@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 本地运行产物：日志和截图用于排查，但不作为实验源码提交。
+groot_n17_isaac_smart_task/terminal_output/
+groot_n17_isaac_smart_task/runs/
