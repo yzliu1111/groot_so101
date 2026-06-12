@@ -57,6 +57,9 @@ LeIsaac 的历史定位是把 Isaac 和 LeRobot 桥接起来：
 experiments/groot_n17_isaac_smart_task/
 ├── README.md
 ├── EXPLANATION_ZH.md
+├── franka_smart_task/
+│   ├── __init__.py
+│   └── franka_smart_task_env_cfg.py
 ├── wire.py
 ├── groot_bridge_server.py
 └── run_smart_task_closed_loop.py
@@ -66,7 +69,9 @@ experiments/groot_n17_isaac_smart_task/
 
 - `wire.py`：Isaac 进程和 GR00T 进程之间的通信协议。负责 socket、msgpack、numpy array 序列化。
 - `groot_bridge_server.py`：运行在 GR00T venv 中，加载 `nvidia/GR00T-N1.7-3B`，对 Isaac 侧提供 `ping/get_action/reset/shutdown` 接口。
-- `run_smart_task_closed_loop.py`：运行在 `conda isaaclab` 中，启动 LeIsaac SmartTask，构造 GR00T observation，接收 action，并驱动 Isaac 中的 SO101。
+- `run_smart_task_closed_loop.py`：运行在 `conda isaaclab` 中，启动 LeIsaac SmartTask 或本目录注册的 Franka SmartTask，构造 GR00T observation，接收 action，并驱动 Isaac 中的机器人。
+- `franka_smart_task/__init__.py`：注册新的 gymnasium task id：`Groot-Franka-SmartTask-v0`。
+- `franka_smart_task/franka_smart_task_env_cfg.py`：定义 Franka 版本 SmartTask 的 IsaacLab env config。
 - `README.md`：实际运行命令。
 - `EXPLANATION_ZH.md`：当前这份中文说明材料。
 
@@ -127,6 +132,32 @@ conda run -n isaaclab env \
 
 它不 import GR00T。
 
+### 4.3 为什么 runner 会主动插入 copied IsaacLab 依赖路径
+
+这台机器上既有你复制过来的公司项目：
+
+```text
+/home/yzliu/smart_project/leisaac/dependencies/IsaacLab/source
+```
+
+也可能有机器上原本安装/checkout 的 IsaacLab。为了不污染本机环境，也为了让实验尽量使用公司项目复制进来的版本，`run_smart_task_closed_loop.py` 在 import IsaacLab 之前会把这些路径插到 `sys.path` 最前面：
+
+```text
+leisaac/dependencies/IsaacLab/source/isaaclab
+leisaac/dependencies/IsaacLab/source/isaaclab_assets
+leisaac/dependencies/IsaacLab/source/isaaclab_tasks
+leisaac/dependencies/IsaacLab/source/isaaclab_mimic
+```
+
+这一步的含义是：
+
+- 不需要 pip install。
+- 不改 conda env。
+- 不改 shell 全局配置。
+- 当前 runner 进程里优先 import workspace 内复制的 IsaacLab / IsaacLab Assets / IsaacLab Tasks。
+
+也就是说，隔离边界仍然是两个进程和两个虚拟环境；只是 Isaac runner 进程内部把公司项目自带源码放在更高优先级。
+
 ## 5. 如何复用 LeIsaac 已有场景
 
 Isaac 侧代码没有手动打开 USD 文件，而是复用 LeIsaac 已经注册好的 task。
@@ -159,6 +190,140 @@ env = gym.make(args.task, cfg=env_cfg).unwrapped
 
 - `leisaac/assets/scenes/smart_scene/scene.usd`
 - `leisaac/assets/robots/so101_follower.usd`
+
+## 5.1 Franka 版本 task 是怎么隔离出来的
+
+为了验证“GR00T N1.7 是否具备 zero-shot 能力”，SO101 版本实验有一个很大的干扰项：
+
+> GR00T N1.7 的 OXE/DROID action schema 更接近 7DoF Franka/DROID 类机器人，而 SO101 是更小、更弱、关节语义完全不同的演示/教育机械臂。
+
+所以新加的 Franka 路线不是为了替代 SO101 路线，而是为了做一个更公平的对照实验：
+
+- 如果 SO101 抓不到，但 Franka 能明显更接近目标，说明 embodiment mismatch 很可能是主要问题。
+- 如果 Franka 也完全没有朝物体去，说明问题更可能在 zero-shot 视觉/语言/任务理解本身。
+- 如果 Franka 能抓起来，那就能更强地证明 N1.7 base model 确实有比较强的 zero-shot pick 能力。
+
+### 5.1.1 task 注册方式
+
+新增文件：
+
+```text
+experiments/groot_n17_isaac_smart_task/franka_smart_task/__init__.py
+```
+
+里面调用：
+
+```python
+gym.register(
+    id="Groot-Franka-SmartTask-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": "franka_smart_task.franka_smart_task_env_cfg:FrankaSmartTaskEnvCfg",
+    },
+)
+```
+
+这里没有修改 LeIsaac 主工程的注册表，而是利用 Python import 的副作用，在 experiments 目录里额外注册一个 task id。runner 里执行：
+
+```python
+import franka_smart_task
+```
+
+之后，`gym.make("Groot-Franka-SmartTask-v0", cfg=env_cfg)` 就可以创建 Franka 版本环境。
+
+### 5.1.2 复用哪些东西
+
+Franka task 继承 LeIsaac 的 `SmartTaskEnvCfg` 和 `SmartTaskSceneCfg`，所以继续复用：
+
+- SmartScene USD。
+- 红色 2x4 lego brick。
+- 外部相机 observation key。
+- wrist camera observation key。
+- `camera1/camera3/joint_pos/ee_frame_state` 这套 policy observation 结构。
+- reward / termination / scene entity 命名的大部分约定。
+- IsaacLab ManagerBasedRLEnv 创建方式。
+
+因此它不是另起炉灶写一个新仿真项目，而是在 LeIsaac 已有任务结构上替换 robot embodiment。
+
+### 5.1.3 替换哪些东西
+
+Franka task 主要替换四类配置：
+
+1. 机器人资产：
+
+```python
+robot = FRANKA_PANDA_HIGH_PD_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
+```
+
+这里的 `FRANKA_PANDA_HIGH_PD_CFG` 来自你复制进来的 IsaacLab Assets：
+
+```text
+leisaac/dependencies/IsaacLab/source/isaaclab_assets/isaaclab_assets/robots/franka.py
+```
+
+`prim_path="{ENV_REGEX_NS}/Robot"` 保持了 LeIsaac 里 `SceneEntityCfg("robot")` 的命名习惯。也就是说，下游 observation/action/termination 仍然可以通过 scene entity 名字 `"robot"` 找到机器人。
+
+2. 末端坐标系：
+
+Franka 没有 SO101 的 follower link 命名，所以 `ee_frame` 改成跟踪 `panda_hand`，并额外保留两个 target frame：
+
+- `end_effector`：用于 `ee_frame_state`，给 GR00T 构造 `state.eef_9d`。
+- `grasp_center`：用于诊断指标和 LeIsaac 原始 `object_grasped` 里对 `target_pos_w[:, 1, :]` 的访问约定。
+
+3. wrist/front 相机挂载点：
+
+SO101 原 config 里有相机挂在 `Robot/base` 或 wrist link 上。Franka 版本需要改到：
+
+- wrist camera：`Robot/panda_hand/wrist_camera`
+- front camera：`Robot/panda_link0/front_camera`
+
+即使 SmartTask policy 后面删掉 front observation，InteractiveScene 仍然会实例化 scene cfg 里的 sensor，所以 front camera 的 prim path 也必须有效。
+
+4. action 配置：
+
+Franka 版本支持两种 action mode：
+
+```text
+franka_ik    = 7D EEF pose target + 1D binary gripper
+franka_joint = 7D arm joint target + 1D binary gripper
+```
+
+runner 根据参数自动选择：
+
+```text
+--robot franka --control-mode eef   -> franka_ik
+--robot franka --control-mode joint -> franka_joint
+```
+
+这让 Franka 路线和 SO101 路线共享同一个 bridge / observation 构造 / action chunk 执行逻辑，但 action manager 是各自独立的。
+
+### 5.1.4 Franka 为什么更适合这个 zero-shot 对照
+
+GR00T bridge 使用的 embodiment tag 是：
+
+```text
+OXE_DROID_RELATIVE_EEF_RELATIVE_JOINT
+```
+
+它的 action/state 里有：
+
+```text
+state.joint_position: 7D
+action.joint_position: 7D
+action.eef_9d: 9D
+action.gripper_position: 1D
+```
+
+SO101 的 arm + gripper 只有 6 维，而且第 6 维是 gripper，不是标准 7DoF arm joint。把 7D DROID/Franka action 硬压到 SO101 上，语义一定会损失。
+
+Franka Panda 则天然是：
+
+```text
+7D arm joints + parallel gripper
+```
+
+所以它可以更直接地承接 GR00T 的 `joint_position` 和 `eef_9d + gripper_position` 输出。这样如果失败，至少可以少一个“机器人形态差太多”的解释。
 
 ## 6. Observation 如何从 LeIsaac 转成 GR00T
 
@@ -499,7 +664,7 @@ cd /home/yzliu/smart_project
   --device cuda
 ```
 
-终端 2：启动 Isaac viewport，并走 EEF 控制路线。
+终端 2A：启动原始 SO101 SmartTask viewport，并走 EEF 控制路线。
 
 ```bash
 cd /home/yzliu/smart_project
@@ -515,3 +680,45 @@ conda run -n isaaclab env \
     --max-policy-calls 1 \
     --instruction "Pick up the red 2x4 lego brick."
 ```
+
+终端 2B：启动 Franka SmartTask viewport，并走 EEF 控制路线。
+
+```bash
+cd /home/yzliu/smart_project
+conda run -n isaaclab env \
+  PYTHONPATH=/home/yzliu/smart_project/experiments/groot_n17_isaac_smart_task:/home/yzliu/smart_project/leisaac/source/leisaac \
+  PYTHONDONTWRITEBYTECODE=1 \
+  PYTHONNOUSERSITE=1 \
+  python experiments/groot_n17_isaac_smart_task/run_smart_task_closed_loop.py \
+    --robot franka \
+    --control-mode eef \
+    --no-headless \
+    --render-sleep-s 0.08 \
+    --keep-open-s 60 \
+    --max-policy-calls 1 \
+    --instruction "Pick up the red 2x4 lego brick."
+```
+
+终端 2C：启动 Franka SmartTask viewport，并走 joint-space baseline。
+
+```bash
+cd /home/yzliu/smart_project
+conda run -n isaaclab env \
+  PYTHONPATH=/home/yzliu/smart_project/experiments/groot_n17_isaac_smart_task:/home/yzliu/smart_project/leisaac/source/leisaac \
+  PYTHONDONTWRITEBYTECODE=1 \
+  PYTHONNOUSERSITE=1 \
+  python experiments/groot_n17_isaac_smart_task/run_smart_task_closed_loop.py \
+    --robot franka \
+    --control-mode joint \
+    --no-headless \
+    --render-sleep-s 0.08 \
+    --keep-open-s 60 \
+    --max-policy-calls 1 \
+    --instruction "Pick up the red 2x4 lego brick."
+```
+
+这三条 Isaac 命令共用同一个 GR00T bridge。差别只在：
+
+- SO101 EEF：验证“原 LeIsaac 机器人 + EEF action 落地”。
+- Franka EEF：验证“更接近 GR00T 官方 embodiment 的机器人 + EEF action 落地”。
+- Franka joint：验证“7D joint action 在 Franka 上是否比 SO101 更自然”。

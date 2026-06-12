@@ -11,6 +11,24 @@ GR00T-side bridge over a standard-library socket.
 - No GR00T imports inside IsaacLab.
 - No LeIsaac policy client changes.
 - No dependencies installed into either environment.
+- The Isaac runner prepends the copied project dependencies under
+  `leisaac/dependencies/IsaacLab/source/*` to `sys.path`, so this experiment
+  prefers the company workspace copy instead of silently using another IsaacLab
+  source checkout on the machine.
+
+## Task Variants
+
+This folder now contains two isolated Isaac task routes:
+
+- `--robot so101` uses the original LeIsaac task
+  `LeIsaac-SO101-SmartTask-v0`.
+- `--robot franka` imports the local `franka_smart_task` package and registers
+  `Groot-Franka-SmartTask-v0`.
+
+The Franka task keeps the same SmartTask scene/lego/camera observation contract,
+but replaces the SO101 robot with IsaacLab's copied `FRANKA_PANDA_HIGH_PD_CFG`.
+This is meant to reduce the mismatch between GR00T N1.7's OXE/DROID-style
+outputs and SO101's much smaller morphology.
 
 ## Terminal 1: GR00T Bridge
 
@@ -122,6 +140,46 @@ conda run -n isaaclab env \
   PYTHONNOUSERSITE=1 \
   python experiments/groot_n17_isaac_smart_task/run_smart_task_closed_loop.py \
     --control-mode eef \
+    --no-headless \
+    --render-sleep-s 0.08 \
+    --keep-open-s 60 \
+    --max-policy-calls 1 \
+    --instruction "Pick up the red 2x4 lego brick."
+```
+
+## Franka SmartTask Variant
+
+The Franka route is the cleaner zero-shot probe for GR00T N1.7 because Panda has
+7 arm joints and a parallel gripper, matching the OXE/DROID action schema more
+closely than SO101. Start the same GR00T bridge in terminal 1, then run:
+
+```bash
+cd /home/yzliu/smart_project
+conda run -n isaaclab env \
+  PYTHONPATH=/home/yzliu/smart_project/experiments/groot_n17_isaac_smart_task:/home/yzliu/smart_project/leisaac/source/leisaac \
+  PYTHONDONTWRITEBYTECODE=1 \
+  PYTHONNOUSERSITE=1 \
+  python experiments/groot_n17_isaac_smart_task/run_smart_task_closed_loop.py \
+    --robot franka \
+    --control-mode eef \
+    --no-headless \
+    --render-sleep-s 0.08 \
+    --keep-open-s 60 \
+    --max-policy-calls 1 \
+    --instruction "Pick up the red 2x4 lego brick."
+```
+
+For a joint-space baseline on the same Franka task:
+
+```bash
+cd /home/yzliu/smart_project
+conda run -n isaaclab env \
+  PYTHONPATH=/home/yzliu/smart_project/experiments/groot_n17_isaac_smart_task:/home/yzliu/smart_project/leisaac/source/leisaac \
+  PYTHONDONTWRITEBYTECODE=1 \
+  PYTHONNOUSERSITE=1 \
+  python experiments/groot_n17_isaac_smart_task/run_smart_task_closed_loop.py \
+    --robot franka \
+    --control-mode joint \
     --no-headless \
     --render-sleep-s 0.08 \
     --keep-open-s 60 \
