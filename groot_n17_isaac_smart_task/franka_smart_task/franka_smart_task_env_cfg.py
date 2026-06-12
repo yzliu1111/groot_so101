@@ -62,6 +62,35 @@ class FrankaSmartTaskSceneCfg(SmartTaskSceneCfg):
     # SceneEntityCfg("robot") 的 observation/reward/termination 不需要改名。
     robot = FRANKA_PANDA_HIGH_PD_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
 
+    # Franka 专属外部 overview camera。
+    #
+    # 原 SmartScene 的 camera_front 是按 SO101/soarm 尺寸和高度设计的；换成
+    # Franka 后，这个相机太低太近，容易只看到 Panda 底座或局部，不能承担
+    # GR00T `exterior_image_1_left` 需要的全局态势视角。因此 Franka task 覆盖
+    # camera1 为一个更高、更远的 oblique view，用来同时观察机械臂、盘面和 lego。
+    #
+    # rot 使用 OpenGL camera convention：本地 -Z 为视线方向，+Y 为画面上方。
+    # 这组四元数由 eye=(0.65, 0.95, 0.85) lookat=(0.18, 0.12, 0.22) 计算而来。
+    camera1: TiledCameraCfg = TiledCameraCfg(
+        prim_path="{ENV_REGEX_NS}/Scene/franka_overview_camera",
+        offset=TiledCameraCfg.OffsetCfg(
+            pos=(0.65, 0.95, 0.85),
+            rot=(0.22438, 0.1207, 0.45811, 0.8516),
+            convention="opengl",
+        ),
+        data_types=["rgb"],
+        spawn=sim_utils.PinholeCameraCfg(
+            focal_length=24.0,
+            focus_distance=400.0,
+            horizontal_aperture=47.0,
+            clipping_range=(0.01, 50.0),
+            lock_camera=True,
+        ),
+        width=640,
+        height=480,
+        update_period=1 / 30.0,
+    )
+
     # Franka 的 EEF frame：
     # - prim_path 设在 panda_link0，表示 frame transformer 的源坐标系是机器人 root。
     # - 第 0 个 target frame 用于 ee_frame_state，即 GR00T 的 state.eef_9d。
@@ -87,7 +116,7 @@ class FrankaSmartTaskSceneCfg(SmartTaskSceneCfg):
     # 腕部相机挂到 Franka panda_hand 下。这里采用 copied IsaacLab 官方
     # `stack_ik_rel_visuomotor_env_cfg.py` 里的 Franka wrist camera offset。
     # 它保留 wrist/gripper 视角语义：相机服务于末端附近观测，不强行在初始帧
-    # 看向 lego；全局目标定位交给 SmartScene 固定外部相机 camera1。
+    # 看向 lego；全局目标定位交给 Franka 专属 overview `camera1`。
     wrist: TiledCameraCfg = TiledCameraCfg(
         prim_path="{ENV_REGEX_NS}/Robot/panda_hand/wrist_camera",
         offset=TiledCameraCfg.OffsetCfg(
@@ -153,7 +182,7 @@ class FrankaSmartTaskEnvCfg(SmartTaskEnvCfg):
         self.scene.robot.init_state.rot = (1.0, 0.0, 0.0, 0.0)
         # copied IsaacLab Franka stack task 使用的 ready pose。这个姿态比
         # FRANKA_PANDA_CFG 默认姿态更接近桌面 pick/stack 任务起点；它不要求
-        # wrist camera 初始帧看见 lego，目标物由固定外部相机 camera1 观测。
+        # wrist camera 初始帧看见 lego，目标物由 Franka overview camera1 观测。
         self.scene.robot.init_state.joint_pos = FRANKA_STACK_READY_JOINT_POS
 
         parse_usd_and_create_subassets(SMART_SCENE_USD_PATH, self)

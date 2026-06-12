@@ -25,16 +25,18 @@ This folder now contains two isolated Isaac task routes:
 - `--robot franka` imports the local `franka_smart_task` package and registers
   `Groot-Franka-SmartTask-v0`.
 
-The Franka task keeps the same SmartTask scene/lego/camera observation contract,
-but replaces the SO101 robot with IsaacLab's copied `FRANKA_PANDA_HIGH_PD_CFG`.
-This is meant to reduce the mismatch between GR00T N1.7's OXE/DROID-style
-outputs and SO101's much smaller morphology.
+The Franka task keeps the same SmartTask scene/lego/policy-observation key
+contract, but replaces the SO101 robot with IsaacLab's copied
+`FRANKA_PANDA_HIGH_PD_CFG`. This is meant to reduce the mismatch between GR00T
+N1.7's OXE/DROID-style outputs and SO101's much smaller morphology.
 
 The Franka route reuses the SmartTask scene assets, but keeps Franka-specific
 robot, EEF, wrist camera, gripper, and action semantics. In particular,
-`camera1` is the fixed SmartScene external view used for global object
-localization, while `camera3` is the Franka wrist view and is not forced to see
-the lego in the initial pose.
+`camera1` keeps the same policy key and GR00T bridge role, but Franka overrides
+the physical sensor with a higher `Scene/franka_overview_camera` view. The
+original SO101 `camera_front` is too low and close for Panda, so it mostly sees
+the base instead of the full arm. `camera3` is the Franka wrist view and is not
+forced to see the lego in the initial pose.
 
 ## Terminal 1: GR00T Bridge
 
@@ -230,8 +232,10 @@ saves `camera1.png`, `camera2.png`, and `camera3.png` under
 
 Current image semantics:
 
-- `camera1`: fixed SmartScene external camera, sent to
-  `video.exterior_image_1_left`.
+- `camera1`: main exterior view, sent to `video.exterior_image_1_left`.
+  SO101 uses the original SmartScene `camera_front`; Franka overrides this key
+  with `Scene/franka_overview_camera`, a higher oblique view that can see the
+  Panda arm, table, and target area together.
 - `camera2`: fixed SmartScene left camera, retained in policy observations but
   not sent to GR00T in this OXE/DROID probe.
 - `camera3`: robot wrist camera, sent to `video.wrist_image_left`.

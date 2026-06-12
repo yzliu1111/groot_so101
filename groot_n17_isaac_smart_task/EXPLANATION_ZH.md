@@ -254,7 +254,9 @@ Franka task 仍然复用 LeIsaac 的 `SmartTaskSceneCfg` / observation schema，
 都按 Franka embodiment 重新定义。它不是另起炉灶写一个新仿真项目，而是：
 
 ```text
-SmartScene / lego / 固定外部相机：复用 LeIsaac
+SmartScene / lego / observation key：复用 LeIsaac
+SO101 外部相机物理机位：复用 LeIsaac
+Franka 外部主视角物理机位：覆盖为 Franka overview camera
 robot / EEF / wrist / gripper / action：按 Franka 语义定义
 ```
 
@@ -283,7 +285,7 @@ Franka 没有 SO101 的 follower link 命名，所以 `ee_frame` 改成跟踪 `p
 - `end_effector`：用于 `ee_frame_state`，给 GR00T 构造 `state.eef_9d`。
 - `grasp_center`：用于诊断指标和 LeIsaac 原始 `object_grasped` 里对 `target_pos_w[:, 1, :]` 的访问约定。
 
-3. wrist 相机和固定外部相机：
+3. wrist 相机和主外部相机：
 
 当前 GR00T OXE/DROID probe 真正送给模型的是两路图像：
 
@@ -294,8 +296,13 @@ camera3 -> video.wrist_image_left
 
 其中：
 
-- `camera1` 是 SmartScene USD 里的固定外部相机：
-  `Scene/camera_front_xform/camera_front`。它负责初始全局定位，能看到盘面和 lego。
+- `camera1` 是送给 GR00T 的主外部视角 key。SO101 路线中它仍然来自 SmartScene USD
+  里的原始固定外部相机：`Scene/camera_front_xform/camera_front`。但 Franka 路线中不能
+  直接照搬这个物理机位，因为它是按 SO101/soarm 的体型和高度设计的；换成更高大的 Panda
+  后，这个相机太低太近，容易只看到底座和局部，不能观察完整机械臂全局姿态。因此 Franka
+  路线把同一个 `camera1` observation key 覆盖为新的
+  `Scene/franka_overview_camera`，它是一个更高、更远的斜上方 overview camera，用来同时
+  看到 Franka、桌面盘面和 lego 目标区域。
 - `camera3` 是 Franka wrist camera：
   `Robot/panda_hand/wrist_camera`。它保留腕部/夹爪视角语义，跟着 `panda_hand` 运动。
 - `camera2` 是 SmartScene USD 里的左侧固定相机，仍保留在 policy observation 中，但当前
@@ -303,7 +310,7 @@ camera3 -> video.wrist_image_left
 
 这里有一个重要结论：Franka 当前 ready pose 下，夹爪方向和 lego 所在方向并不天然一致。
 因此不应该为了让 wrist 初始帧看到 lego 而把 wrist 相机旋成“看目标”的相机；那会破坏
-真实 wrist camera 的语义。初始目标定位应该交给固定外部相机 `camera1`，wrist 相机主要服务于
+真实 wrist camera 的语义。初始目标定位应该交给主外部相机 `camera1`，wrist 相机主要服务于
 靠近目标和闭合夹爪阶段。
 
 Franka 版还显式去掉了 SO101 模板里遗留的 robot-mounted `front` sensor，避免 Isaac stage 中
@@ -362,7 +369,8 @@ Franka route 当前的原则是：
 - 使用 copied IsaacLab 里的 `FRANKA_PANDA_HIGH_PD_CFG`。
 - 使用 copied IsaacLab Franka stack task 的 ready joint pose 作为桌面任务起点。
 - wrist camera 使用 Franka wrist/gripper 视角语义，不强行初始看 lego。
-- 固定外部相机 `camera1` 承担全局目标观测。
+- `camera1` 这个 observation key 承担全局目标观测；SO101 使用原 SmartScene
+  `camera_front`，Franka 使用专属的 `franka_overview_camera`。
 - reset 后启用 `rerender_on_reset=True`，避免相机 observation 仍是旧缓存帧。
 
 这也意味着 Franka 路线验证的是“更接近 GR00T OXE/DROID embodiment 的机器人，在同一个
@@ -708,7 +716,9 @@ env.step(command)
 - EEF 路线动作明显更大。
 - 但在当前 SO101 + SmartTask + OXE/DROID zero-shot setup 下，没有可靠抓起红色 2x4 lego。
 - Franka 路线已经隔离出来，并且不再照搬 SO101 的 robot/front/wrist cfg。
-- Franka 的固定外部相机 `camera1` 可以看到目标物；wrist 相机保持末端/夹爪视角语义，不再强行旋向 lego。
+- Franka 的主外部相机 `camera1` 已从 SO101 原始低位 `camera_front` 改成
+  Franka 专属的 `franka_overview_camera`；它能看到 Panda 全局姿态、桌面和目标物。
+- wrist 相机保持末端/夹爪视角语义，不再强行旋向 lego。
 
 这说明：
 
@@ -735,7 +745,8 @@ env.step(command)
 - SO101 gripper 的尺度和 DROID/Franka gripper 语义未必一致。
 - 这个 SmartTask 场景和红色 lego pick 的视觉/几何分布未必在 base model 舒适区。
 - 当前 EEF relative/absolute 解读仍然是实验假设，需要更多日志验证。
-- Franka 版本虽然减少了 SO101 morphology mismatch，但 SmartScene 的物体布局、夹爪初始朝向、固定外部相机分布仍然不是 GR00T 官方任务配置。
+- Franka 版本虽然减少了 SO101 morphology mismatch，并把主外部相机改成了适合 Panda
+  的 overview view，但 SmartScene 的物体布局和夹爪初始朝向仍然不是 GR00T 官方任务配置。
 
 所以当前结果更适合被理解为：
 
