@@ -278,6 +278,16 @@ leisaac/dependencies/IsaacLab/source/isaaclab_assets/isaaclab_assets/robots/fran
 
 `prim_path="{ENV_REGEX_NS}/Robot"` 保持了 LeIsaac 里 `SceneEntityCfg("robot")` 的命名习惯。也就是说，下游 observation/action/termination 仍然可以通过 scene entity 名字 `"robot"` 找到机器人。
 
+Franka 的 root 初始朝向被设置为绕世界 Z 轴逆时针 90 度：
+
+```python
+self.scene.robot.init_state.rot = (0.70710678, 0.0, 0.0, 0.70710678)
+```
+
+这个四元数的含义是 `yaw=+90deg`。这样做的目的不是改变 Franka 官方 ready pose
+的关节形状，而是把整台 Panda 在 SmartScene 中转向，使 ready pose 下的夹爪朝向
+更自然地对准 lego 所在的任务方向。
+
 2. 末端坐标系：
 
 Franka 没有 SO101 的 follower link 命名，所以 `ee_frame` 改成跟踪 `panda_hand`，并额外保留两个 target frame：
@@ -308,10 +318,11 @@ camera3 -> video.wrist_image_left
 - `camera2` 是 SmartScene USD 里的左侧固定相机，仍保留在 policy observation 中，但当前
   OXE/DROID GR00T probe 没有把它送给模型。
 
-这里有一个重要结论：Franka 当前 ready pose 下，夹爪方向和 lego 所在方向并不天然一致。
-因此不应该为了让 wrist 初始帧看到 lego 而把 wrist 相机旋成“看目标”的相机；那会破坏
-真实 wrist camera 的语义。初始目标定位应该交给主外部相机 `camera1`，wrist 相机主要服务于
-靠近目标和闭合夹爪阶段。
+这里有一个重要结论：如果 Franka ready pose 的整体朝向和 lego 所在方向不一致，应该优先旋转
+Franka root，而不是把 wrist 相机单独旋成“看目标”的相机；后者会破坏真实 wrist camera 的语义。
+当前版本已经把 Franka root 逆时针旋转 90 度。wrist camera 仍然挂在 `panda_hand` 下，所以它会
+随着机器人末端自然旋转，不需要额外修改 hand-relative offset。初始目标定位仍主要交给主外部相机
+`camera1`，wrist 相机主要服务于靠近目标和闭合夹爪阶段。
 
 Franka 版还显式去掉了 SO101 模板里遗留的 robot-mounted `front` sensor，避免 Isaac stage 中
 多出一个与当前 GR00T 输入无关的机器人前置相机。
@@ -368,6 +379,8 @@ Franka route 当前的原则是：
 - 不再把 SO101 的 robot init、front camera、wrist offset 直接套到 Franka 上。
 - 使用 copied IsaacLab 里的 `FRANKA_PANDA_HIGH_PD_CFG`。
 - 使用 copied IsaacLab Franka stack task 的 ready joint pose 作为桌面任务起点。
+- Franka root 绕世界 Z 轴逆时针旋转 90 度，让 ready pose 下的夹爪方向更贴近 SmartScene
+  中 lego 的任务方向。
 - wrist camera 使用 Franka wrist/gripper 视角语义，不强行初始看 lego。
 - `camera1` 这个 observation key 承担全局目标观测；SO101 使用原 SmartScene
   `camera_front`，Franka 使用专属的 `franka_overview_camera`。

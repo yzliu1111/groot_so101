@@ -53,6 +53,16 @@ FRANKA_STACK_READY_JOINT_POS = {
     "panda_finger_joint.*": 0.04,
 }
 
+# Franka base 的初始朝向。
+#
+# Isaac/Usd 里 articulation root rotation 使用 wxyz 四元数。这里把 Panda root
+# 绕世界 Z 轴逆时针旋转 90 度，也就是 yaw=+90deg：
+#   q = [cos(90/2), 0, 0, sin(90/2)]
+# 这样可以把当前 ready pose 下大致朝 +Y 的夹爪方向转向 -X，更贴近 SmartScene
+# 中 lego 目标的摆放方向。wrist camera 挂在 panda_hand 下，会随机器人末端一起
+# 旋转，因此不需要额外改 wrist camera 的 hand-relative offset。
+FRANKA_BASE_YAW_CCW_90_QUAT = (0.70710678, 0.0, 0.0, 0.70710678)
+
 
 @configclass
 class FrankaSmartTaskSceneCfg(SmartTaskSceneCfg):
@@ -139,7 +149,7 @@ class FrankaSmartTaskSceneCfg(SmartTaskSceneCfg):
 
     # Franka 路线不再实例化 SO101 模板里的 robot-mounted front camera。
     # GR00T OXE/DROID embodiment 只需要一个外部相机和一个 wrist 相机；外部相机
-    # 直接复用 SmartScene USD 里的 camera1，而不是额外挂在 Franka base 上。
+    # 使用上面覆盖后的 Franka overview camera1，而不是额外挂在 Franka base 上。
     front = None
 
 
@@ -179,7 +189,7 @@ class FrankaSmartTaskEnvCfg(SmartTaskEnvCfg):
         self.viewer.eye = (-0.9, 0.15, 0.88)
         self.viewer.lookat = (0.0, 0.25, 0.07)
         self.scene.robot.init_state.pos = (0.0, 0.0, 0.0)
-        self.scene.robot.init_state.rot = (1.0, 0.0, 0.0, 0.0)
+        self.scene.robot.init_state.rot = FRANKA_BASE_YAW_CCW_90_QUAT
         # copied IsaacLab Franka stack task 使用的 ready pose。这个姿态比
         # FRANKA_PANDA_CFG 默认姿态更接近桌面 pick/stack 任务起点；它不要求
         # wrist camera 初始帧看见 lego，目标物由 Franka overview camera1 观测。

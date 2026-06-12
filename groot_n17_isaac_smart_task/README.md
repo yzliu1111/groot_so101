@@ -36,7 +36,9 @@ robot, EEF, wrist camera, gripper, and action semantics. In particular,
 the physical sensor with a higher `Scene/franka_overview_camera` view. The
 original SO101 `camera_front` is too low and close for Panda, so it mostly sees
 the base instead of the full arm. `camera3` is the Franka wrist view and is not
-forced to see the lego in the initial pose.
+forced to see the lego in the initial pose. The Franka root is initialized with
+a counterclockwise 90 degree yaw so the official stack-task ready pose faces the
+SmartScene target direction more naturally.
 
 ## Terminal 1: GR00T Bridge
 
@@ -242,7 +244,8 @@ Current image semantics:
 
 For Franka, `camera3` should keep the wrist/gripper-view meaning. It should not
 be rotated just to see the lego at the initial pose; the initial global target
-view comes from `camera1`.
+view comes from `camera1`. If target-facing alignment is needed, rotate the
+Franka root pose instead of changing the wrist camera's hand-relative offset.
 
 ## Four Video Probes
 
