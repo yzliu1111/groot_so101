@@ -19,11 +19,39 @@ from isaaclab.utils import configclass
 
 from isaaclab_assets.robots.franka import FRANKA_PANDA_HIGH_PD_CFG
 
+from leisaac.assets.scenes.smart_scene import SMART_SCENE_USD_PATH
 from leisaac.tasks.smart_task.smart_task_env_cfg import (
     SmartTaskEnvCfg,
     SmartTaskSceneCfg,
     SmartTaskTerminationCfg,
 )
+from leisaac.tasks.template import SingleArmTaskEnvCfg
+from leisaac.utils.domain_randomization import domain_randomization, randomize_object_uniform
+from leisaac.utils.general_assets import parse_usd_and_create_subassets
+
+
+FRANKA_FEATURE_JOINT_NAMES = [
+    "panda_joint1.pos",
+    "panda_joint2.pos",
+    "panda_joint3.pos",
+    "panda_joint4.pos",
+    "panda_joint5.pos",
+    "panda_joint6.pos",
+    "panda_joint7.pos",
+    "panda_finger_joint1.pos",
+    "panda_finger_joint2.pos",
+]
+
+FRANKA_STACK_READY_JOINT_POS = {
+    "panda_joint1": 0.0444,
+    "panda_joint2": -0.1894,
+    "panda_joint3": -0.1107,
+    "panda_joint4": -2.5148,
+    "panda_joint5": 0.0044,
+    "panda_joint6": 2.3775,
+    "panda_joint7": 0.6952,
+    "panda_finger_joint.*": 0.04,
+}
 
 
 @configclass
@@ -57,8 +85,9 @@ class FrankaSmartTaskSceneCfg(SmartTaskSceneCfg):
     )
 
     # 腕部相机挂到 Franka panda_hand 下。这里采用 copied IsaacLab 官方
-    # `stack_ik_rel_visuomotor_env_cfg.py` 里的 Franka wrist camera offset：
-    # 它比最初的保守近似更接近“安装在手腕、朝向 gripper 工作区”的视角。
+    # `stack_ik_rel_visuomotor_env_cfg.py` 里的 Franka wrist camera offset。
+    # 它保留 wrist/gripper 视角语义：相机服务于末端附近观测，不强行在初始帧
+    # 看向 lego；全局目标定位交给 SmartScene 固定外部相机 camera1。
     wrist: TiledCameraCfg = TiledCameraCfg(
         prim_path="{ENV_REGEX_NS}/Robot/panda_hand/wrist_camera",
         offset=TiledCameraCfg.OffsetCfg(
@@ -79,28 +108,10 @@ class FrankaSmartTaskSceneCfg(SmartTaskSceneCfg):
         update_period=1 / 30.0,
     )
 
-    # SingleArmTaskSceneCfg 里还定义了 front camera。SmartTask 的 policy 虽然会删掉
-    # front observation，但 InteractiveScene 仍会实例化 scene cfg 中的 front sensor。
-    # 因此 Franka 版必须把它从 SO101 的 Robot/base 改到 Franka 的 panda_link0。
-    front: TiledCameraCfg = TiledCameraCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/panda_link0/front_camera",
-        offset=TiledCameraCfg.OffsetCfg(
-            pos=(0.0, -0.6, 0.5),
-            rot=(0.1650476, -0.9862856, 0.0, 0.0),
-            convention="ros",
-        ),
-        data_types=["rgb"],
-        spawn=sim_utils.PinholeCameraCfg(
-            focal_length=28.7,
-            focus_distance=400.0,
-            horizontal_aperture=38.11,
-            clipping_range=(0.01, 50.0),
-            lock_camera=True,
-        ),
-        width=640,
-        height=480,
-        update_period=1 / 30.0,
-    )
+    # Franka 路线不再实例化 SO101 模板里的 robot-mounted front camera。
+    # GR00T OXE/DROID embodiment 只需要一个外部相机和一个 wrist 相机；外部相机
+    # 直接复用 SmartScene USD 里的 camera1，而不是额外挂在 Franka base 上。
+    front = None
 
 
 @configclass
@@ -128,26 +139,46 @@ class FrankaSmartTaskEnvCfg(SmartTaskEnvCfg):
     robot_name: str = "franka_panda"
 
     def __post_init__(self) -> None:
-        super().__post_init__()
+        # 只调用更底层的 SingleArmTaskEnvCfg 初始化，避免进入
+        # SmartTaskEnvCfg.__post_init__ 中的 SO101 robot init 逻辑。下面显式复刻
+        # SmartTask 需要的“场景资产解析 + lego 随机化”，机器人相关配置则完全
+        # 由 Franka 本类定义。
+        SingleArmTaskEnvCfg.__post_init__(self)
 
-        # SmartTaskEnvCfg.__post_init__ 会把 robot init pos 改成 SO101 的摆放位置。
-        # Franka base 更接近 IsaacLab lift task 的布局，这里重新覆盖。
-        # 这个位置是第一版 smoke test 起点，后续可根据 viewport 精调到更正对 lego。
+        # SmartScene 仍然是同事搭好的任务场景；Franka base 使用 Franka 自己的
+        # world-frame 初始位姿，而不是 SO101 的偏移。
+        self.viewer.eye = (-0.9, 0.15, 0.88)
+        self.viewer.lookat = (0.0, 0.25, 0.07)
         self.scene.robot.init_state.pos = (0.0, 0.0, 0.0)
         self.scene.robot.init_state.rot = (1.0, 0.0, 0.0, 0.0)
+        # copied IsaacLab Franka stack task 使用的 ready pose。这个姿态比
+        # FRANKA_PANDA_CFG 默认姿态更接近桌面 pick/stack 任务起点；它不要求
+        # wrist camera 初始帧看见 lego，目标物由固定外部相机 camera1 观测。
+        self.scene.robot.init_state.joint_pos = FRANKA_STACK_READY_JOINT_POS
+
+        parse_usd_and_create_subassets(SMART_SCENE_USD_PATH, self)
+        domain_randomization(
+            self,
+            random_options=[
+                randomize_object_uniform(
+                    "red_2x4_lego_brick",
+                    pose_range={
+                        "x": (-0.05, 0.05),
+                        "y": (-0.05, 0.05),
+                        "z": (0.0, 0.0),
+                    },
+                ),
+            ],
+        )
+
+        # Visuomotor 任务中 reset 后必须强制 rerender 一次，否则相机 observation
+        # 可能仍是 reset 前的缓存帧。Franka zero-shot probe 以图像为核心，所以这里
+        # 采用 IsaacLab 官方视觉任务的设置。
+        self.rerender_on_reset = True
+        self.sim.render.antialiasing_mode = "OFF"
 
         # Franka 的关节 feature 名称仅用于日志/兼容，不参与 GR00T 推理。
-        self.default_feature_joint_names = [
-            "panda_joint1.pos",
-            "panda_joint2.pos",
-            "panda_joint3.pos",
-            "panda_joint4.pos",
-            "panda_joint5.pos",
-            "panda_joint6.pos",
-            "panda_joint7.pos",
-            "panda_finger_joint1.pos",
-            "panda_finger_joint2.pos",
-        ]
+        self.default_feature_joint_names = FRANKA_FEATURE_JOINT_NAMES
 
         # 默认给 Franka 配 IK action，runner 后续也会按 --control-mode 显式调用。
         self.use_teleop_device("franka_ik")
