@@ -169,6 +169,33 @@ conda run -n isaaclab env \
     --instruction "Pick up the red 2x4 lego brick."
 ```
 
+To record the active Isaac viewport directly to a compact mp4, add
+`--capture-video`. The defaults are intentionally small:
+`960x540`, `15 fps`, `2 Mbps`.
+
+```bash
+cd /home/yzliu/smart_project
+conda run -n isaaclab env \
+  PYTHONPATH=/home/yzliu/smart_project/experiments/groot_n17_isaac_smart_task:/home/yzliu/smart_project/leisaac/source/leisaac \
+  PYTHONDONTWRITEBYTECODE=1 \
+  PYTHONNOUSERSITE=1 \
+  python experiments/groot_n17_isaac_smart_task/run_smart_task_closed_loop.py \
+    --robot franka \
+    --control-mode eef \
+    --no-headless \
+    --render-sleep-s 0.08 \
+    --keep-open-s 60 \
+    --max-policy-calls 1 \
+    --capture-video \
+    --capture-name franka_eef_probe \
+    --instruction "Pick up the red 2x4 lego brick."
+```
+
+Captured videos are written under
+`experiments/groot_n17_isaac_smart_task/runs/captures/` by default. To reduce
+file size further, lower `--capture-bitrate-mbps`, lower
+`--capture-width/--capture-height`, or set `--capture-every-nth-frames 2`.
+
 For a joint-space baseline on the same Franka task:
 
 ```bash

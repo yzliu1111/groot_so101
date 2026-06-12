@@ -23,6 +23,7 @@ import math
 import sys
 import time
 from collections import deque
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -587,6 +588,134 @@ def summarize_action(action: dict[str, np.ndarray]) -> str:
     return "; ".join(parts)
 
 
+def start_viewport_video_capture(args: argparse.Namespace, total_frames: int) -> Any | None:
+    """启动 Isaac/Omniverse viewport mp4 录制。
+
+    这个函数只在 `--capture-video` 打开时调用。它直接使用 Isaac Sim 自带的
+    `omni.kit.capture.viewport` extension，不引入 OBS、ffmpeg、OpenCV 或其它
+    额外依赖。
+
+    参数：
+    - `args`：命令行参数，里面包含输出目录、分辨率、fps、码率等 capture 设置。
+    - `total_frames`：预计要捕获的 viewport 帧数。runner 会根据 GR00T 返回的
+      action chunk 长度和剩余 policy call 数估算。
+
+    返回：
+    - CaptureExtension instance；后续可用 `capture.done` 等待编码完成。
+    - 如果扩展不可用或启动失败，返回 None，主仿真继续运行。
+
+    文件大小控制：
+    - 默认 960x540。
+    - 默认 15 fps。
+    - 默认 2 Mbps H.264 mp4。
+
+    这几个默认值足够看清机器人动作，同时避免一分钟视频膨胀到几百 MB。
+    """
+
+    if args.dry_run:
+        print("[runner] capture-video requested, but dry-run does not step the viewport; skipping capture", flush=True)
+        return None
+
+    if args.headless:
+        print("[runner] warning: capture-video is intended for --no-headless viewport runs", flush=True)
+
+    try:
+        import omni.kit.app
+
+        # mp4 编码需要 omni.videoencoding；viewport 抓帧需要 omni.kit.capture.viewport。
+        # 这里用 Isaac Sim extension manager 只在当前 app 进程启用，不修改环境。
+        extension_manager = omni.kit.app.get_app().get_extension_manager()
+        extension_manager.set_extension_enabled_immediate("omni.videoencoding", True)
+        extension_manager.set_extension_enabled_immediate("omni.kit.capture.viewport", True)
+
+        from omni.kit.capture.viewport import CaptureExtension, CaptureOptions, CaptureRangeType, CaptureRenderPreset
+        import omni.kit.viewport.utility as viewport_utils
+
+        viewport = viewport_utils.get_active_viewport()
+        if viewport is None:
+            print("[runner] warning: no active viewport found; skipping capture", flush=True)
+            return None
+
+        capture_dir = Path(args.capture_dir).expanduser()
+        if not capture_dir.is_absolute():
+            capture_dir = SCRIPT_DIR / capture_dir
+        capture_dir.mkdir(parents=True, exist_ok=True)
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        capture_name = args.capture_name or f"{args.robot}_{args.control_mode}_{timestamp}"
+
+        options = CaptureOptions()
+        # 当前 viewport 使用的 camera path。通常是用户在 viewport 中正在看的相机。
+        options.camera = viewport.camera_path.pathString
+        options.output_folder = str(capture_dir)
+        options.file_name = capture_name
+        options.file_type = ".mp4"
+        options.range_type = CaptureRangeType.FRAMES
+        options.start_frame = 1
+        options.end_frame = max(1, int(total_frames))
+        options.capture_every_Nth_frames = max(1, int(args.capture_every_nth_frames))
+        options.fps = float(args.capture_fps)
+        options.res_width = int(args.capture_width)
+        options.res_height = int(args.capture_height)
+        # RAY_TRACE 比默认 PATH_TRACE 快得多，更适合记录实验过程。
+        options.render_preset = CaptureRenderPreset.RAY_TRACE
+        options.spp_per_iteration = 1
+        options.path_trace_spp = 1
+        options.real_time_settle_latency_frames = 1
+        options.overwrite_existing_frames = True
+        # CaptureOptions 的 bitrate 单位是 bits/s。2 Mbps 通常已经够看机械臂动作。
+        options.mp4_encoding_bitrate = int(float(args.capture_bitrate_mbps) * 1024 * 1024)
+        options.mp4_encoding_iframe_interval = max(1, int(float(args.capture_fps) * 2))
+        options.mp4_encoding_preset = "PRESET_DEFAULT"
+        options.mp4_encoding_profile = "H264_PROFILE_HIGH"
+        options.mp4_encoding_rc_mode = "RC_VBR"
+
+        capture = CaptureExtension.get_instance()
+        capture.show_default_progress_window = False
+        capture.options = options
+
+        if not capture.start():
+            print("[runner] warning: viewport capture failed to start; continuing without video", flush=True)
+            return None
+
+        print(
+            "[runner] viewport capture started "
+            f"output={capture_dir / (capture_name + '.mp4')} "
+            f"frames={options.end_frame} fps={options.fps:g} "
+            f"resolution={options.res_width}x{options.res_height} "
+            f"bitrate={args.capture_bitrate_mbps:g}Mbps",
+            flush=True,
+        )
+        return capture
+    except Exception as exc:  # noqa: BLE001 - capture must not break the robot run.
+        print(f"[runner] warning: viewport capture unavailable: {exc}", flush=True)
+        return None
+
+
+def wait_for_viewport_video_capture(capture: Any | None, simulation_app: Any, env: Any, timeout_s: float) -> None:
+    """等待 viewport capture 编码完成。
+
+    Omniverse 的 mp4 capture 会先写临时帧，再异步编码。主动控制结束后如果立刻
+    `simulation_app.close()`，视频文件可能还没来得及落盘。因此这里用 render
+    loop 等一下 capture.done。
+    """
+
+    if capture is None:
+        return
+
+    deadline = time.time() + max(0.0, timeout_s)
+    print("[runner] waiting for viewport capture to finish encoding", flush=True)
+
+    while simulation_app.is_running() and not capture.done and time.time() < deadline:
+        env.sim.render()
+        time.sleep(1.0 / 30.0)
+
+    if capture.done:
+        print(f"[runner] viewport capture outputs: {capture.get_outputs()}", flush=True)
+    else:
+        print("[runner] warning: viewport capture did not finish before timeout", flush=True)
+
+
 def parse_args() -> argparse.Namespace:
     """解析 Isaac runner 的命令行参数。"""
 
@@ -681,6 +810,35 @@ def parse_args() -> argparse.Namespace:
     # 只构造 observation 并请求 GR00T，不执行动作。
     parser.add_argument("--dry-run", action="store_true", help="Build and send one obs, but do not step actions.")
 
+    # 直接调用 Isaac/Omniverse viewport capture extension，把当前 viewport 录成 mp4。
+    parser.add_argument(
+        "--capture-video",
+        action="store_true",
+        help="Record the active Isaac viewport to a compact mp4 during active robot control.",
+    )
+    parser.add_argument(
+        "--capture-dir",
+        default="runs/captures",
+        help="Directory for captured mp4 files. Relative paths are resolved under this experiment folder.",
+    )
+    parser.add_argument("--capture-name", default=None, help="Output mp4 stem. Default: robot_controlmode_timestamp.")
+    parser.add_argument("--capture-width", type=int, default=960)
+    parser.add_argument("--capture-height", type=int, default=540)
+    parser.add_argument("--capture-fps", type=float, default=15.0)
+    parser.add_argument("--capture-bitrate-mbps", type=float, default=2.0)
+    parser.add_argument(
+        "--capture-every-nth-frames",
+        type=int,
+        default=1,
+        help="Capture every Nth viewport frame. Increase to reduce file size further.",
+    )
+    parser.add_argument(
+        "--capture-wait-timeout-s",
+        type=float,
+        default=60.0,
+        help="How long to wait for mp4 encoding before closing Isaac Sim.",
+    )
+
     args = parser.parse_args()
     if args.task is None:
         args.task = "Groot-Franka-SmartTask-v0" if args.robot == "franka" else "LeIsaac-SO101-SmartTask-v0"
@@ -764,6 +922,7 @@ def main() -> None:
 
     # 相机历史缓存，用于构造 GR00T 的两帧 video 输入。
     history = FrameHistory(horizon=max(args.warmup_frames, 2))
+    capture_instance = None
 
     try:
         # 先 ping bridge，确认 GR00T 进程已经启动，并打印 modality schema。
@@ -827,6 +986,13 @@ def main() -> None:
             # 默认 action_horizon=0，表示完整执行 GR00T 返回的 40 步。
             num_action_steps = action_chunk_len(action) if args.action_horizon <= 0 else args.action_horizon
             print(f"[runner] executing {num_action_steps} action steps from this chunk", flush=True)
+
+            # 第一次真正执行动作前启动 viewport capture。这样不会把等待 GR00T
+            # 推理的空窗录进去，也能根据第一段 action chunk 估算总帧数。
+            if args.capture_video and capture_instance is None:
+                remaining_policy_calls = args.max_policy_calls - call_idx
+                estimated_total_frames = max(1, int(num_action_steps * remaining_policy_calls))
+                capture_instance = start_viewport_video_capture(args, estimated_total_frames)
 
             # 内层循环：逐步执行 action chunk。
             for step_idx in range(num_action_steps):
@@ -917,6 +1083,7 @@ def main() -> None:
             if stop_run:
                 break
 
+        wait_for_viewport_video_capture(capture_instance, simulation_app, env, args.capture_wait_timeout_s)
         keep_open(simulation_app, env, args.keep_open_s)
 
     finally:

@@ -699,6 +699,43 @@ conda run -n isaaclab env \
     --instruction "Pick up the red 2x4 lego brick."
 ```
 
+如果想直接把 Isaac viewport 录成视频，可以加 `--capture-video`：
+
+```bash
+cd /home/yzliu/smart_project
+conda run -n isaaclab env \
+  PYTHONPATH=/home/yzliu/smart_project/experiments/groot_n17_isaac_smart_task:/home/yzliu/smart_project/leisaac/source/leisaac \
+  PYTHONDONTWRITEBYTECODE=1 \
+  PYTHONNOUSERSITE=1 \
+  python experiments/groot_n17_isaac_smart_task/run_smart_task_closed_loop.py \
+    --robot franka \
+    --control-mode eef \
+    --no-headless \
+    --render-sleep-s 0.08 \
+    --keep-open-s 60 \
+    --max-policy-calls 1 \
+    --capture-video \
+    --capture-name franka_eef_probe \
+    --instruction "Pick up the red 2x4 lego brick."
+```
+
+录制实现方式：
+
+- runner 调用 Isaac Sim 自带的 `omni.kit.capture.viewport`。
+- mp4 编码依赖同环境已有的 `omni.videoencoding`。
+- 默认只录“主动控制阶段”，不录最后 `--keep-open-s` 的静止观察阶段。
+- 默认输出目录是 `experiments/groot_n17_isaac_smart_task/runs/captures/`。
+- 默认视频参数是 `960x540 / 15fps / 2Mbps`，目的是让文件不要太大。
+
+如果文件仍然太大，可以调低：
+
+```bash
+--capture-bitrate-mbps 1.0
+--capture-width 768
+--capture-height 432
+--capture-every-nth-frames 2
+```
+
 终端 2C：启动 Franka SmartTask viewport，并走 joint-space baseline。
 
 ```bash
