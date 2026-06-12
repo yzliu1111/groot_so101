@@ -196,7 +196,61 @@ Captured videos are written under
 file size further, lower `--capture-bitrate-mbps`, lower
 `--capture-width/--capture-height`, or set `--capture-every-nth-frames 2`.
 
-For a joint-space baseline on the same Franka task:
+## Four Video Probes
+
+For reports, record the full 2x2 comparison:
+
+```text
+SO101  + joint
+SO101  + EEF
+Franka + joint
+Franka + EEF
+```
+
+All four commands share the same GR00T bridge. The mp4 files are written to
+`experiments/groot_n17_isaac_smart_task/runs/captures/`.
+
+SO101 joint-space baseline:
+
+```bash
+cd /home/yzliu/smart_project
+conda run -n isaaclab env \
+  PYTHONPATH=/home/yzliu/smart_project/experiments/groot_n17_isaac_smart_task:/home/yzliu/smart_project/leisaac/source/leisaac \
+  PYTHONDONTWRITEBYTECODE=1 \
+  PYTHONNOUSERSITE=1 \
+  python experiments/groot_n17_isaac_smart_task/run_smart_task_closed_loop.py \
+    --robot so101 \
+    --control-mode joint \
+    --no-headless \
+    --render-sleep-s 0.08 \
+    --keep-open-s 60 \
+    --max-policy-calls 1 \
+    --capture-video \
+    --capture-name so101_joint_probe \
+    --instruction "Pick up the red 2x4 lego brick."
+```
+
+SO101 EEF/IK route:
+
+```bash
+cd /home/yzliu/smart_project
+conda run -n isaaclab env \
+  PYTHONPATH=/home/yzliu/smart_project/experiments/groot_n17_isaac_smart_task:/home/yzliu/smart_project/leisaac/source/leisaac \
+  PYTHONDONTWRITEBYTECODE=1 \
+  PYTHONNOUSERSITE=1 \
+  python experiments/groot_n17_isaac_smart_task/run_smart_task_closed_loop.py \
+    --robot so101 \
+    --control-mode eef \
+    --no-headless \
+    --render-sleep-s 0.08 \
+    --keep-open-s 60 \
+    --max-policy-calls 1 \
+    --capture-video \
+    --capture-name so101_eef_probe \
+    --instruction "Pick up the red 2x4 lego brick."
+```
+
+Franka joint-space baseline:
 
 ```bash
 cd /home/yzliu/smart_project
@@ -211,6 +265,28 @@ conda run -n isaaclab env \
     --render-sleep-s 0.08 \
     --keep-open-s 60 \
     --max-policy-calls 1 \
+    --capture-video \
+    --capture-name franka_joint_probe \
+    --instruction "Pick up the red 2x4 lego brick."
+```
+
+Franka EEF/IK route:
+
+```bash
+cd /home/yzliu/smart_project
+conda run -n isaaclab env \
+  PYTHONPATH=/home/yzliu/smart_project/experiments/groot_n17_isaac_smart_task:/home/yzliu/smart_project/leisaac/source/leisaac \
+  PYTHONDONTWRITEBYTECODE=1 \
+  PYTHONNOUSERSITE=1 \
+  python experiments/groot_n17_isaac_smart_task/run_smart_task_closed_loop.py \
+    --robot franka \
+    --control-mode eef \
+    --no-headless \
+    --render-sleep-s 0.08 \
+    --keep-open-s 60 \
+    --max-policy-calls 1 \
+    --capture-video \
+    --capture-name franka_eef_probe \
     --instruction "Pick up the red 2x4 lego brick."
 ```
 

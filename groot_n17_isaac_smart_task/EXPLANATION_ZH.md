@@ -664,24 +664,47 @@ cd /home/yzliu/smart_project
   --device cuda
 ```
 
-终端 2A：启动原始 SO101 SmartTask viewport，并走 EEF 控制路线。
+终端 2A：启动原始 SO101 SmartTask viewport，并走 joint-space baseline。
 
 ```bash
 cd /home/yzliu/smart_project
 conda run -n isaaclab env \
-  PYTHONPATH=/home/yzliu/smart_project/leisaac/source/leisaac \
+  PYTHONPATH=/home/yzliu/smart_project/experiments/groot_n17_isaac_smart_task:/home/yzliu/smart_project/leisaac/source/leisaac \
   PYTHONDONTWRITEBYTECODE=1 \
   PYTHONNOUSERSITE=1 \
   python experiments/groot_n17_isaac_smart_task/run_smart_task_closed_loop.py \
+    --robot so101 \
+    --control-mode joint \
+    --no-headless \
+    --render-sleep-s 0.08 \
+    --keep-open-s 60 \
+    --max-policy-calls 1 \
+    --capture-video \
+    --capture-name so101_joint_probe \
+    --instruction "Pick up the red 2x4 lego brick."
+```
+
+终端 2B：启动原始 SO101 SmartTask viewport，并走 EEF/IK 控制路线。
+
+```bash
+cd /home/yzliu/smart_project
+conda run -n isaaclab env \
+  PYTHONPATH=/home/yzliu/smart_project/experiments/groot_n17_isaac_smart_task:/home/yzliu/smart_project/leisaac/source/leisaac \
+  PYTHONDONTWRITEBYTECODE=1 \
+  PYTHONNOUSERSITE=1 \
+  python experiments/groot_n17_isaac_smart_task/run_smart_task_closed_loop.py \
+    --robot so101 \
     --control-mode eef \
     --no-headless \
     --render-sleep-s 0.08 \
     --keep-open-s 60 \
     --max-policy-calls 1 \
+    --capture-video \
+    --capture-name so101_eef_probe \
     --instruction "Pick up the red 2x4 lego brick."
 ```
 
-终端 2B：启动 Franka SmartTask viewport，并走 EEF 控制路线。
+终端 2C：启动 Franka SmartTask viewport，并走 joint-space baseline。
 
 ```bash
 cd /home/yzliu/smart_project
@@ -691,15 +714,17 @@ conda run -n isaaclab env \
   PYTHONNOUSERSITE=1 \
   python experiments/groot_n17_isaac_smart_task/run_smart_task_closed_loop.py \
     --robot franka \
-    --control-mode eef \
+    --control-mode joint \
     --no-headless \
     --render-sleep-s 0.08 \
     --keep-open-s 60 \
     --max-policy-calls 1 \
+    --capture-video \
+    --capture-name franka_joint_probe \
     --instruction "Pick up the red 2x4 lego brick."
 ```
 
-如果想直接把 Isaac viewport 录成视频，可以加 `--capture-video`：
+终端 2D：启动 Franka SmartTask viewport，并走 EEF/IK 控制路线。
 
 ```bash
 cd /home/yzliu/smart_project
@@ -719,6 +744,15 @@ conda run -n isaaclab env \
     --instruction "Pick up the red 2x4 lego brick."
 ```
 
+这四条命令会得到一个完整的 2x2 对照：
+
+```text
+SO101  + joint
+SO101  + EEF/IK
+Franka + joint
+Franka + EEF/IK
+```
+
 录制实现方式：
 
 - runner 调用 Isaac Sim 自带的 `omni.kit.capture.viewport`。
@@ -736,26 +770,9 @@ conda run -n isaaclab env \
 --capture-every-nth-frames 2
 ```
 
-终端 2C：启动 Franka SmartTask viewport，并走 joint-space baseline。
+这四条 Isaac 命令共用同一个 GR00T bridge。差别只在：
 
-```bash
-cd /home/yzliu/smart_project
-conda run -n isaaclab env \
-  PYTHONPATH=/home/yzliu/smart_project/experiments/groot_n17_isaac_smart_task:/home/yzliu/smart_project/leisaac/source/leisaac \
-  PYTHONDONTWRITEBYTECODE=1 \
-  PYTHONNOUSERSITE=1 \
-  python experiments/groot_n17_isaac_smart_task/run_smart_task_closed_loop.py \
-    --robot franka \
-    --control-mode joint \
-    --no-headless \
-    --render-sleep-s 0.08 \
-    --keep-open-s 60 \
-    --max-policy-calls 1 \
-    --instruction "Pick up the red 2x4 lego brick."
-```
-
-这三条 Isaac 命令共用同一个 GR00T bridge。差别只在：
-
-- SO101 EEF：验证“原 LeIsaac 机器人 + EEF action 落地”。
-- Franka EEF：验证“更接近 GR00T 官方 embodiment 的机器人 + EEF action 落地”。
+- SO101 joint：验证“DROID/Franka 风格 7D joint action 硬落到 SO101 joint space”的 baseline。
+- SO101 EEF：验证“原 LeIsaac 机器人 + EEF/IK action 落地”。
 - Franka joint：验证“7D joint action 在 Franka 上是否比 SO101 更自然”。
+- Franka EEF：验证“更接近 GR00T 官方 embodiment 的机器人 + EEF/IK action 落地”。
