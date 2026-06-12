@@ -521,6 +521,230 @@ def tensor_values(tensor: torch.Tensor) -> list[float]:
     return tensor.detach().cpu().numpy()[0].round(4).tolist()
 
 
+def tensor_first_row(tensor: torch.Tensor) -> np.ndarray:
+    """把 torch tensor 的第一个 env 拿到 CPU numpy，供诊断日志使用。"""
+
+    return tensor.detach().cpu().numpy()[0]
+
+
+def format_vec(values: np.ndarray, precision: int = 4) -> str:
+    """把短向量格式化成日志友好的 `[x, y, z]` 字符串。"""
+
+    rounded = np.asarray(values, dtype=np.float64).round(precision).tolist()
+    return str(rounded)
+
+
+def get_usd_stage(env: Any) -> Any | None:
+    """取得当前 Isaac Sim 的 USD stage。
+
+    优先从 `env.sim.stage` 读取；如果 IsaacLab 版本没有暴露这个属性，再退回
+    Omniverse 全局 USD context。这个函数只用于 debug，不影响正常控制。
+    """
+
+    stage = getattr(getattr(env, "sim", None), "stage", None)
+    if stage is not None:
+        return stage
+
+    try:
+        import omni.usd
+
+        return omni.usd.get_context().get_stage()
+    except Exception:  # noqa: BLE001 - debug helper should be best-effort.
+        return None
+
+
+def usd_world_pose(stage: Any, prim_path: str) -> tuple[np.ndarray, np.ndarray] | None:
+    """读取某个 USD prim 的世界位姿。
+
+    返回：
+    - `pos_w`：世界坐标位置，shape `(3,)`。
+    - `quat_wxyz`：世界坐标旋转四元数，shape `(4,)`，顺序 `(w, x, y, z)`。
+
+    这里直接查 USD Xform，而不是依赖 camera sensor 的 `data.pos_w`，因为有些
+    IsaacLab 版本默认 `update_latest_camera_pose=False`，sensor data 不一定实时更新。
+    """
+
+    if stage is None or not prim_path:
+        return None
+
+    try:
+        from pxr import UsdGeom
+
+        prim = stage.GetPrimAtPath(prim_path)
+        if not prim or not prim.IsValid():
+            return None
+
+        matrix = UsdGeom.XformCache().GetLocalToWorldTransform(prim)
+        translation = matrix.ExtractTranslation()
+        rotation = matrix.ExtractRotationQuat()
+        imaginary = rotation.GetImaginary()
+        pos_w = np.array([translation[0], translation[1], translation[2]], dtype=np.float64)
+        quat_wxyz = np.array(
+            [rotation.GetReal(), imaginary[0], imaginary[1], imaginary[2]],
+            dtype=np.float64,
+        )
+        return pos_w, quat_wxyz
+    except Exception as exc:  # noqa: BLE001 - keep debug non-fatal.
+        print(f"[runner] camera-debug warning: failed reading USD pose for {prim_path}: {exc}", flush=True)
+        return None
+
+
+def usd_camera_prim_paths(stage: Any) -> list[str]:
+    """列出当前 USD stage 中所有 UsdGeom.Camera prim 的路径。"""
+
+    if stage is None:
+        return []
+
+    try:
+        from pxr import UsdGeom
+
+        return [prim.GetPath().pathString for prim in stage.Traverse() if prim.IsA(UsdGeom.Camera)]
+    except Exception as exc:  # noqa: BLE001 - keep debug non-fatal.
+        print(f"[runner] camera-debug warning: failed traversing USD cameras: {exc}", flush=True)
+        return []
+
+
+def sensor_prim_paths(sensor: Any) -> list[str]:
+    """从 IsaacLab sensor 对象中尽量取出实例化后的 prim path。"""
+
+    view = getattr(sensor, "_view", None)
+    prim_paths = getattr(view, "prim_paths", None)
+    if prim_paths is None:
+        return []
+    return [str(path) for path in prim_paths]
+
+
+def save_policy_camera_frames(policy_obs: dict[str, torch.Tensor], output_dir: str | Path) -> None:
+    """把当前 policy observation 里的 camera 图像保存成 png。
+
+    这一步用于确认“GR00T 实际拿到的图像内容”。它保存的是 observation tensor，
+    不是 viewport 截屏，所以最适合排查相机是否被挡住、方向是否反了、腕部相机
+    是否跟着手爪移动。
+    """
+
+    output_path = Path(output_dir).expanduser()
+    if not output_path.is_absolute():
+        output_path = SCRIPT_DIR / output_path
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    try:
+        from PIL import Image
+    except Exception as exc:  # noqa: BLE001 - PIL may be absent in minimal envs.
+        print(f"[runner] camera-debug warning: cannot save png frames because PIL import failed: {exc}", flush=True)
+        return
+
+    saved = []
+    for key in sorted(policy_obs):
+        if not key.startswith("camera"):
+            continue
+        frame = image_to_numpy(policy_obs[key])
+        file_path = output_path / f"{key}.png"
+        Image.fromarray(frame).save(file_path)
+        saved.append(str(file_path))
+
+    print(f"[runner] camera-debug saved policy camera frames: {saved}", flush=True)
+
+
+def print_camera_debug(env: Any, policy_obs: dict[str, torch.Tensor], robot_kind: str, frame_dir: str | None) -> None:
+    """打印 SmartTask/Franka 相机诊断信息。
+
+    诊断目标：
+    - 确认 policy observation 中实际有哪些 camera key。
+    - 确认 InteractiveScene 中实例化了哪些 camera sensor。
+    - 确认 USD stage 中为什么会看到多个 camera prim。
+    - 对 Franka 尤其确认 `wrist` camera 和 `panda_hand` 的世界位置关系。
+    """
+
+    print("[runner] camera-debug begin", flush=True)
+
+    for key in sorted(policy_obs):
+        if not key.startswith("camera"):
+            continue
+        tensor = policy_obs[key]
+        frame = image_to_numpy(tensor)
+        print(
+            "[runner] camera-debug policy "
+            f"{key}: tensor_shape={tuple(tensor.shape)} frame_shape={tuple(frame.shape)} "
+            f"dtype={frame.dtype} min={int(frame.min())} max={int(frame.max())} "
+            f"mean={float(frame.mean()):.2f} std={float(frame.std()):.2f}",
+            flush=True,
+        )
+
+    scene_sensors = getattr(env.scene, "sensors", {})
+    print(f"[runner] camera-debug scene sensor names: {sorted(scene_sensors.keys())}", flush=True)
+    for name, sensor in sorted(scene_sensors.items()):
+        cfg = getattr(sensor, "cfg", None)
+        cfg_prim = getattr(cfg, "prim_path", None)
+        paths = sensor_prim_paths(sensor)
+        print(
+            "[runner] camera-debug sensor "
+            f"{name}: class={sensor.__class__.__name__} cfg_prim_path={cfg_prim} instantiated_paths={paths}",
+            flush=True,
+        )
+
+    stage = get_usd_stage(env)
+    camera_paths = usd_camera_prim_paths(stage)
+    print(f"[runner] camera-debug USD camera count={len(camera_paths)}", flush=True)
+    for path in camera_paths:
+        pose = usd_world_pose(stage, path)
+        if pose is None:
+            print(f"[runner] camera-debug USD camera {path}: pose=<unavailable>", flush=True)
+            continue
+        pos_w, quat_wxyz = pose
+        print(
+            "[runner] camera-debug USD camera "
+            f"{path}: pos_w={format_vec(pos_w)} quat_wxyz={format_vec(quat_wxyz)}",
+            flush=True,
+        )
+
+    robot = env.scene["robot"]
+    print(f"[runner] camera-debug robot body names: {robot.data.body_names}", flush=True)
+
+    body_names_to_report = ["panda_link0", "panda_hand", "panda_leftfinger", "panda_rightfinger"]
+    if robot_kind != "franka":
+        body_names_to_report = ["base", "gripper", "jaw"]
+
+    body_positions: dict[str, np.ndarray] = {}
+    for body_name in body_names_to_report:
+        if body_name not in robot.data.body_names:
+            continue
+        body_idx = robot.data.body_names.index(body_name)
+        pos_w = tensor_first_row(robot.data.body_pos_w[:, body_idx, :])
+        quat_w = tensor_first_row(robot.data.body_quat_w[:, body_idx, :])
+        body_positions[body_name] = pos_w
+        print(
+            "[runner] camera-debug body "
+            f"{body_name}: pos_w={format_vec(pos_w)} quat_wxyz={format_vec(quat_w)}",
+            flush=True,
+        )
+
+    if "wrist" in scene_sensors:
+        wrist_paths = sensor_prim_paths(scene_sensors["wrist"])
+        wrist_path = wrist_paths[0] if wrist_paths else getattr(scene_sensors["wrist"].cfg, "prim_path", "")
+        wrist_pose = usd_world_pose(stage, wrist_path)
+        hand_pos = body_positions.get("panda_hand")
+        if hand_pos is None:
+            hand_pos = body_positions.get("gripper")
+        if wrist_pose is not None and hand_pos is not None:
+            wrist_pos, _ = wrist_pose
+            delta = wrist_pos - hand_pos
+            print(
+                "[runner] camera-debug wrist_to_hand "
+                f"wrist_path={wrist_path} delta_pos_w={format_vec(delta)} distance={float(np.linalg.norm(delta)):.4f}",
+                flush=True,
+            )
+
+    if "red_2x4_lego_brick" in env.scene.rigid_objects:
+        lego = env.scene["red_2x4_lego_brick"]
+        lego_pos = tensor_first_row(lego.data.root_pos_w)
+        print(f"[runner] camera-debug lego pos_w={format_vec(lego_pos)}", flush=True)
+
+    if frame_dir is not None:
+        save_policy_camera_frames(policy_obs, frame_dir)
+
+    print("[runner] camera-debug end", flush=True)
+
+
 def smart_task_metrics(env: Any, robot_kind: str) -> dict[str, float]:
     """从 Isaac scene 中读取几个用于判断 pick 进展的诊断指标。
 
@@ -838,10 +1062,27 @@ def parse_args() -> argparse.Namespace:
         default=60.0,
         help="How long to wait for mp4 encoding before closing Isaac Sim.",
     )
+    parser.add_argument(
+        "--debug-cameras",
+        action="store_true",
+        help="Print policy camera tensors, scene camera sensors, USD camera prims, and wrist/body poses after reset.",
+    )
+    parser.add_argument(
+        "--debug-cameras-only",
+        action="store_true",
+        help="Run only the camera diagnostics after env reset, without connecting to the GR00T bridge.",
+    )
+    parser.add_argument(
+        "--debug-camera-frame-dir",
+        default=None,
+        help="Optional directory for saving current policy camera1/camera2/camera3 frames as png.",
+    )
 
     args = parser.parse_args()
     if args.task is None:
         args.task = "Groot-Franka-SmartTask-v0" if args.robot == "franka" else "LeIsaac-SO101-SmartTask-v0"
+    if args.debug_cameras_only:
+        args.debug_cameras = True
     return args
 
 
@@ -925,6 +1166,28 @@ def main() -> None:
     capture_instance = None
 
     try:
+        print(
+            f"[runner] robot={args.robot} task={args.task} control mode={args.control_mode} "
+            f"teleop_device={teleop_device}",
+            flush=True,
+        )
+
+        # reset Isaac env，拿到第一帧 observation。相机 debug 也必须放在 reset 后，
+        # 因为此时 sensor/view/prim 才完整实例化。
+        obs, _ = env.reset()
+        policy_obs = obs["policy"]
+
+        if args.debug_cameras:
+            debug_frame_dir = args.debug_camera_frame_dir
+            if debug_frame_dir is None and args.debug_cameras_only:
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                debug_frame_dir = f"runs/camera_debug/{args.robot}_{args.control_mode}_{timestamp}"
+            print_camera_debug(env, policy_obs, args.robot, debug_frame_dir)
+
+        if args.debug_cameras_only:
+            keep_open(simulation_app, env, args.keep_open_s)
+            return
+
         # 先 ping bridge，确认 GR00T 进程已经启动，并打印 modality schema。
         print("[runner] ping bridge", flush=True)
         ping = request(args.bridge_host, args.bridge_port, {"endpoint": "ping"}, args.timeout_s)
@@ -932,15 +1195,6 @@ def main() -> None:
             raise RuntimeError(ping)
 
         print(f"[runner] bridge modality: {ping.get('modality')}", flush=True)
-        print(
-            f"[runner] robot={args.robot} task={args.task} control mode={args.control_mode} "
-            f"teleop_device={teleop_device}",
-            flush=True,
-        )
-
-        # reset Isaac env，拿到第一帧 observation。
-        obs, _ = env.reset()
-        policy_obs = obs["policy"]
 
         print(f"[runner] initial joint_pos values={tensor_values(policy_obs['joint_pos'])}", flush=True)
         print_metrics(env, "initial", args.robot)

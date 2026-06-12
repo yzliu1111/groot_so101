@@ -56,13 +56,14 @@ class FrankaSmartTaskSceneCfg(SmartTaskSceneCfg):
         ],
     )
 
-    # 腕部相机挂到 Franka panda_hand 下。位置/朝向先取一个保守近似：
-    # 相机略高于手爪中心，并朝向手爪前方。后续可通过 viewport 再微调。
+    # 腕部相机挂到 Franka panda_hand 下。这里采用 copied IsaacLab 官方
+    # `stack_ik_rel_visuomotor_env_cfg.py` 里的 Franka wrist camera offset：
+    # 它比最初的保守近似更接近“安装在手腕、朝向 gripper 工作区”的视角。
     wrist: TiledCameraCfg = TiledCameraCfg(
         prim_path="{ENV_REGEX_NS}/Robot/panda_hand/wrist_camera",
         offset=TiledCameraCfg.OffsetCfg(
-            pos=(0.0, 0.0, 0.08),
-            rot=(0.0, 1.0, 0.0, 0.0),
+            pos=(0.13, 0.0, -0.15),
+            rot=(-0.70614, 0.03701, 0.03701, -0.70614),
             convention="ros",
         ),
         data_types=["rgb"],
