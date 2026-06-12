@@ -30,6 +30,12 @@ but replaces the SO101 robot with IsaacLab's copied `FRANKA_PANDA_HIGH_PD_CFG`.
 This is meant to reduce the mismatch between GR00T N1.7's OXE/DROID-style
 outputs and SO101's much smaller morphology.
 
+The Franka route reuses the SmartTask scene assets, but keeps Franka-specific
+robot, EEF, wrist camera, gripper, and action semantics. In particular,
+`camera1` is the fixed SmartScene external view used for global object
+localization, while `camera3` is the Franka wrist view and is not forced to see
+the lego in the initial pose.
+
 ## Terminal 1: GR00T Bridge
 
 ```bash
@@ -65,7 +71,7 @@ conda run -n isaaclab env \
     --instruction "Pick up the red 2x4 lego brick."
 ```
 
-Then try one short closed-loop chunk:
+Then try a closed-loop probe:
 
 ```bash
 cd /home/yzliu/smart_project
@@ -74,9 +80,13 @@ conda run -n isaaclab env \
   PYTHONDONTWRITEBYTECODE=1 \
   PYTHONNOUSERSITE=1 \
   python experiments/groot_n17_isaac_smart_task/run_smart_task_closed_loop.py \
-    --max-policy-calls 1 \
+    --max-policy-calls 8 \
     --instruction "Pick up the red 2x4 lego brick."
 ```
+
+For actual motion inspection or recorded videos, use more than one GR00T action
+chunk. The examples below use `--max-policy-calls 8`; `--max-policy-calls 1` is
+only a smoke test and usually produces a very short active-control video.
 
 ## Viewport Mode
 
@@ -93,7 +103,7 @@ conda run -n isaaclab env \
   python experiments/groot_n17_isaac_smart_task/run_smart_task_closed_loop.py \
     --no-headless \
     --keep-open-s 60 \
-    --max-policy-calls 1 \
+    --max-policy-calls 8 \
     --instruction "Pick up the red 2x4 lego brick."
 ```
 
@@ -143,7 +153,7 @@ conda run -n isaaclab env \
     --no-headless \
     --render-sleep-s 0.08 \
     --keep-open-s 60 \
-    --max-policy-calls 1 \
+    --max-policy-calls 8 \
     --instruction "Pick up the red 2x4 lego brick."
 ```
 
@@ -165,7 +175,7 @@ conda run -n isaaclab env \
     --no-headless \
     --render-sleep-s 0.08 \
     --keep-open-s 60 \
-    --max-policy-calls 1 \
+    --max-policy-calls 8 \
     --instruction "Pick up the red 2x4 lego brick."
 ```
 
@@ -185,7 +195,7 @@ conda run -n isaaclab env \
     --no-headless \
     --render-sleep-s 0.08 \
     --keep-open-s 60 \
-    --max-policy-calls 1 \
+    --max-policy-calls 8 \
     --capture-video \
     --capture-name franka_eef_probe \
     --instruction "Pick up the red 2x4 lego brick."
@@ -195,6 +205,40 @@ Captured videos are written under
 `experiments/groot_n17_isaac_smart_task/runs/captures/` by default. To reduce
 file size further, lower `--capture-bitrate-mbps`, lower
 `--capture-width/--capture-height`, or set `--capture-every-nth-frames 2`.
+
+## Camera Diagnostics
+
+Before interpreting a policy run, inspect the actual policy images:
+
+```bash
+cd /home/yzliu/smart_project
+conda run -n isaaclab env \
+  PYTHONPATH=/home/yzliu/smart_project/experiments/groot_n17_isaac_smart_task:/home/yzliu/smart_project/leisaac/source/leisaac \
+  PYTHONDONTWRITEBYTECODE=1 \
+  PYTHONNOUSERSITE=1 \
+  python experiments/groot_n17_isaac_smart_task/run_smart_task_closed_loop.py \
+    --robot franka \
+    --control-mode eef \
+    --headless \
+    --debug-cameras-only
+```
+
+This does not connect to the GR00T bridge. It resets Isaac once, prints policy
+camera tensor statistics, lists scene camera sensors and USD camera prims, and
+saves `camera1.png`, `camera2.png`, and `camera3.png` under
+`runs/camera_debug/`.
+
+Current image semantics:
+
+- `camera1`: fixed SmartScene external camera, sent to
+  `video.exterior_image_1_left`.
+- `camera2`: fixed SmartScene left camera, retained in policy observations but
+  not sent to GR00T in this OXE/DROID probe.
+- `camera3`: robot wrist camera, sent to `video.wrist_image_left`.
+
+For Franka, `camera3` should keep the wrist/gripper-view meaning. It should not
+be rotated just to see the lego at the initial pose; the initial global target
+view comes from `camera1`.
 
 ## Four Video Probes
 
@@ -224,7 +268,7 @@ conda run -n isaaclab env \
     --no-headless \
     --render-sleep-s 0.08 \
     --keep-open-s 60 \
-    --max-policy-calls 1 \
+    --max-policy-calls 8 \
     --capture-video \
     --capture-name so101_joint_probe \
     --instruction "Pick up the red 2x4 lego brick."
@@ -244,7 +288,7 @@ conda run -n isaaclab env \
     --no-headless \
     --render-sleep-s 0.08 \
     --keep-open-s 60 \
-    --max-policy-calls 1 \
+    --max-policy-calls 8 \
     --capture-video \
     --capture-name so101_eef_probe \
     --instruction "Pick up the red 2x4 lego brick."
@@ -264,7 +308,7 @@ conda run -n isaaclab env \
     --no-headless \
     --render-sleep-s 0.08 \
     --keep-open-s 60 \
-    --max-policy-calls 1 \
+    --max-policy-calls 8 \
     --capture-video \
     --capture-name franka_joint_probe \
     --instruction "Pick up the red 2x4 lego brick."
@@ -284,7 +328,7 @@ conda run -n isaaclab env \
     --no-headless \
     --render-sleep-s 0.08 \
     --keep-open-s 60 \
-    --max-policy-calls 1 \
+    --max-policy-calls 8 \
     --capture-video \
     --capture-name franka_eef_probe \
     --instruction "Pick up the red 2x4 lego brick."
@@ -296,11 +340,20 @@ The first probe uses the GR00T N1.7 base-model OXE/DROID schema:
 
 - `camera1` -> `video.exterior_image_1_left`
 - `camera3` -> `video.wrist_image_left`
+- `camera2` remains available in the Isaac policy observation but is not sent to
+  GR00T for the current OXE/DROID embodiment.
 - `ee_frame_state` -> `state.eef_9d`
 - SO101 6D joint state padded to 7D -> `state.joint_position`
+- Franka 7D arm joint state -> `state.joint_position`
 - gripper joint -> `state.gripper_position`
-- default `--control-mode joint`: returned `action.joint_position[..., :6]` -> LeIsaac SO101 joint command
-- optional `--control-mode eef`: returned relative `action.eef_9d` plus `action.gripper_position` -> LeIsaac `mimic_so101leader` IK command
+- SO101 `--control-mode joint`: returned `action.joint_position[..., :6]`
+  -> LeIsaac SO101 joint command
+- SO101 `--control-mode eef`: returned relative `action.eef_9d` plus
+  `action.gripper_position` -> LeIsaac `mimic_so101leader` IK command
+- Franka `--control-mode joint`: returned relative `action.joint_position`
+  -> Franka 7D joint target plus binary gripper
+- Franka `--control-mode eef`: returned relative `action.eef_9d` plus
+  `action.gripper_position` -> Franka Differential IK target plus binary gripper
 
 This is intentionally a probe, not a claim that SO101 equals the DROID
 embodiment. If this fails physically but the action stream is nontrivial, the

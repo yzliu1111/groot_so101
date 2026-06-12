@@ -117,7 +117,7 @@ conda run -n isaaclab env \
     --no-headless \
     --render-sleep-s 0.08 \
     --keep-open-s 60 \
-    --max-policy-calls 1 \
+    --max-policy-calls 8 \
     --instruction "Pick up the red 2x4 lego brick."
 ```
 
@@ -234,7 +234,13 @@ import franka_smart_task
 
 ### 5.1.2 复用哪些东西
 
-Franka task 继承 LeIsaac 的 `SmartTaskEnvCfg` 和 `SmartTaskSceneCfg`，所以继续复用：
+Franka task 仍然复用 LeIsaac 的 `SmartTaskSceneCfg` / observation schema，但
+`__post_init__()` 不再直接走 `SmartTaskEnvCfg.__post_init__()`。原因是
+`SmartTaskEnvCfg.__post_init__()` 里包含 SO101 的 robot init 假设；Franka 版现在
+显式调用更底层的 `SingleArmTaskEnvCfg.__post_init__()`，然后只复刻 SmartTask 需要的
+场景资产解析和 lego 随机化。
+
+所以 Franka 路线继续复用：
 
 - SmartScene USD。
 - 红色 2x4 lego brick。
@@ -244,7 +250,13 @@ Franka task 继承 LeIsaac 的 `SmartTaskEnvCfg` 和 `SmartTaskSceneCfg`，所�
 - reward / termination / scene entity 命名的大部分约定。
 - IsaacLab ManagerBasedRLEnv 创建方式。
 
-因此它不是另起炉灶写一个新仿真项目，而是在 LeIsaac 已有任务结构上替换 robot embodiment。
+但机器人相关的 init pose、wrist camera、EEF frame、gripper action 和 action manager
+都按 Franka embodiment 重新定义。它不是另起炉灶写一个新仿真项目，而是：
+
+```text
+SmartScene / lego / 固定外部相机：复用 LeIsaac
+robot / EEF / wrist / gripper / action：按 Franka 语义定义
+```
 
 ### 5.1.3 替换哪些东西
 
@@ -271,14 +283,31 @@ Franka 没有 SO101 的 follower link 命名，所以 `ee_frame` 改成跟踪 `p
 - `end_effector`：用于 `ee_frame_state`，给 GR00T 构造 `state.eef_9d`。
 - `grasp_center`：用于诊断指标和 LeIsaac 原始 `object_grasped` 里对 `target_pos_w[:, 1, :]` 的访问约定。
 
-3. wrist/front 相机挂载点：
+3. wrist 相机和固定外部相机：
 
-SO101 原 config 里有相机挂在 `Robot/base` 或 wrist link 上。Franka 版本需要改到：
+当前 GR00T OXE/DROID probe 真正送给模型的是两路图像：
 
-- wrist camera：`Robot/panda_hand/wrist_camera`
-- front camera：`Robot/panda_link0/front_camera`
+```text
+camera1 -> video.exterior_image_1_left
+camera3 -> video.wrist_image_left
+```
 
-即使 SmartTask policy 后面删掉 front observation，InteractiveScene 仍然会实例化 scene cfg 里的 sensor，所以 front camera 的 prim path 也必须有效。
+其中：
+
+- `camera1` 是 SmartScene USD 里的固定外部相机：
+  `Scene/camera_front_xform/camera_front`。它负责初始全局定位，能看到盘面和 lego。
+- `camera3` 是 Franka wrist camera：
+  `Robot/panda_hand/wrist_camera`。它保留腕部/夹爪视角语义，跟着 `panda_hand` 运动。
+- `camera2` 是 SmartScene USD 里的左侧固定相机，仍保留在 policy observation 中，但当前
+  OXE/DROID GR00T probe 没有把它送给模型。
+
+这里有一个重要结论：Franka 当前 ready pose 下，夹爪方向和 lego 所在方向并不天然一致。
+因此不应该为了让 wrist 初始帧看到 lego 而把 wrist 相机旋成“看目标”的相机；那会破坏
+真实 wrist camera 的语义。初始目标定位应该交给固定外部相机 `camera1`，wrist 相机主要服务于
+靠近目标和闭合夹爪阶段。
+
+Franka 版还显式去掉了 SO101 模板里遗留的 robot-mounted `front` sensor，避免 Isaac stage 中
+多出一个与当前 GR00T 输入无关的机器人前置相机。
 
 4. action 配置：
 
@@ -325,6 +354,20 @@ Franka Panda 则天然是：
 
 所以它可以更直接地承接 GR00T 的 `joint_position` 和 `eef_9d + gripper_position` 输出。这样如果失败，至少可以少一个“机器人形态差太多”的解释。
 
+### 5.1.5 Franka cfg 当前采用的原则
+
+Franka route 当前的原则是：
+
+- 不再把 SO101 的 robot init、front camera、wrist offset 直接套到 Franka 上。
+- 使用 copied IsaacLab 里的 `FRANKA_PANDA_HIGH_PD_CFG`。
+- 使用 copied IsaacLab Franka stack task 的 ready joint pose 作为桌面任务起点。
+- wrist camera 使用 Franka wrist/gripper 视角语义，不强行初始看 lego。
+- 固定外部相机 `camera1` 承担全局目标观测。
+- reset 后启用 `rerender_on_reset=True`，避免相机 observation 仍是旧缓存帧。
+
+这也意味着 Franka 路线验证的是“更接近 GR00T OXE/DROID embodiment 的机器人，在同一个
+SmartScene 任务里是否更自然”，而不是“把 SO101 的所有 cfg 名字换成 Franka”。
+
 ## 6. Observation 如何从 LeIsaac 转成 GR00T
 
 GR00T N1.7 base model 使用的是 OXE/DROID embodiment：
@@ -364,6 +407,33 @@ Isaac 侧的 `build_oxe_observation()` 把 LeIsaac observation 映射成这个 s
 LeIsaac camera1 -> GR00T video.exterior_image_1_left
 LeIsaac camera3 -> GR00T video.wrist_image_left
 ```
+
+`camera2` 仍然存在于 Isaac policy observation 中，但当前没有送入 GR00T。这是因为
+`OXE_DROID_RELATIVE_EEF_RELATIVE_JOINT` embodiment 的 video modality 只声明了
+`exterior_image_1_left` 和 `wrist_image_left` 两路。
+
+调试相机时可以运行：
+
+```bash
+cd /home/yzliu/smart_project
+conda run -n isaaclab env \
+  PYTHONPATH=/home/yzliu/smart_project/experiments/groot_n17_isaac_smart_task:/home/yzliu/smart_project/leisaac/source/leisaac \
+  PYTHONDONTWRITEBYTECODE=1 \
+  PYTHONNOUSERSITE=1 \
+  python experiments/groot_n17_isaac_smart_task/run_smart_task_closed_loop.py \
+    --robot franka \
+    --control-mode eef \
+    --headless \
+    --debug-cameras-only
+```
+
+这个模式不会连接 GR00T bridge，只会 reset Isaac env，一次性打印：
+
+- policy 中 `camera1/camera2/camera3` 的 shape、像素范围、均值和方差。
+- InteractiveScene 中实际注册了哪些 sensors。
+- USD stage 中实际有哪些 camera prim。
+- wrist camera 和 `panda_hand` 的世界坐标关系。
+- 当前三路 policy 图像 PNG，默认保存在 `runs/camera_debug/`。
 
 GR00T OXE/DROID config 的 video delta indices 是 `[-15, 0]`，意思是模型希望看到一个历史帧和一个当前帧。实验里用 `FrameHistory` 保存相机历史，然后取最旧帧和最新帧，组成：
 
@@ -410,6 +480,15 @@ SO101 6D -> DROID 7D
 
 这只是为了让 schema 对上，不代表语义完全正确。
 
+Franka 的 arm 正好是 7DoF，所以：
+
+```text
+Franka panda_joint1..7 -> DROID 7D joint_position
+```
+
+这比 SO101 padding 合理得多，但仍然要注意：GR00T 输出的是 DROID/OXE 训练语义下的
+relative joint action，不等于“任何 7DoF 机器人都能直接完美执行”。
+
 ### 6.4 Gripper 状态映射
 
 SO101 第 6 个 joint 是 gripper，所以：
@@ -419,6 +498,12 @@ state.gripper_position = joint_pos[5]
 ```
 
 shape 写成 `(1, 1, 1)`，符合 GR00T 的 batch/time/dim 约定。
+
+Franka 则有两个 finger joint，当前实验取两个 finger joint 的平均开口作为：
+
+```text
+state.gripper_position = mean(panda_finger_joint1, panda_finger_joint2)
+```
 
 ### 6.5 Language 映射
 
@@ -519,10 +604,11 @@ N 字节 payload：msgpack 编码后的 dict
 --control-mode joint
 ```
 
-LeIsaac action mode：
+Isaac action mode：
 
 ```text
-so101leader
+SO101  -> so101leader
+Franka -> franka_joint
 ```
 
 GR00T 输出：
@@ -534,14 +620,16 @@ action.joint_position: shape = (1, 40, 7)
 实验处理：
 
 ```text
-取前 6 维 -> LeIsaac SO101 6D joint command
+SO101:  取前 6 维 -> LeIsaac SO101 6D joint command
+Franka: 7D relative joint action + current joint state -> Franka 7D joint target
 ```
 
 问题：
 
 - GR00T 的 joint_position 是 DROID/Franka 类机器人语义。
 - SO101 是完全不同的 5DoF arm + gripper。
-- 直接取前 6 维会非常粗糙，容易动作小、不朝任务目标去。
+- SO101 直接取前 6 维会非常粗糙，容易动作小、不朝任务目标去。
+- Franka joint route 形态更匹配，但仍受 GR00T joint action 语义和当前场景分布影响。
 
 实际日志也显示，joint 路线里模型并非完全没 action，但执行到 SO101 上后动作幅度和语义都不理想。
 
@@ -553,13 +641,14 @@ action.joint_position: shape = (1, 40, 7)
 --control-mode eef
 ```
 
-LeIsaac action mode：
+Isaac action mode：
 
 ```text
-mimic_so101leader
+SO101  -> mimic_so101leader
+Franka -> franka_ik
 ```
 
-这个模式在 LeIsaac 里使用 Differential IK，action 格式是：
+这两个模式都使用 Differential IK，action 格式是：
 
 ```text
 [x, y, z, qw, qx, qy, qz, gripper]
@@ -604,6 +693,9 @@ command = [target_x, target_y, target_z, target_qw, target_qx, target_qy, target
 env.step(command)
 ```
 
+对 Franka 来说，最后一维 gripper 不是 SO101 的连续 gripper joint target，而是
+`BinaryJointPositionActionCfg` 的开/合命令：正数表示 open，负数表示 close。
+
 这条路线更接近跨机器人迁移，因为末端位姿比原始关节更接近机器人无关的动作表达。
 
 实际观察中，EEF 路线明显比 joint 路线动作更大，说明 GR00T 输出的 EEF action 确实更有信号。
@@ -615,17 +707,24 @@ env.step(command)
 - joint 路线动作很小或语义不明显。
 - EEF 路线动作明显更大。
 - 但在当前 SO101 + SmartTask + OXE/DROID zero-shot setup 下，没有可靠抓起红色 2x4 lego。
+- Franka 路线已经隔离出来，并且不再照搬 SO101 的 robot/front/wrist cfg。
+- Franka 的固定外部相机 `camera1` 可以看到目标物；wrist 相机保持末端/夹爪视角语义，不再强行旋向 lego。
 
 这说明：
 
 1. GR00T N1.7 并不是完全没有输出动作。
 2. 之前“看起来没动作”的主要原因，是 joint action schema 落到 SO101 上非常别扭。
 3. EEF/IK 路线更能释放 GR00T 的动作意图。
-4. 但 zero-shot 到 SO101/lego pick 仍然没有成功。
+4. Franka 路线更适合判断 N1.7 在 OXE/DROID 风格 embodiment 下的真实表现。
+5. 但 zero-shot 到这个 SmartScene/lego pick 任务是否能成功，仍需要继续用 Franka EEF/IK 长一点的闭环视频来观察。
 
 更准确的结论应该是：
 
 > N1.7 base model 在这个 LeIsaac SmartTask 场景中有非空、较强的末端动作意图；EEF 控制路线比 joint 硬映射合理得多。但在没有针对 SO101 embodiment 和该任务微调的情况下，当前 setup 没有实现可靠 zero-shot pick。
+
+对 Franka 路线更准确的说法是：
+
+> Franka task 已经变成更干净的 embodiment 对照：场景仍是同一个 SmartScene，但 robot/EEF/wrist/gripper/action 都按 Franka 语义处理。接下来 Franka 的失败或成功，更能说明 GR00T N1.7 在相对接近 OXE/DROID embodiment 的设置下是否具备 zero-shot pick 能力。
 
 ## 11. 为什么这不是“模型完全不行”的证明
 
@@ -636,6 +735,7 @@ env.step(command)
 - SO101 gripper 的尺度和 DROID/Franka gripper 语义未必一致。
 - 这个 SmartTask 场景和红色 lego pick 的视觉/几何分布未必在 base model 舒适区。
 - 当前 EEF relative/absolute 解读仍然是实验假设，需要更多日志验证。
+- Franka 版本虽然减少了 SO101 morphology mismatch，但 SmartScene 的物体布局、夹爪初始朝向、固定外部相机分布仍然不是 GR00T 官方任务配置。
 
 所以当前结果更适合被理解为：
 
@@ -645,11 +745,12 @@ env.step(command)
 
 建议后续按优先级做：
 
-1. 记录一轮 EEF 路线日志，观察 `jaw_to_lego` 是否下降、gripper 是否闭合。
-2. 如果 jaw 没朝物体去，说明 policy/视觉语义不够。
-3. 如果 jaw 接近但没夹住，说明 gripper/IK/接触参数是主要问题。
-4. 尝试更接近 GR00T 官方 embodiment 的 Franka/Panda 场景，减少 SO101 morphology mismatch。
-5. 如果公司后续有真实 SO101/SOARM 数据，可以考虑对 N1.7 做小规模 embodiment finetune。
+1. 优先跑 Franka + EEF/IK 的 8-call 视频，观察末端是否朝盘面/lego 区域运动。
+2. 同时保留 SO101 + EEF/IK 作为对照，比较“同一模型输出落在不同 embodiment 上”的差异。
+3. 用 `--debug-cameras-only` 保存每次运行前的 `camera1/camera3`，确认模型看到的是正确外部视角和 wrist 视角。
+4. 如果 Franka 末端没有朝目标区移动，优先怀疑视觉/语言/zero-shot 能力边界或 observation schema。
+5. 如果 Franka 末端能接近但夹不住，再检查 gripper 阈值、接触参数、EEF delta 缩放和 IK 跟踪。
+6. 如果公司后续有真实 SO101/SOARM 数据，可以考虑对 N1.7 做小规模 embodiment finetune。
 
 ## 13. 复现命令
 
@@ -678,7 +779,7 @@ conda run -n isaaclab env \
     --no-headless \
     --render-sleep-s 0.08 \
     --keep-open-s 60 \
-    --max-policy-calls 1 \
+    --max-policy-calls 8 \
     --capture-video \
     --capture-name so101_joint_probe \
     --instruction "Pick up the red 2x4 lego brick."
@@ -698,7 +799,7 @@ conda run -n isaaclab env \
     --no-headless \
     --render-sleep-s 0.08 \
     --keep-open-s 60 \
-    --max-policy-calls 1 \
+    --max-policy-calls 8 \
     --capture-video \
     --capture-name so101_eef_probe \
     --instruction "Pick up the red 2x4 lego brick."
@@ -718,7 +819,7 @@ conda run -n isaaclab env \
     --no-headless \
     --render-sleep-s 0.08 \
     --keep-open-s 60 \
-    --max-policy-calls 1 \
+    --max-policy-calls 8 \
     --capture-video \
     --capture-name franka_joint_probe \
     --instruction "Pick up the red 2x4 lego brick."
@@ -738,7 +839,7 @@ conda run -n isaaclab env \
     --no-headless \
     --render-sleep-s 0.08 \
     --keep-open-s 60 \
-    --max-policy-calls 1 \
+    --max-policy-calls 8 \
     --capture-video \
     --capture-name franka_eef_probe \
     --instruction "Pick up the red 2x4 lego brick."
