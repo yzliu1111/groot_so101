@@ -62,7 +62,9 @@ experiments/groot_n17_isaac_smart_task/
 │   └── franka_smart_task_env_cfg.py
 ├── wire.py
 ├── groot_bridge_server.py
-└── run_smart_task_closed_loop.py
+├── run_smart_task_closed_loop.py
+├── so101_synthetic_groot_config.py
+└── train_so101_synthetic_groot.py
 ```
 
 核心文件含义：
@@ -70,6 +72,8 @@ experiments/groot_n17_isaac_smart_task/
 - `wire.py`：Isaac 进程和 GR00T 进程之间的通信协议。负责 socket、msgpack、numpy array 序列化。
 - `groot_bridge_server.py`：运行在 GR00T venv 中，加载 `nvidia/GR00T-N1.7-3B`，对 Isaac 侧提供 `ping/get_action/reset/shutdown` 接口。
 - `run_smart_task_closed_loop.py`：运行在 `conda isaaclab` 中，启动 LeIsaac SmartTask 或本目录注册的 Franka SmartTask，构造 GR00T observation，接收 action，并驱动 Isaac 中的机器人。
+- `so101_synthetic_groot_config.py`：GR00T `NEW_EMBODIMENT` 的 SO101 modality config，用于合成数据微调。
+- `train_so101_synthetic_groot.py`：SO101 合成数据准备和 GR00T fine-tune 启动脚本。
 - `franka_smart_task/__init__.py`：注册新的 gymnasium task id：`Groot-Franka-SmartTask-v0`。
 - `franka_smart_task/franka_smart_task_env_cfg.py`：定义 Franka 版本 SmartTask 的 IsaacLab env config。
 - `README.md`：实际运行命令。
@@ -295,7 +299,7 @@ Franka 没有 SO101 的 follower link 命名，所以 `ee_frame` 改成跟踪 `p
 - `end_effector`：用于 `ee_frame_state`，给 GR00T 构造 `state.eef_9d`。
 - `grasp_center`：用于诊断指标和 LeIsaac 原始 `object_grasped` 里对 `target_pos_w[:, 1, :]` 的访问约定。
 
-3. wrist 相机和主外部相机：
+3. wrist 相机和 top/global 外部相机：
 
 当前 GR00T OXE/DROID probe 真正送给模型的是两路图像：
 
@@ -306,11 +310,11 @@ camera3 -> video.wrist_image_left
 
 其中：
 
-- `camera1` 是送给 GR00T 的主外部视角 key。SO101 路线中它仍然来自 SmartScene USD
-  里的原始固定外部相机：`Scene/camera_front_xform/camera_front`。但 Franka 路线中不能
-  直接照搬这个物理机位，因为它是按 SO101/soarm 的体型和高度设计的；换成更高大的 Panda
-  后，这个相机太低太近，容易只看到底座和局部，不能观察完整机械臂全局姿态。因此 Franka
-  路线把同一个 `camera1` observation key 覆盖为新的
+- `camera1` 是送给 GR00T 的 top/global 外部视角 key。虽然历史 USD/变量命名里可能出现
+  `front`，但从实际图像语义看，它更应该被理解为俯视/全局观察相机，而不是机器人正前方相机。
+  SO101 路线中它仍然来自 SmartScene USD 里的原始固定外部相机。Franka 路线中不能直接照搬
+  这个物理机位，因为它是按 SO101/soarm 的体型和高度设计的；换成更高大的 Panda 后，这个
+  相机不适合作为 Franka 全局观察。因此 Franka 路线把同一个 `camera1` observation key 覆盖为新的
   `Scene/franka_overview_camera`，它是一个更高、更远的斜上方 overview camera，用来同时
   看到 Franka、桌面盘面和 lego 目标区域。
 - `camera3` 是 Franka wrist camera：
@@ -376,14 +380,14 @@ Franka Panda 则天然是：
 
 Franka route 当前的原则是：
 
-- 不再把 SO101 的 robot init、front camera、wrist offset 直接套到 Franka 上。
+- 不再把 SO101 的 robot init、历史 camera/sensor 配置、wrist offset 直接套到 Franka 上。
 - 使用 copied IsaacLab 里的 `FRANKA_PANDA_HIGH_PD_CFG`。
 - 使用 copied IsaacLab Franka stack task 的 ready joint pose 作为桌面任务起点。
 - Franka root 绕世界 Z 轴逆时针旋转 90 度，让 ready pose 下的夹爪方向更贴近 SmartScene
   中 lego 的任务方向。
 - wrist camera 使用 Franka wrist/gripper 视角语义，不强行初始看 lego。
-- `camera1` 这个 observation key 承担全局目标观测；SO101 使用原 SmartScene
-  `camera_front`，Franka 使用专属的 `franka_overview_camera`。
+- `camera1` 这个 observation key 承担 top/global 目标观测；SO101 使用原 SmartScene
+  固定相机，Franka 使用专属的 `franka_overview_camera`。
 - reset 后启用 `rerender_on_reset=True`，避免相机 observation 仍是旧缓存帧。
 
 这也意味着 Franka 路线验证的是“更接近 GR00T OXE/DROID embodiment 的机器人，在同一个
@@ -428,6 +432,10 @@ Isaac 侧的 `build_oxe_observation()` 把 LeIsaac observation 映射成这个 s
 LeIsaac camera1 -> GR00T video.exterior_image_1_left
 LeIsaac camera3 -> GR00T video.wrist_image_left
 ```
+
+这里的 `camera1` 在本 SmartTask 数据里应理解为 top/global 视角。映射到
+`video.exterior_image_1_left` 只是因为 OXE/DROID embodiment 的外部相机 key 叫这个名字，
+不表示它是 front camera。
 
 `camera2` 仍然存在于 Isaac policy observation 中，但当前没有送入 GR00T。这是因为
 `OXE_DROID_RELATIVE_EEF_RELATIVE_JOINT` embodiment 的 video modality 只声明了
@@ -728,8 +736,8 @@ env.step(command)
 - joint 路线动作很小或语义不明显。
 - EEF 路线动作明显更大。
 - 但在当前 SO101 + SmartTask + OXE/DROID zero-shot setup 下，没有可靠抓起红色 2x4 lego。
-- Franka 路线已经隔离出来，并且不再照搬 SO101 的 robot/front/wrist cfg。
-- Franka 的主外部相机 `camera1` 已从 SO101 原始低位 `camera_front` 改成
+- Franka 路线已经隔离出来，并且不再照搬 SO101 的 robot/camera/wrist cfg。
+- Franka 的 top/global 外部相机 `camera1` 已改成
   Franka 专属的 `franka_overview_camera`；它能看到 Panda 全局姿态、桌面和目标物。
 - wrist 相机保持末端/夹爪视角语义，不再强行旋向 lego。
 
@@ -771,12 +779,162 @@ env.step(command)
 
 1. 优先跑 Franka + EEF/IK 的 8-call 视频，观察末端是否朝盘面/lego 区域运动。
 2. 同时保留 SO101 + EEF/IK 作为对照，比较“同一模型输出落在不同 embodiment 上”的差异。
-3. 用 `--debug-cameras-only` 保存每次运行前的 `camera1/camera3`，确认模型看到的是正确外部视角和 wrist 视角。
+3. 用 `--debug-cameras-only` 保存每次运行前的 `camera1/camera3`，确认模型看到的是正确 top/global 视角和 wrist 视角。
 4. 如果 Franka 末端没有朝目标区移动，优先怀疑视觉/语言/zero-shot 能力边界或 observation schema。
 5. 如果 Franka 末端能接近但夹不住，再检查 gripper 阈值、接触参数、EEF delta 缩放和 IK 跟踪。
-6. 如果公司后续有真实 SO101/SOARM 数据，可以考虑对 N1.7 做小规模 embodiment finetune。
+6. 对当前已有 SO101 合成数据，先跑通 GR00T `NEW_EMBODIMENT` 微调链路；真机部署前再补真实
+   SO101/SOARM 数据或做 HG-DAgger 类修正数据采集。
 
-## 13. 复现命令
+## 13. SO101 合成数据微调路线
+
+除了 zero-shot probe，本目录现在还增加了面向真实部署目标的 SO101 微调路线。这里的目标机械臂
+明确是 SOARM101/SO101，不是 Franka。Franka 仍然只是为了分析 zero-shot embodiment mismatch
+而加入的对照任务。
+
+当前 `dataset/` 下的两份合成数据是 LeRobot v3 格式：
+
+```text
+dataset/so101_lego_pick_0609_1722
+dataset/so101_lego_pick_0609_1722_mimic
+```
+
+它们的关键特征是：
+
+- `robot_type` 是 `so101_follower`。
+- `observation.state` 是 6D SO101 state。
+- `action` 是 6D SO101 action。
+- 前 5 维是 arm joints，第 6 维是 gripper。
+- 图像有三路：`camera1/camera2/camera3`。
+
+GR00T 训练侧当前需要的是 GR00T-flavored LeRobot v2.1 数据，并且需要额外的
+`meta/modality.json`。所以新增的训练准备逻辑不是直接修改原始 `dataset/`，而是默认生成 prepared
+副本：
+
+```text
+outputs/groot_so101_synthetic_datasets/
+```
+
+这些 prepared dataset 中会额外出现：
+
+```text
+meta/modality.json
+meta/stats.json
+meta/relative_stats.json
+```
+
+### 13.1 为什么是两阶段环境
+
+本机环境是刻意隔离的：
+
+```text
+LeRobot 数据/schema 转换 -> conda lerobot
+GR00T stats / launch_finetune -> /home/yzliu/Isaac-GR00T/.venv
+Isaac closed-loop -> conda isaaclab
+```
+
+因此不要假设一个 Python 环境可以同时 import LeRobot、GR00T、IsaacLab。推荐流程是：
+
+第一阶段：在 LeRobot 环境里准备数据。
+
+```bash
+cd /home/yzliu/smart_project
+conda run -n lerobot python \
+  experiments/groot_n17_isaac_smart_task/train_so101_synthetic_groot.py \
+    --instruction "Pick up the red 2x4 lego brick." \
+    --force-prepare \
+    --skip-stats \
+    --prepare-only
+```
+
+第二阶段：在 GR00T venv 里生成统计并启动 fine-tune 入口。
+
+```bash
+cd /home/yzliu/smart_project
+/home/yzliu/Isaac-GR00T/.venv/bin/python \
+  experiments/groot_n17_isaac_smart_task/train_so101_synthetic_groot.py \
+    --skip-prepare \
+    --max-steps 2000 \
+    --save-steps 500 \
+    --global-batch-size 32
+```
+
+本机 RTX 5060 Ti 16GB 更适合做数据转换、loader smoke test、stats 生成和小步数逻辑验证；完整
+GR00T 微调大概率仍然需要上云或使用 40GB+ 显存设备。
+
+### 13.2 v3 到 v2.1 转换
+
+LeRobot v3 和 v2.1 最大区别是存储布局：
+
+```text
+v3:   data/chunk-000/file-000.parquet
+      videos/observation.images.camera1/chunk-000/file-000.mp4
+      meta/tasks.parquet
+      meta/episodes/chunk-000/file-000.parquet
+
+v2.1: data/chunk-000/episode_000000.parquet
+      videos/chunk-000/observation.images.camera1/episode_000000.mp4
+      meta/tasks.jsonl
+      meta/episodes.jsonl
+```
+
+GR00T 官方仓库里有转换器：
+
+```text
+/home/yzliu/Isaac-GR00T/scripts/lerobot_conversion/convert_v3_to_v2.py
+```
+
+这个转换器的 `convert_dataset()` 是原地转换：会把原始目录移动成 `_v3.0` 备份，再把 v2.1 写回原路径。
+这不是删除数据，但会改变当前 `dataset/` 的目录形态。当前实验脚本默认使用 prepared copy，是为了减少误操作。
+
+另外，GR00T 官方转换器依赖某个 LeRobot commit 的 API；本机 LeRobot 更新后可能出现
+`load_info` 等 API 位置变化。这不是环境坏了，而是 Isaac/GR00T 和 LeRobot 更新节奏不同造成的正常
+版本漂移。`train_so101_synthetic_groot.py` 会优先尝试官方转换器；如果依赖或 API 不兼容，会打印原因并
+回退到本目录里的轻量非破坏性转换逻辑。
+
+### 13.3 GR00T modality config
+
+新增文件：
+
+```text
+experiments/groot_n17_isaac_smart_task/so101_synthetic_groot_config.py
+```
+
+这不是 LeRobot 官方格式，而是 GR00T 对自定义 embodiment 的训练配置。它注册：
+
+```text
+EmbodimentTag.NEW_EMBODIMENT
+```
+
+并声明：
+
+```text
+video:
+  top
+  wrist
+
+state:
+  single_arm  -> observation.state[0:5]
+  gripper     -> observation.state[5:6]
+
+action:
+  single_arm  -> action[0:5], relative joint action
+  gripper     -> action[5:6], absolute gripper target
+
+language:
+  annotation.human.task_description
+```
+
+训练相机映射是：
+
+```text
+observation.images.camera1 -> video.top
+observation.images.camera3 -> video.wrist
+observation.images.camera2 -> 不送入 GR00T 微调
+```
+
+这里把 `camera1` 命名为 `top`，是因为实际图像语义是 top/global 视角，而不是 front 视角。
+
+## 14. 复现命令
 
 终端 1：启动 GR00T bridge。
 

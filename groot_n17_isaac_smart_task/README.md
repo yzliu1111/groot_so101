@@ -33,12 +33,11 @@ N1.7's OXE/DROID-style outputs and SO101's much smaller morphology.
 The Franka route reuses the SmartTask scene assets, but keeps Franka-specific
 robot, EEF, wrist camera, gripper, and action semantics. In particular,
 `camera1` keeps the same policy key and GR00T bridge role, but Franka overrides
-the physical sensor with a higher `Scene/franka_overview_camera` view. The
-original SO101 `camera_front` is too low and close for Panda, so it mostly sees
-the base instead of the full arm. `camera3` is the Franka wrist view and is not
-forced to see the lego in the initial pose. The Franka root is initialized with
-a counterclockwise 90 degree yaw so the official stack-task ready pose faces the
-SmartScene target direction more naturally.
+the physical sensor with a higher `Scene/franka_overview_camera` view. `camera3`
+is the Franka wrist view and is not forced to see the lego in the initial pose.
+The Franka root is initialized with a counterclockwise 90 degree yaw so the
+official stack-task ready pose faces the SmartScene target direction more
+naturally.
 
 ## Terminal 1: GR00T Bridge
 
@@ -234,10 +233,10 @@ saves `camera1.png`, `camera2.png`, and `camera3.png` under
 
 Current image semantics:
 
-- `camera1`: main exterior view, sent to `video.exterior_image_1_left`.
-  SO101 uses the original SmartScene `camera_front`; Franka overrides this key
-  with `Scene/franka_overview_camera`, a higher oblique view that can see the
-  Panda arm, table, and target area together.
+- `camera1`: top/global exterior view, sent to
+  `video.exterior_image_1_left` in the zero-shot OXE/DROID probe. For SO101
+  synthetic fine-tuning, the same source camera is named `top` in the custom
+  GR00T modality config.
 - `camera2`: fixed SmartScene left camera, retained in policy observations but
   not sent to GR00T in this OXE/DROID probe.
 - `camera3`: robot wrist camera, sent to `video.wrist_image_left`.
@@ -257,6 +256,66 @@ SO101  + EEF
 Franka + joint
 Franka + EEF
 ```
+
+## SO101 Synthetic Fine-tuning
+
+The current synthetic datasets under `dataset/` target the real deployment
+embodiment: SOARM101/SO101. The workstation keeps LeRobot and Isaac-GR00T in
+separate Python environments, so use a two-stage flow.
+
+Stage 1 prepares GR00T-flavored LeRobot v2.1 dataset copies from the LeRobot
+conda environment:
+
+```bash
+cd /home/yzliu/smart_project
+conda run -n lerobot python \
+  experiments/groot_n17_isaac_smart_task/train_so101_synthetic_groot.py \
+    --instruction "Pick up the red 2x4 lego brick." \
+    --force-prepare \
+    --skip-stats \
+    --prepare-only
+```
+
+Stage 2 generates GR00T stats and launches the official GR00T N1.7 fine-tune
+entry point from the Isaac-GR00T virtualenv:
+
+```bash
+cd /home/yzliu/smart_project
+/home/yzliu/Isaac-GR00T/.venv/bin/python \
+  experiments/groot_n17_isaac_smart_task/train_so101_synthetic_groot.py \
+    --skip-prepare \
+    --max-steps 2000 \
+    --save-steps 500 \
+    --global-batch-size 32
+```
+
+The script keeps the original `dataset/` folders untouched. Prepared datasets
+are written to `outputs/groot_so101_synthetic_datasets/`, and checkpoints are
+written to `outputs/groot_so101_synthetic_finetune/`.
+
+Training camera mapping:
+
+- `observation.images.camera1` -> GR00T custom video key `top`
+- `observation.images.camera3` -> GR00T custom video key `wrist`
+- `observation.images.camera2` is left out of this GR00T fine-tuning run
+
+For a quick metadata/video smoke test without launching training:
+
+```bash
+conda run -n lerobot python \
+  experiments/groot_n17_isaac_smart_task/train_so101_synthetic_groot.py \
+    --max-episodes 1 \
+    --force-prepare \
+    --skip-stats \
+    --prepare-only \
+    --instruction "Pick up the red 2x4 lego brick."
+```
+
+The helper attempts to reuse
+`/home/yzliu/Isaac-GR00T/scripts/lerobot_conversion/convert_v3_to_v2.py`.
+That official converter expects a specific LeRobot API; if the active
+environment has a compatible mismatch, the helper falls back to a local
+non-destructive converter with the same output layout.
 
 All four commands share the same GR00T bridge. The mp4 files are written to
 `experiments/groot_n17_isaac_smart_task/runs/captures/`.
@@ -345,7 +404,7 @@ conda run -n isaaclab env \
 
 The first probe uses the GR00T N1.7 base-model OXE/DROID schema:
 
-- `camera1` -> `video.exterior_image_1_left`
+- `camera1` top/global view -> `video.exterior_image_1_left`
 - `camera3` -> `video.wrist_image_left`
 - `camera2` remains available in the Isaac policy observation but is not sent to
   GR00T for the current OXE/DROID embodiment.
