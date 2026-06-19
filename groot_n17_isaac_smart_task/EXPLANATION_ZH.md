@@ -57,6 +57,7 @@ LeIsaac 的历史定位是把 Isaac 和 LeRobot 桥接起来：
 experiments/groot_n17_isaac_smart_task/
 ├── README.md
 ├── EXPLANATION_ZH.md
+├── REMOTE_LINUX_FINETUNE_ZH.md
 ├── franka_smart_task/
 │   ├── __init__.py
 │   └── franka_smart_task_env_cfg.py
@@ -78,6 +79,7 @@ experiments/groot_n17_isaac_smart_task/
 - `franka_smart_task/franka_smart_task_env_cfg.py`：定义 Franka 版本 SmartTask 的 IsaacLab env config。
 - `README.md`：实际运行命令。
 - `EXPLANATION_ZH.md`：当前这份中文说明材料。
+- `REMOTE_LINUX_FINETUNE_ZH.md`：迁移到另一台 Linux 训练机时的 GR00T 安装、数据转换、stats 和 fine-tune 操作手册。
 
 ## 4. 两个 Python 环境如何隔离
 
@@ -860,6 +862,12 @@ cd /home/yzliu/smart_project
 
 本机 RTX 5060 Ti 16GB 更适合做数据转换、loader smoke test、stats 生成和小步数逻辑验证；完整
 GR00T 微调大概率仍然需要上云或使用 40GB+ 显存设备。
+
+如果要迁移到另一台 Linux 训练机，先看本目录的独立手册：
+
+```text
+experiments/groot_n17_isaac_smart_task/REMOTE_LINUX_FINETUNE_ZH.md
+```
 
 ### 13.2 v3 到 v2.1 转换
 
