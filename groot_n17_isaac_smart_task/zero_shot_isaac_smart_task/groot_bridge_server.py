@@ -29,7 +29,8 @@ from pathlib import Path
 from typing import Any
 
 
-# 当前文件所在目录，也就是 experiments/groot_n17_isaac_smart_task。
+# 当前文件所在目录，也就是
+# experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task。
 SCRIPT_DIR = Path(__file__).resolve().parent
 
 # 把当前目录插入 sys.path，是为了让 bridge 可以 import 同目录下的 wire.py。

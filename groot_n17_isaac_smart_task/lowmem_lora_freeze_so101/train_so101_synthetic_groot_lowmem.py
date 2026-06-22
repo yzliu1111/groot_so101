@@ -21,14 +21,15 @@ from typing import Any
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-REPO_ROOT = SCRIPT_DIR.parents[1]
+EXPERIMENT_ROOT = SCRIPT_DIR.parent
+REPO_ROOT = EXPERIMENT_ROOT.parents[1]
 DEFAULT_GROOT_ROOT = Path(os.environ.get("GROOT_ROOT", "/home/yzliu/Isaac-GR00T"))
 DEFAULT_PREPARED_ROOT = REPO_ROOT / "outputs" / "groot_so101_synthetic_datasets"
 DEFAULT_PREPARED_DATASETS = (
     DEFAULT_PREPARED_ROOT / "so101_lego_pick_0609_1722",
     DEFAULT_PREPARED_ROOT / "so101_lego_pick_0609_1722_mimic",
 )
-MODALITY_CONFIG_PATH = SCRIPT_DIR / "so101_synthetic_groot_config.py"
+MODALITY_CONFIG_PATH = EXPERIMENT_ROOT / "full_finetune_so101" / "so101_synthetic_groot_config.py"
 
 DEFAULT_LORA_TARGET_REGEX = (
     r"action_head\.model\..*(to_q|to_k|to_v|to_out\.0|proj_out_1|proj_out_2)$"

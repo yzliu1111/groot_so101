@@ -9,13 +9,13 @@ Recommended local flow:
 1. Run dataset conversion/preparation in the LeRobot conda environment:
 
     conda run -n lerobot python \
-      experiments/groot_n17_isaac_smart_task/train_so101_synthetic_groot.py \
+      experiments/groot_n17_isaac_smart_task/full_finetune_so101/train_so101_synthetic_groot.py \
         --force-prepare --skip-stats --prepare-only
 
 2. Run GR00T stats/fine-tuning from the Isaac-GR00T virtualenv:
 
     /home/yzliu/Isaac-GR00T/.venv/bin/python \
-      experiments/groot_n17_isaac_smart_task/train_so101_synthetic_groot.py \
+      experiments/groot_n17_isaac_smart_task/full_finetune_so101/train_so101_synthetic_groot.py \
         --skip-prepare
 
 By default, the script writes prepared GR00T-flavored LeRobot v2.1 copies under
@@ -39,7 +39,8 @@ import pyarrow.parquet as pq
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-REPO_ROOT = SCRIPT_DIR.parents[1]
+EXPERIMENT_ROOT = SCRIPT_DIR.parent
+REPO_ROOT = EXPERIMENT_ROOT.parents[1]
 DEFAULT_GROOT_ROOT = Path("/home/yzliu/Isaac-GR00T")
 DEFAULT_DATASETS = (
     REPO_ROOT / "dataset" / "so101_lego_pick_0609_1722",

@@ -1,12 +1,18 @@
-# SO101 / GR00T 低显存微调与 LoRA 说明
+# Low-memory / LoRA：SO101 冻结参数与 adapter 微调
 
-本文记录 5090 32GB 训练机上的新结论和低显存训练入口。范围只覆盖已经 prepared 的 SO101 v2.1 数据微调，不覆盖 LeRobot v3 转换和真机部署。
+本文记录两台机器共用的 GR00T N1.7 低显存训练入口：
+
+- 本机 RTX 5060 Ti 16GB：主要做数据 / 配置 / loader / stats / 1-step smoke test。
+- 公司 remote RTX 5090 32GB：主要做低显存策略的正式训练 smoke 和较长 steps 实验。
+
+范围只覆盖已经 prepared 的 SO101 v2.1 数据微调，不覆盖 LeRobot v3 转换和真机部署。所有命令尽量通过 `SMART_PROJECT` 和 `GROOT_ROOT` 两个变量写成同一套；先按机器设置 profile，再复制后面的训练命令。
 
 ## 当前结论
 
 - 远程 5090 PC 上虽然 `nvidia-smi` / 官方建议显示 CUDA 13.0，但目前能跑到 OOM，没有出现明确 CUDA 13.0 版本相关报错。
 - 当前主矛盾不是 CUDA 版本，而是 GR00T N1.7 默认 fine-tune 训练参数量太大。
 - 全量 / 默认 action-head 微调在 32GB 5090 上仍然 OOM，需要先尝试冻结更多权重，或用 LoRA / adapter 路线。
+- 本机 5060 Ti 16GB 不应该作为“正式训练是否可行”的主要判断依据；它适合快速验证脚本、数据、stats 和最小训练 step，OOM 是预期风险。
 - CUDA 12.8 仍是 PyTorch `cu128` 栈的稳妥保底方案；但如果 CUDA 13.0 toolkit 已经能跑到 OOM，先不急着切 sudo 账号重装 12.8。
 
 ## 先把这件事讲清楚
@@ -111,7 +117,7 @@ embodiment 迁移不一定简单：7DoF / Franka-like 经验 -> SO101 关节动�
 
 ### 3.2 建议的实验优先级
 
-不要把本地 5090 变成无限调参战场。更合理的顺序是：
+不要把 5060 Ti 或 5090 变成无限调参战场。更合理的顺序是：
 
 ```text
 1. 官方冻结能力能覆盖的策略：projector-only / 关闭 diffusion / 关闭 vlln
@@ -161,22 +167,24 @@ embodiment 迁移不一定简单：7DoF / Franka-like 经验 -> SO101 关节动�
 | 仿真闭环 | 在 LeIsaac / IsaacLab SmartTask 中跑成功率 | 证明动作反馈循环可用 |
 | 真实 SO101 | 相机标定、动作缩放、安全限幅、延迟处理 | 这是另一层部署问题 |
 
-当前这份文档主要解决前两关：让 5090 32GB 有机会跑过训练 smoke，并把训练策略说清楚。
+当前这份文档主要解决前两关：让本机 5060 Ti 能做最小工程验证，让 5090 32GB 有机会跑过训练 smoke，并把训练策略说清楚。
 
 ## 新训练入口
 
-新增脚本：
+维护中的入口脚本：
 
 ```text
-experiments/groot_n17_isaac_smart_task/train_so101_synthetic_groot_lowmem.py
+experiments/groot_n17_isaac_smart_task/lowmem_lora_freeze_so101/train_so101_synthetic_groot_lowmem.py
 ```
 
-它和原来的 `train_so101_synthetic_groot.py` 分工不同：
+新命令直接使用这个子目录入口。
+
+它和 full fine-tune 入口分工不同：
 
 | 脚本 | 用途 |
 |---|---|
-| `train_so101_synthetic_groot.py` | 数据准备 + 官方默认 fine-tune launcher，适合转换 v3 -> v2.1 或复现默认路线 |
-| `train_so101_synthetic_groot_lowmem.py` | 只在 GR00T 环境里运行，默认复用 prepared v2.1 数据，提供冻结 / LoRA 低显存策略 |
+| `full_finetune_so101/train_so101_synthetic_groot.py` | 数据准备 + 官方默认 fine-tune launcher，适合转换 v3 -> v2.1 或复现默认路线 |
+| `lowmem_lora_freeze_so101/train_so101_synthetic_groot_lowmem.py` | 只在 GR00T 环境里运行，默认复用 prepared v2.1 数据，提供冻结 / LoRA 低显存策略 |
 
 低显存脚本不会 import LeRobot，也不会修改原始 `dataset/`。
 
@@ -187,9 +195,52 @@ outputs/groot_so101_synthetic_datasets/so101_lego_pick_0609_1722
 outputs/groot_so101_synthetic_datasets/so101_lego_pick_0609_1722_mimic
 ```
 
-## 环境检查
+## 机器 Profile 与环境检查
 
-在远程机 `guest1` 账号下：
+后面所有训练命令都假设已经设置了这两个变量：
+
+```text
+SMART_PROJECT -> 当前 smart_project 仓库
+GROOT_ROOT    -> Isaac-GR00T 仓库，且里面已经有 .venv
+```
+
+### Profile A：本机 5060 Ti
+
+本机主要用来确认 prepared 数据、modality config、stats 和最小训练 step 是否连得上。路径按当前机器写：
+
+```bash
+export SMART_PROJECT=/home/yzliu/smart_project
+export GROOT_ROOT=/home/yzliu/Isaac-GR00T
+
+# 只指向本机实际存在的 CUDA toolkit；12.8 最贴合 PyTorch cu128 栈。
+unset CUDA_HOME
+if [ -d /usr/local/cuda-12.8 ]; then
+  export CUDA_HOME=/usr/local/cuda-12.8
+elif [ -d /usr/local/cuda ]; then
+  export CUDA_HOME=/usr/local/cuda
+fi
+
+if [ -n "${CUDA_HOME:-}" ]; then
+  export PATH="$CUDA_HOME/bin:$PATH"
+  export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
+fi
+```
+
+如果本机没有可用 `$CUDA_HOME/bin/nvcc`，先不要急着装系统 CUDA；可以先跑下面的 Python 环境检查和 `--dry-run`。只有 DeepSpeed / CUDA extension 明确报 `CUDA_HOME does not exist` 或 CUDA op 编译失败时，再补本机 toolkit。
+
+本机建议执行顺序：
+
+```text
+1. 环境检查
+2. dataset / config dry-run
+3. 必要时生成或刷新 stats
+4. projector-only 1-step smoke test
+5. 如果 16GB OOM，记录即可，不把它当作策略失败结论
+```
+
+### Profile B：公司 remote 5090
+
+remote 5090 是低显存训练的主要实验机器。在 `guest1` 账号下：
 
 ```bash
 export SMART_PROJECT=/home/guest1/smart_project
@@ -204,7 +255,19 @@ export PATH="$CUDA_HOME/bin:$PATH"
 export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
 ```
 
-验证：
+remote 5090 建议执行顺序：
+
+```text
+1. 环境检查
+2. projector-only 1-step smoke test
+3. diffusion-lora 1-step smoke test
+4. 能过以后再跑 100-500 steps 训练 smoke
+5. 最后才跑 2000 steps 起步实验
+```
+
+### 通用环境验证
+
+两台机器都用同一条验证命令：
 
 ```bash
 cd "$SMART_PROJECT"
@@ -217,11 +280,50 @@ print("torch cuda:", torch.version.cuda)
 print("peft:", peft.__version__)
 print("extension CUDA_HOME:", CUDA_HOME)
 print("cuda available:", torch.cuda.is_available())
-print("gpu:", torch.cuda.get_device_name(0))
+if torch.cuda.is_available():
+    print("gpu:", torch.cuda.get_device_name(0))
+else:
+    print("gpu:", "<unavailable>")
 PY
 ```
 
 `peft` 是 Isaac-GR00T 官方 `pyproject.toml` 里的依赖，正常 `uv sync --python 3.10 && uv pip install -e .` 后应该已经存在。
+
+### 本机 5060 Ti 快速 dry-run
+
+这条命令不进入训练，只检查 prepared 数据路径、modality config、GR00T config 构造和低显存策略 patch。适合作为本机第一条命令：
+
+```bash
+cd "$SMART_PROJECT"
+"$GROOT_ROOT/.venv/bin/python" \
+  experiments/groot_n17_isaac_smart_task/lowmem_lora_freeze_so101/train_so101_synthetic_groot_lowmem.py \
+    --strategy projector-only \
+    --skip-stats \
+    --max-steps 1 \
+    --save-steps 1 \
+    --global-batch-size 1 \
+    --gradient-accumulation-steps 1 \
+    --dataloader-num-workers 0 \
+    --experiment-name so101_local_5060ti_dryrun \
+    --dry-run
+```
+
+如果本机需要生成或刷新 GR00T stats，直接调用 GR00T stats 脚本。注意：低显存训练脚本的 `--dry-run` 会把 stats 命令也 dry-run 掉，所以不要用它来实际生成 stats。
+
+```bash
+cd "$GROOT_ROOT"
+"$GROOT_ROOT/.venv/bin/python" \
+  gr00t/data/stats.py \
+    --dataset-path "$SMART_PROJECT/outputs/groot_so101_synthetic_datasets/so101_lego_pick_0609_1722" \
+    --embodiment-tag NEW_EMBODIMENT \
+    --modality-config-path "$SMART_PROJECT/experiments/groot_n17_isaac_smart_task/full_finetune_so101/so101_synthetic_groot_config.py"
+
+"$GROOT_ROOT/.venv/bin/python" \
+  gr00t/data/stats.py \
+    --dataset-path "$SMART_PROJECT/outputs/groot_so101_synthetic_datasets/so101_lego_pick_0609_1722_mimic" \
+    --embodiment-tag NEW_EMBODIMENT \
+    --modality-config-path "$SMART_PROJECT/experiments/groot_n17_isaac_smart_task/full_finetune_so101/so101_synthetic_groot_config.py"
+```
 
 ## 策略 1：Projector-only
 
@@ -233,12 +335,12 @@ PY
 - 比默认路线少很多可训练参数。
 - 对新 embodiment 的状态 / 动作映射最直接。
 
-1-step smoke test：
+1-step smoke test。两台机器都可以先跑这条；本机 5060 Ti 建议先只跑到这里：
 
 ```bash
 cd "$SMART_PROJECT"
 "$GROOT_ROOT/.venv/bin/python" \
-  experiments/groot_n17_isaac_smart_task/train_so101_synthetic_groot_lowmem.py \
+  experiments/groot_n17_isaac_smart_task/lowmem_lora_freeze_so101/train_so101_synthetic_groot_lowmem.py \
     --strategy projector-only \
     --skip-stats \
     --max-steps 1 \
@@ -248,12 +350,18 @@ cd "$SMART_PROJECT"
     --dataloader-num-workers 0
 ```
 
-正式起步：
+如果是在本机留档，可以额外加：
+
+```text
+--experiment-name so101_local_5060ti_projector_only_smoke
+```
+
+remote 5090 正式起步：
 
 ```bash
 cd "$SMART_PROJECT"
 "$GROOT_ROOT/.venv/bin/python" \
-  experiments/groot_n17_isaac_smart_task/train_so101_synthetic_groot_lowmem.py \
+  experiments/groot_n17_isaac_smart_task/lowmem_lora_freeze_so101/train_so101_synthetic_groot_lowmem.py \
     --strategy projector-only \
     --skip-stats \
     --max-steps 2000 \
@@ -273,19 +381,19 @@ cd "$SMART_PROJECT"
 优点：
 
 - 可训练参数最少。
-- 更适合测试 “LoRA 能不能让 5090 32GB 跑起来”。
+- 更适合测试 “LoRA 能不能让低显存机器跑起来”。
 
 注意：
 
 - 输出是 PEFT adapter 形式，不是普通完整 GR00T checkpoint。
 - 后续推理需要按 “base model + adapter” 的方式加载，部署前还要单独验证。
 
-1-step smoke test：
+1-step smoke test。两台机器都可以跑；本机 5060 Ti 如果 rank 8 OOM，下一步直接降 rank 4：
 
 ```bash
 cd "$SMART_PROJECT"
 "$GROOT_ROOT/.venv/bin/python" \
-  experiments/groot_n17_isaac_smart_task/train_so101_synthetic_groot_lowmem.py \
+  experiments/groot_n17_isaac_smart_task/lowmem_lora_freeze_so101/train_so101_synthetic_groot_lowmem.py \
     --strategy diffusion-lora \
     --skip-stats \
     --max-steps 1 \
@@ -298,12 +406,31 @@ cd "$SMART_PROJECT"
     --lora-dropout 0.05
 ```
 
-正式起步：
+本机 5060 Ti 更保守的 rank 4 smoke test：
 
 ```bash
 cd "$SMART_PROJECT"
 "$GROOT_ROOT/.venv/bin/python" \
-  experiments/groot_n17_isaac_smart_task/train_so101_synthetic_groot_lowmem.py \
+  experiments/groot_n17_isaac_smart_task/lowmem_lora_freeze_so101/train_so101_synthetic_groot_lowmem.py \
+    --strategy diffusion-lora \
+    --skip-stats \
+    --max-steps 1 \
+    --save-steps 1 \
+    --global-batch-size 1 \
+    --gradient-accumulation-steps 1 \
+    --dataloader-num-workers 0 \
+    --lora-rank 4 \
+    --lora-alpha 8 \
+    --lora-dropout 0.05 \
+    --experiment-name so101_local_5060ti_diffusion_lora_r4_smoke
+```
+
+remote 5090 正式起步：
+
+```bash
+cd "$SMART_PROJECT"
+"$GROOT_ROOT/.venv/bin/python" \
+  experiments/groot_n17_isaac_smart_task/lowmem_lora_freeze_so101/train_so101_synthetic_groot_lowmem.py \
     --strategy diffusion-lora \
     --skip-stats \
     --max-steps 2000 \
@@ -331,12 +458,12 @@ action_decoder
 position_embedding
 ```
 
-建议只有在前两条能跑通后再试：
+建议只有在前两条能跑通后再试。本机 5060 Ti 不建议一开始跑这条；优先把它当作 remote 5090 或更大显存机器上的第三阶段实验：
 
 ```bash
 cd "$SMART_PROJECT"
 "$GROOT_ROOT/.venv/bin/python" \
-  experiments/groot_n17_isaac_smart_task/train_so101_synthetic_groot_lowmem.py \
+  experiments/groot_n17_isaac_smart_task/lowmem_lora_freeze_so101/train_so101_synthetic_groot_lowmem.py \
     --strategy projector-plus-diffusion-lora \
     --skip-stats \
     --max-steps 2000 \
@@ -363,7 +490,7 @@ cd "$SMART_PROJECT"
 --optim adamw_torch
 ```
 
-这里的 `--global-batch-size` 在单卡下基本就是 per-device batch size。32GB 5090 上不要再从 32 起步。
+这里的 `--global-batch-size` 在单卡下基本就是 per-device batch size。5060 Ti 和 32GB 5090 都不要再从 32 起步；本文件所有低显存训练都先从 1 起步。
 
 LoRA 默认 target regex：
 
@@ -401,4 +528,6 @@ du -sh outputs/groot_so101_synthetic_finetune/*
 - OOM 发生在 forward、backward、optimizer step，还是 save checkpoint；
 - 峰值显存。
 
-如果 `projector-only` 和 `diffusion-lora` 都在 5090 32GB 上 OOM，基本可以判断本地/公司 5090 不适合作为 GR00T N1.7 微调训练机，需要申请更大显存云端资源，或者进一步做更激进的冻结、量化训练、离线特征缓存。
+如果 `projector-only` 和 `diffusion-lora` 都在本机 5060 Ti 上 OOM，只能说明本机不适合承担训练，不代表策略失败。把日志和参数记录下来，转到 remote 5090 继续判断。
+
+如果 `projector-only` 和 `diffusion-lora` 都在 remote 5090 32GB 上 OOM，基本可以判断 32GB 级别单卡不适合作为 GR00T N1.7 微调训练机，需要申请更大显存云端资源，或者进一步做更激进的冻结、量化训练、离线特征缓存。

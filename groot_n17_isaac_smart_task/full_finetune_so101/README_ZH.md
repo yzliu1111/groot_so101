@@ -1,4 +1,238 @@
-# 另一台 Linux 训练机上的 GR00T SO101 微调准备手册
+# Full fine-tune：SO101 合成数据准备与官方微调入口
+
+读完这份文件，你应该能区分：
+
+1. 原始 LeRobot v3 数据放在哪里。
+2. GR00T 可读的 prepared v2.1 copy 放在哪里。
+3. 本机 5060 Ti 和 remote 5090 在 full fine-tune 链路里各自承担什么。
+
+## 机器视角
+
+| 机器 | 推荐用途 | 不推荐做什么 |
+|---|---|---|
+| 本机 RTX 5060 Ti | 数据转换、prepared copy 生成、stats、loader smoke、小步数逻辑验证 | 不用它判断 2000-step full fine-tune 是否可行 |
+| 公司 remote RTX 5090 | 复用 prepared 数据做训练 smoke；如果要重新转换数据，再补 LeRobot 环境 | 不要先从 `--global-batch-size 32` 盲跑 |
+
+## 资产应该放在哪里
+
+```text
+本机：
+/home/yzliu/smart_project/dataset/so101_lego_pick_0609_1722
+/home/yzliu/smart_project/dataset/so101_lego_pick_0609_1722_mimic
+/home/yzliu/smart_project/outputs/groot_so101_synthetic_datasets/
+/home/yzliu/Isaac-GR00T
+
+remote 5090：
+/home/guest1/smart_project/outputs/groot_so101_synthetic_datasets/
+/home/guest1/Isaac-GR00T
+```
+
+本机可以保留原始 `dataset/`；remote 第一轮只需要同步 prepared 数据，不必同步原始 v3 数据。
+
+## SO101 合成数据微调路线
+
+除了 zero-shot probe，本目录现在还增加了面向真实部署目标的 SO101 微调路线。这里的目标机械臂
+明确是 SOARM101/SO101，不是 Franka。Franka 仍然只是为了分析 zero-shot embodiment mismatch
+而加入的对照任务。
+
+当前 `dataset/` 下的两份合成数据是 LeRobot v3 格式：
+
+```text
+dataset/so101_lego_pick_0609_1722
+dataset/so101_lego_pick_0609_1722_mimic
+```
+
+它们的关键特征是：
+
+- `robot_type` 是 `so101_follower`。
+- `observation.state` 是 6D SO101 state。
+- `action` 是 6D SO101 action。
+- 前 5 维是 arm joints，第 6 维是 gripper。
+- 图像有三路：`camera1/camera2/camera3`。
+
+GR00T 训练侧当前需要的是 GR00T-flavored LeRobot v2.1 数据，并且需要额外的
+`meta/modality.json`。所以新增的训练准备逻辑不是直接修改原始 `dataset/`，而是默认生成 prepared
+副本：
+
+```text
+outputs/groot_so101_synthetic_datasets/
+```
+
+这些 prepared dataset 中会额外出现：
+
+```text
+meta/modality.json
+meta/stats.json
+meta/relative_stats.json
+```
+
+### 为什么是两阶段环境
+
+本机环境是刻意隔离的：
+
+```text
+LeRobot 数据/schema 转换 -> conda lerobot
+GR00T stats / launch_finetune -> /home/yzliu/Isaac-GR00T/.venv
+Isaac closed-loop -> conda isaaclab
+```
+
+因此不要假设一个 Python 环境可以同时 import LeRobot、GR00T、IsaacLab。推荐流程是：
+
+第一阶段：在 LeRobot 环境里准备数据。
+
+```bash
+cd /home/yzliu/smart_project
+conda run -n lerobot python \
+  experiments/groot_n17_isaac_smart_task/full_finetune_so101/train_so101_synthetic_groot.py \
+    --instruction "Pick up the red 2x4 lego brick." \
+    --force-prepare \
+    --skip-stats \
+    --prepare-only
+```
+
+第二阶段：在 GR00T venv 里生成统计并启动 fine-tune 入口。
+
+```bash
+cd /home/yzliu/smart_project
+/home/yzliu/Isaac-GR00T/.venv/bin/python \
+  experiments/groot_n17_isaac_smart_task/full_finetune_so101/train_so101_synthetic_groot.py \
+    --skip-prepare \
+    --max-steps 2000 \
+    --save-steps 500 \
+    --global-batch-size 32
+```
+
+本机 RTX 5060 Ti 16GB 更适合做数据转换、loader smoke test、stats 生成和小步数逻辑验证；完整
+GR00T 微调大概率仍然需要上云或使用 40GB+ 显存设备。
+
+如果要迁移到另一台 Linux 训练机，直接看本文后面的 remote 章节；低显存策略看第三阶段文档：
+
+```text
+experiments/groot_n17_isaac_smart_task/lowmem_lora_freeze_so101/README_ZH.md
+```
+
+### v3 到 v2.1 转换
+
+LeRobot v3 和 v2.1 最大区别是存储布局：
+
+```text
+v3:   data/chunk-000/file-000.parquet
+      videos/observation.images.camera1/chunk-000/file-000.mp4
+      meta/tasks.parquet
+      meta/episodes/chunk-000/file-000.parquet
+
+v2.1: data/chunk-000/episode_000000.parquet
+      videos/chunk-000/observation.images.camera1/episode_000000.mp4
+      meta/tasks.jsonl
+      meta/episodes.jsonl
+```
+
+GR00T 官方仓库里有转换器：
+
+```text
+/home/yzliu/Isaac-GR00T/scripts/lerobot_conversion/convert_v3_to_v2.py
+```
+
+这个转换器的 `convert_dataset()` 是原地转换：会把原始目录移动成 `_v3.0` 备份，再把 v2.1 写回原路径。
+这不是删除数据，但会改变当前 `dataset/` 的目录形态。当前实验脚本默认使用 prepared copy，是为了减少误操作。
+
+另外，GR00T 官方转换器依赖某个 LeRobot commit 的 API；本机 LeRobot 更新后可能出现
+`load_info` 等 API 位置变化。这不是环境坏了，而是 Isaac/GR00T 和 LeRobot 更新节奏不同造成的正常
+版本漂移。`train_so101_synthetic_groot.py` 会优先尝试官方转换器；如果依赖或 API 不兼容，会打印原因并
+回退到本目录里的轻量非破坏性转换逻辑。
+
+### GR00T modality config
+
+新增文件：
+
+```text
+experiments/groot_n17_isaac_smart_task/full_finetune_so101/so101_synthetic_groot_config.py
+```
+
+这不是 LeRobot 官方格式，而是 GR00T 对自定义 embodiment 的训练配置。它注册：
+
+```text
+EmbodimentTag.NEW_EMBODIMENT
+```
+
+并声明：
+
+```text
+video:
+  top
+  wrist
+
+state:
+  single_arm  -> observation.state[0:5]
+  gripper     -> observation.state[5:6]
+
+action:
+  single_arm  -> action[0:5], relative joint action
+  gripper     -> action[5:6], absolute gripper target
+
+language:
+  annotation.human.task_description
+```
+
+训练相机映射是：
+
+```text
+observation.images.camera1 -> video.top
+observation.images.camera3 -> video.wrist
+observation.images.camera2 -> 不送入 GR00T 微调
+```
+
+这里把 `camera1` 命名为 `top`，是因为实际图像语义是 top/global 视角，而不是 front 视角。
+
+## 本机 5060 Ti：推荐命令
+
+先准备 prepared copy：
+
+```bash
+cd /home/yzliu/smart_project
+conda run -n lerobot python \
+  experiments/groot_n17_isaac_smart_task/full_finetune_so101/train_so101_synthetic_groot.py \
+    --instruction "Pick up the red 2x4 lego brick." \
+    --force-prepare \
+    --skip-stats \
+    --prepare-only
+```
+
+只做 1 episode metadata/video smoke：
+
+```bash
+cd /home/yzliu/smart_project
+conda run -n lerobot python \
+  experiments/groot_n17_isaac_smart_task/full_finetune_so101/train_so101_synthetic_groot.py \
+    --max-episodes 1 \
+    --force-prepare \
+    --skip-stats \
+    --prepare-only \
+    --instruction "Pick up the red 2x4 lego brick."
+```
+
+在 GR00T venv 里跑 stats / 最小 fine-tune smoke：
+
+```bash
+cd /home/yzliu/smart_project
+/home/yzliu/Isaac-GR00T/.venv/bin/python \
+  experiments/groot_n17_isaac_smart_task/full_finetune_so101/train_so101_synthetic_groot.py \
+    --skip-prepare \
+    --max-steps 1 \
+    --save-steps 1 \
+    --global-batch-size 1 \
+    --gradient-accumulation-steps 1
+```
+
+## Remote 5090：基础迁移与 smoke
+
+下面保留原 remote 手册里最有用的系统/用户层准备内容。低显存降显存策略不放在这里，统一看：
+
+```text
+experiments/groot_n17_isaac_smart_task/lowmem_lora_freeze_so101/README_ZH.md
+```
+
+### Remote 原手册摘录：另一台 Linux 训练机上的 GR00T SO101 微调准备
 
 本文记录把当前 `experiments/groot_n17_isaac_smart_task` 微调链路迁移到另一台 Linux 设备时的步骤。范围先限定为：
 
@@ -10,7 +244,7 @@
 
 暂不覆盖真机部署、PolicyServer、IsaacLab 闭环控制和真实 SO101 上机。
 
-## 1. 目标机状态记录
+### 1. 目标机状态记录
 
 目标机信息后续可以边拿到边补：
 
@@ -40,7 +274,7 @@ export GROOT_ROOT=/home/guest1/Isaac-GR00T
 
 如果目标机路径不同，只要同步替换这两个变量即可。
 
-## 2. 当前优先策略
+### 2. 当前优先策略
 
 把目标机当成一张白纸处理。当前只知道它有 Isaac Sim；不要假设它已经有 IsaacLab、LeIsaac、LeRobot 或 Isaac-GR00T。
 
@@ -76,7 +310,7 @@ Isaac Sim 暂时不参与这条链路。它说明目标机可能具备 NVIDIA �
 /home/guest1/smart_project
 ```
 
-## 3. 环境分层原则
+### 3. 环境分层原则
 
 不要把 IsaacLab、LeRobot、GR00T 全塞进同一个 Python 环境。
 
@@ -99,7 +333,7 @@ GR00T stats / fine-tune                     在 guest1 的 Isaac-GR00T .venv 里
 
 LeRobot v3 -> v2.1 转换是第二阶段能力，见后面的“可选：数据格式转换”。
 
-## 4. CUDA / 系统层准备：先查，再决定是否 `smartscape`
+### 4. CUDA / 系统层准备：先查，再决定是否 `smartscape`
 
 目标机需要 NVIDIA driver 正常：
 
@@ -157,7 +391,7 @@ sudo apt-get install -y --no-install-recommends cuda-toolkit-12-8
 
 `smartscape` 做完系统层之后，切回 `guest1` 继续下面步骤。
 
-## 5. `guest1` 执行线：用户层环境变量
+### 5. `guest1` 执行线：用户层环境变量
 
 `guest1` 每次开新 shell 先设置。`CUDA_HOME` 使用第 4 节确认可用的 toolkit 路径：如果先试目标机已有 CUDA 13.0，就指向 13.0；如果已经由 `smartscape` 安装了 12.8，或 13.0 smoke test 失败，就指向 12.8。
 
@@ -188,7 +422,7 @@ nvcc   -> $CUDA_HOME/bin/nvcc
 
 如果 `guest1` 看不到 `nvcc`，但 `smartscape` 能看到，通常是环境变量没设；如果 `$CUDA_HOME/bin/nvcc` 本身不存在，需要回到第 4 节重新确认 toolkit 路径或让 `smartscape` 补系统层。
 
-## 6. `guest1` 创建用户目录并安装 Isaac-GR00T
+### 6. `guest1` 创建用户目录并安装 Isaac-GR00T
 
 目标机如果还没有 GR00T：
 
@@ -270,7 +504,7 @@ print("extension CUDA_HOME:", CUDA_HOME)
 PY
 ```
 
-## 7. 同步项目代码和 prepared 数据
+### 7. 同步项目代码和 prepared 数据
 
 第一轮只需要目标机有：
 
@@ -321,7 +555,7 @@ parquet: 100
 mp4:     200
 ```
 
-## 8. 可选：准备 LeRobot / 转换环境
+### 8. 可选：准备 LeRobot / 转换环境
 
 第一轮不需要这一节。只有后续决定在目标机重新从原始 LeRobot v3 数据生成 prepared v2.1 数据，才需要 LeRobot/转换环境。
 
@@ -347,7 +581,7 @@ $GROOT_ROOT/scripts/lerobot_conversion/convert_v3_to_v2.py
 
 如果官方 converter 因 LeRobot API 漂移无法 import，会自动回退到本实验里的轻量非破坏性转换逻辑。
 
-## 9. 可选：数据格式转换
+### 9. 可选：数据格式转换
 
 第一轮不跑这一节；直接使用本机同步过去的 `outputs/groot_so101_synthetic_datasets/`。
 
@@ -369,7 +603,7 @@ $SMART_PROJECT/outputs/groot_so101_synthetic_datasets/
 ```bash
 cd "$SMART_PROJECT"
 conda run -n lerobot python \
-  experiments/groot_n17_isaac_smart_task/train_so101_synthetic_groot.py \
+  experiments/groot_n17_isaac_smart_task/full_finetune_so101/train_so101_synthetic_groot.py \
     --groot-root "$GROOT_ROOT" \
     --instruction "Pick up the red 2x4 lego brick." \
     --force-prepare \
@@ -382,7 +616,7 @@ conda run -n lerobot python \
 ```bash
 cd "$SMART_PROJECT"
 conda run -n lerobot python \
-  experiments/groot_n17_isaac_smart_task/train_so101_synthetic_groot.py \
+  experiments/groot_n17_isaac_smart_task/full_finetune_so101/train_so101_synthetic_groot.py \
     --groot-root "$GROOT_ROOT" \
     --source-dataset /data/so101_lego_pick_0609_1722 \
     --source-dataset /data/so101_lego_pick_0609_1722_mimic \
@@ -449,7 +683,7 @@ meta/tasks.jsonl
 meta/episodes.jsonl
 ```
 
-## 10. `guest1` 跑 GR00T stats 和 fine-tune smoke test
+### 10. `guest1` 跑 GR00T stats 和 fine-tune smoke test
 
 进入目标机 GR00T 环境前，先设 CUDA toolkit，保持和第 5 节一致：
 
@@ -472,7 +706,7 @@ export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
 ```bash
 cd "$SMART_PROJECT"
 "$GROOT_ROOT/.venv/bin/python" \
-  experiments/groot_n17_isaac_smart_task/train_so101_synthetic_groot.py \
+  experiments/groot_n17_isaac_smart_task/full_finetune_so101/train_so101_synthetic_groot.py \
     --groot-root "$GROOT_ROOT" \
     --skip-prepare \
     --max-steps 1 \
@@ -492,165 +726,3 @@ Rank 0, Worker 0: Caching shard...
 ```
 
 如果在此之后 OOM，通常说明训练策略太重，不是数据转换失败。
-
-## 11. 5090 32GB 训练策略更新
-
-当前官方默认 fine-tune 路线会训练大量 action-head / diffusion 相关参数。本机曾看到：
-
-```text
-Total parameters: 3,144,016,000
-Trainable parameters: 1,620,515,968 (51.54%)
-```
-
-远程 5090 PC 已经验证过一次：CUDA 13.0 toolkit 至少能把训练跑到 OOM，没有出现明确 CUDA 版本相关报错；但默认 / 全量 action-head fine-tune 即使在 32GB 5090 上仍然 OOM。
-
-因此当前不要继续在 `train_so101_synthetic_groot.py` 默认 fine-tune 路线上盲目调 batch size。下一步改用低显存入口：
-
-```text
-experiments/groot_n17_isaac_smart_task/train_so101_synthetic_groot_lowmem.py
-```
-
-详细说明见：
-
-```text
-experiments/groot_n17_isaac_smart_task/LOWMEM_LORA_FINETUNE_ZH.md
-```
-
-第一条推荐基线是 `projector-only`，它冻结 LLM、视觉骨干、diffusion Transformer 和 VLLN，只训练 action head 的 projector / encoder / decoder，保存出来仍是普通 GR00T checkpoint：
-
-```bash
-cd "$SMART_PROJECT"
-"$GROOT_ROOT/.venv/bin/python" \
-  experiments/groot_n17_isaac_smart_task/train_so101_synthetic_groot_lowmem.py \
-    --strategy projector-only \
-    --skip-stats \
-    --max-steps 2000 \
-    --save-steps 500 \
-    --global-batch-size 1 \
-    --gradient-accumulation-steps 16 \
-    --dataloader-num-workers 2 \
-    --experiment-name so101_projector_only_bs1_acc16
-```
-
-如果还需要更少可训练参数，或 `projector-only` 表现不够，再试 `diffusion-lora` / `projector-plus-diffusion-lora`。LoRA 输出是 PEFT adapter，部署和推理加载要后续单独验证。
-
-输出目录默认是：
-
-```text
-$SMART_PROJECT/outputs/groot_so101_synthetic_finetune/<experiment-name>/
-```
-
-如果要保留多组实验，显式改名字：
-
-```bash
---experiment-name so101_synthetic_bs1_acc16_run01
-```
-
-## 12. 最小推理 / 模型加载 smoke test
-
-这里的推理只用于验证 GR00T 安装和模型权重访问，不等同于 SO101 真机部署。
-
-官方 demo smoke：
-
-```bash
-cd "$GROOT_ROOT"
-uv run python scripts/deployment/standalone_inference_script.py \
-  --model-path nvidia/GR00T-N1.7-3B \
-  --dataset-path demo_data/droid_sample \
-  --embodiment-tag OXE_DROID_RELATIVE_EEF_RELATIVE_JOINT \
-  --traj-ids 1 2 \
-  --inference-mode pytorch \
-  --action-horizon 8
-```
-
-如果需要验证本项目 bridge 能加载 base model，而不做真实部署，可在目标机上启动：
-
-```bash
-cd "$SMART_PROJECT"
-"$GROOT_ROOT/.venv/bin/python" \
-  experiments/groot_n17_isaac_smart_task/groot_bridge_server.py \
-    --model-path nvidia/GR00T-N1.7-3B \
-    --embodiment-tag OXE_DROID_RELATIVE_EEF_RELATIVE_JOINT \
-    --device cuda
-```
-
-这只说明 GR00T bridge 能加载模型并监听 socket。是否能在 IsaacLab/真机上闭环，是另一份部署文档要处理的问题。
-
-微调 checkpoint 的推理验证流程等第一个有效 checkpoint 出来后再补。需要重点确认：
-
-- checkpoint 目录里是否保存了 model 和 processor；
-- `experiment_cfg/` 里的 modality config、statistics 是否随 checkpoint 一起可恢复；
-- 自定义 `NEW_EMBODIMENT` 的 inference processor 是否需要额外传入同一个 `so101_synthetic_groot_config.py`。
-
-## 13. 常见问题
-
-### 13.1 `CUDA_HOME does not exist`
-
-说明系统没有可供 DeepSpeed 探测或编译 CUDA op 的 toolkit。把 `CUDA_HOME` 指到第 4 节确认存在的 toolkit 路径，例如先试已有 13.0：
-
-```bash
-export CUDA_HOME=/usr/local/cuda-13.0
-# export CUDA_HOME=/usr/local/cuda-12.8
-export PATH="$CUDA_HOME/bin:$PATH"
-export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
-```
-
-并确认：
-
-```bash
-$CUDA_HOME/bin/nvcc --version
-```
-
-### 13.2 `nvidia-smi` 显示 CUDA 13.0，能不能先试
-
-可以先试，但要分清两件事：`nvidia-smi` 的 CUDA Version 是驱动兼容上限，不等于系统已经安装了 CUDA 13.0 toolkit；真正关键的是 `$CUDA_HOME/bin/nvcc` 是否存在。
-
-如果目标机已有 `/usr/local/cuda-13.0/bin/nvcc`，先把 `CUDA_HOME` 指到 13.0 跑 1-step smoke test。能过就先继续，不急着装 12.8。若报 CUDA version mismatch、DeepSpeed CUDA op 编译失败，或 PyTorch extension build 明确不接受 13.0，再让 `smartscape` 安装 CUDA Toolkit 12.8。GR00T venv 的 PyTorch 是 `cu128`，所以 12.8 是更贴合当前训练栈的保底方案。
-
-### 13.3 官方 converter import LeRobot 报 API 错
-
-这是 LeRobot 和 GR00T 更新节奏不同造成的 API 漂移。当前脚本会自动回退到本地非破坏性 converter。只要最终 prepared dataset 是 v2.1，且有 `meta/modality.json`、mp4、parquet，就可以继续。
-
-### 13.4 prepared 数据里为什么没有图片
-
-LeRobot v2.1 这里的视频模态是 mp4：
-
-```text
-videos/chunk-000/<video_key>/episode_000000.mp4
-```
-
-不是一帧一张图片。训练时 loader 会按 parquet/timestamp 去视频里解码帧。
-
-### 13.5 32GB 仍然 OOM
-
-如果是默认 fine-tune 路线 OOM，这已经符合预期：默认训练策略太重。改用低显存文档里的三条路线：
-
-- `projector-only`
-- `diffusion-lora`
-- `projector-plus-diffusion-lora`
-
-如果这些路线的 `--global-batch-size 1` smoke test 仍然 OOM，记录峰值显存、策略名、trainable parameter 数量和完整报错，再决定是否向公司申请云端大显存资源。
-
-### 13.6 `guest1` 没有 sudo 怎么办
-
-正常。`guest1` 不应该负责系统安装。处理方式：
-
-```text
-smartscape -> 安装/修复系统层依赖
-guest1     -> 运行 GR00T 用户层环境和训练
-```
-
-如果 `guest1` 遇到缺系统包的问题，例如 `ffmpeg`、`libaio-dev`、`nvcc` 缺失，把具体命令和报错交给 `smartscape` 执行第 4 节。
-
-## 14. 迁移完成标准
-
-目标机迁移到“可以开始认真微调”的最低标准：
-
-- `nvidia-smi` 正常。
-- `$CUDA_HOME/bin/nvcc --version` 正常。
-- GR00T `.venv` import 正常。
-- HF gated model 权限正常。
-- prepared v2.1 数据已经同步到目标机。
-- prepared copy 中有 parquet 和两路 mp4。
-- GR00T stats 生成成功。
-- `--max-steps 1 --global-batch-size 1` 能走进训练 step；若 OOM，需要记录峰值显存和报错位置，再决定冻结/LoRA 策略。

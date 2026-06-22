@@ -1,6 +1,23 @@
-# GR00T N1.7 + LeIsaac SmartTask 实验说明
+# Zero-shot：把 GR00T 接到 LeIsaac SmartTask
 
-这份文档解释 `experiments/groot_n17_isaac_smart_task` 这个实验目录做了什么、为什么这么做、如何复用 LeIsaac 里已有的 Isaac 场景，以及 Isaac 侧和 GR00T 侧是如何桥接起来的。
+读完这份文件，你应该能说清楚三件事：
+
+1. 为什么 IsaacLab 和 GR00T 要拆成两个进程。
+2. Observation 如何从 LeIsaac SmartTask 转成 GR00T OXE/DROID schema。
+3. 本机和 remote 机器分别适不适合跑 zero-shot 闭环。
+
+## 机器视角
+
+| 机器 | 推荐用途 | 需要放的资产 |
+|---|---|---|
+| 本机 RTX 5060 Ti | 主要 zero-shot 调试机：Isaac viewport、camera debug、2x2 视频对照 | `smart_project`、`leisaac/`、`Isaac-GR00T`、`conda isaaclab` |
+| 公司 remote RTX 5090 | 不作为 zero-shot 第一目标，除非后续也同步 LeIsaac/IsaacLab 和图形环境 | `smart_project`、`leisaac/`、`Isaac-GR00T`、可用 IsaacLab/Isaac Sim |
+
+本阶段的核心不是训练，而是问：base GR00T N1.7 在 LeIsaac SmartTask 场景里能不能产生有意义的动作流。
+
+## 背景与原理
+
+原长文中与 zero-shot 相关的正文如下。这份文档解释 `experiments/groot_n17_isaac_smart_task` 这个实验目录做了什么、为什么这么做、如何复用 LeIsaac 里已有的 Isaac 场景，以及 Isaac 侧和 GR00T 侧是如何桥接起来的。
 
 ## 1. 实验目标
 
@@ -55,31 +72,32 @@ LeIsaac 的历史定位是把 Isaac 和 LeRobot 桥接起来：
 
 ```text
 experiments/groot_n17_isaac_smart_task/
-├── README.md
-├── EXPLANATION_ZH.md
-├── REMOTE_LINUX_FINETUNE_ZH.md
-├── franka_smart_task/
-│   ├── __init__.py
-│   └── franka_smart_task_env_cfg.py
-├── wire.py
-├── groot_bridge_server.py
-├── run_smart_task_closed_loop.py
-├── so101_synthetic_groot_config.py
-└── train_so101_synthetic_groot.py
+├── README.md                              # 三阶段总索引，根目录唯一文档
+├── zero_shot_isaac_smart_task/            # 本阶段
+│   ├── README_ZH.md
+│   ├── LEISAAC_ACTION_ADAPTER_AUDIT_ZH.md
+│   ├── wire.py
+│   ├── groot_bridge_server.py
+│   ├── run_smart_task_closed_loop.py
+│   └── franka_smart_task/
+├── full_finetune_so101/
+│   ├── README_ZH.md
+│   ├── train_so101_synthetic_groot.py
+│   └── so101_synthetic_groot_config.py
+└── lowmem_lora_freeze_so101/
+    ├── README_ZH.md
+    └── train_so101_synthetic_groot_lowmem.py
 ```
 
-核心文件含义：
+本阶段核心文件含义：
 
 - `wire.py`：Isaac 进程和 GR00T 进程之间的通信协议。负责 socket、msgpack、numpy array 序列化。
 - `groot_bridge_server.py`：运行在 GR00T venv 中，加载 `nvidia/GR00T-N1.7-3B`，对 Isaac 侧提供 `ping/get_action/reset/shutdown` 接口。
-- `run_smart_task_closed_loop.py`：运行在 `conda isaaclab` 中，启动 LeIsaac SmartTask 或本目录注册的 Franka SmartTask，构造 GR00T observation，接收 action，并驱动 Isaac 中的机器人。
-- `so101_synthetic_groot_config.py`：GR00T `NEW_EMBODIMENT` 的 SO101 modality config，用于合成数据微调。
-- `train_so101_synthetic_groot.py`：SO101 合成数据准备和 GR00T fine-tune 启动脚本。
+- `run_smart_task_closed_loop.py`：运行在 `conda isaaclab` 中，启动 LeIsaac SmartTask 或本阶段注册的 Franka SmartTask，构造 GR00T observation，接收 action，并驱动 Isaac 中的机器人。
 - `franka_smart_task/__init__.py`：注册新的 gymnasium task id：`Groot-Franka-SmartTask-v0`。
 - `franka_smart_task/franka_smart_task_env_cfg.py`：定义 Franka 版本 SmartTask 的 IsaacLab env config。
-- `README.md`：实际运行命令。
-- `EXPLANATION_ZH.md`：当前这份中文说明材料。
-- `REMOTE_LINUX_FINETUNE_ZH.md`：迁移到另一台 Linux 训练机时的 GR00T 安装、数据转换、stats 和 fine-tune 操作手册。
+
+新命令直接使用本阶段子目录里的入口。
 
 ## 4. 两个 Python 环境如何隔离
 
@@ -92,7 +110,7 @@ experiments/groot_n17_isaac_smart_task/
 ```bash
 cd /home/yzliu/smart_project
 /home/yzliu/Isaac-GR00T/.venv/bin/python \
-  experiments/groot_n17_isaac_smart_task/groot_bridge_server.py \
+  experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task/groot_bridge_server.py \
   --model-path nvidia/GR00T-N1.7-3B \
   --embodiment-tag OXE_DROID_RELATIVE_EEF_RELATIVE_JOINT \
   --device cuda
@@ -118,7 +136,7 @@ conda run -n isaaclab env \
   PYTHONPATH=/home/yzliu/smart_project/leisaac/source/leisaac \
   PYTHONDONTWRITEBYTECODE=1 \
   PYTHONNOUSERSITE=1 \
-  python experiments/groot_n17_isaac_smart_task/run_smart_task_closed_loop.py \
+  python experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task/run_smart_task_closed_loop.py \
     --control-mode eef \
     --no-headless \
     --render-sleep-s 0.08 \
@@ -214,7 +232,7 @@ env = gym.make(args.task, cfg=env_cfg).unwrapped
 新增文件：
 
 ```text
-experiments/groot_n17_isaac_smart_task/franka_smart_task/__init__.py
+experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task/franka_smart_task/__init__.py
 ```
 
 里面调用：
@@ -448,10 +466,10 @@ LeIsaac camera3 -> GR00T video.wrist_image_left
 ```bash
 cd /home/yzliu/smart_project
 conda run -n isaaclab env \
-  PYTHONPATH=/home/yzliu/smart_project/experiments/groot_n17_isaac_smart_task:/home/yzliu/smart_project/leisaac/source/leisaac \
+  PYTHONPATH=/home/yzliu/smart_project/experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task:/home/yzliu/smart_project/leisaac/source/leisaac \
   PYTHONDONTWRITEBYTECODE=1 \
   PYTHONNOUSERSITE=1 \
-  python experiments/groot_n17_isaac_smart_task/run_smart_task_closed_loop.py \
+  python experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task/run_smart_task_closed_loop.py \
     --robot franka \
     --control-mode eef \
     --headless \
@@ -787,169 +805,14 @@ env.step(command)
 6. 对当前已有 SO101 合成数据，先跑通 GR00T `NEW_EMBODIMENT` 微调链路；真机部署前再补真实
    SO101/SOARM 数据或做 HG-DAgger 类修正数据采集。
 
-## 13. SO101 合成数据微调路线
-
-除了 zero-shot probe，本目录现在还增加了面向真实部署目标的 SO101 微调路线。这里的目标机械臂
-明确是 SOARM101/SO101，不是 Franka。Franka 仍然只是为了分析 zero-shot embodiment mismatch
-而加入的对照任务。
-
-当前 `dataset/` 下的两份合成数据是 LeRobot v3 格式：
-
-```text
-dataset/so101_lego_pick_0609_1722
-dataset/so101_lego_pick_0609_1722_mimic
-```
-
-它们的关键特征是：
-
-- `robot_type` 是 `so101_follower`。
-- `observation.state` 是 6D SO101 state。
-- `action` 是 6D SO101 action。
-- 前 5 维是 arm joints，第 6 维是 gripper。
-- 图像有三路：`camera1/camera2/camera3`。
-
-GR00T 训练侧当前需要的是 GR00T-flavored LeRobot v2.1 数据，并且需要额外的
-`meta/modality.json`。所以新增的训练准备逻辑不是直接修改原始 `dataset/`，而是默认生成 prepared
-副本：
-
-```text
-outputs/groot_so101_synthetic_datasets/
-```
-
-这些 prepared dataset 中会额外出现：
-
-```text
-meta/modality.json
-meta/stats.json
-meta/relative_stats.json
-```
-
-### 13.1 为什么是两阶段环境
-
-本机环境是刻意隔离的：
-
-```text
-LeRobot 数据/schema 转换 -> conda lerobot
-GR00T stats / launch_finetune -> /home/yzliu/Isaac-GR00T/.venv
-Isaac closed-loop -> conda isaaclab
-```
-
-因此不要假设一个 Python 环境可以同时 import LeRobot、GR00T、IsaacLab。推荐流程是：
-
-第一阶段：在 LeRobot 环境里准备数据。
-
-```bash
-cd /home/yzliu/smart_project
-conda run -n lerobot python \
-  experiments/groot_n17_isaac_smart_task/train_so101_synthetic_groot.py \
-    --instruction "Pick up the red 2x4 lego brick." \
-    --force-prepare \
-    --skip-stats \
-    --prepare-only
-```
-
-第二阶段：在 GR00T venv 里生成统计并启动 fine-tune 入口。
-
-```bash
-cd /home/yzliu/smart_project
-/home/yzliu/Isaac-GR00T/.venv/bin/python \
-  experiments/groot_n17_isaac_smart_task/train_so101_synthetic_groot.py \
-    --skip-prepare \
-    --max-steps 2000 \
-    --save-steps 500 \
-    --global-batch-size 32
-```
-
-本机 RTX 5060 Ti 16GB 更适合做数据转换、loader smoke test、stats 生成和小步数逻辑验证；完整
-GR00T 微调大概率仍然需要上云或使用 40GB+ 显存设备。
-
-如果要迁移到另一台 Linux 训练机，先看本目录的独立手册：
-
-```text
-experiments/groot_n17_isaac_smart_task/REMOTE_LINUX_FINETUNE_ZH.md
-```
-
-### 13.2 v3 到 v2.1 转换
-
-LeRobot v3 和 v2.1 最大区别是存储布局：
-
-```text
-v3:   data/chunk-000/file-000.parquet
-      videos/observation.images.camera1/chunk-000/file-000.mp4
-      meta/tasks.parquet
-      meta/episodes/chunk-000/file-000.parquet
-
-v2.1: data/chunk-000/episode_000000.parquet
-      videos/chunk-000/observation.images.camera1/episode_000000.mp4
-      meta/tasks.jsonl
-      meta/episodes.jsonl
-```
-
-GR00T 官方仓库里有转换器：
-
-```text
-/home/yzliu/Isaac-GR00T/scripts/lerobot_conversion/convert_v3_to_v2.py
-```
-
-这个转换器的 `convert_dataset()` 是原地转换：会把原始目录移动成 `_v3.0` 备份，再把 v2.1 写回原路径。
-这不是删除数据，但会改变当前 `dataset/` 的目录形态。当前实验脚本默认使用 prepared copy，是为了减少误操作。
-
-另外，GR00T 官方转换器依赖某个 LeRobot commit 的 API；本机 LeRobot 更新后可能出现
-`load_info` 等 API 位置变化。这不是环境坏了，而是 Isaac/GR00T 和 LeRobot 更新节奏不同造成的正常
-版本漂移。`train_so101_synthetic_groot.py` 会优先尝试官方转换器；如果依赖或 API 不兼容，会打印原因并
-回退到本目录里的轻量非破坏性转换逻辑。
-
-### 13.3 GR00T modality config
-
-新增文件：
-
-```text
-experiments/groot_n17_isaac_smart_task/so101_synthetic_groot_config.py
-```
-
-这不是 LeRobot 官方格式，而是 GR00T 对自定义 embodiment 的训练配置。它注册：
-
-```text
-EmbodimentTag.NEW_EMBODIMENT
-```
-
-并声明：
-
-```text
-video:
-  top
-  wrist
-
-state:
-  single_arm  -> observation.state[0:5]
-  gripper     -> observation.state[5:6]
-
-action:
-  single_arm  -> action[0:5], relative joint action
-  gripper     -> action[5:6], absolute gripper target
-
-language:
-  annotation.human.task_description
-```
-
-训练相机映射是：
-
-```text
-observation.images.camera1 -> video.top
-observation.images.camera3 -> video.wrist
-observation.images.camera2 -> 不送入 GR00T 微调
-```
-
-这里把 `camera1` 命名为 `top`，是因为实际图像语义是 top/global 视角，而不是 front 视角。
-
-## 14. 复现命令
+## 复现命令
 
 终端 1：启动 GR00T bridge。
 
 ```bash
 cd /home/yzliu/smart_project
 /home/yzliu/Isaac-GR00T/.venv/bin/python \
-  experiments/groot_n17_isaac_smart_task/groot_bridge_server.py \
+  experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task/groot_bridge_server.py \
   --model-path nvidia/GR00T-N1.7-3B \
   --embodiment-tag OXE_DROID_RELATIVE_EEF_RELATIVE_JOINT \
   --device cuda
@@ -960,10 +823,10 @@ cd /home/yzliu/smart_project
 ```bash
 cd /home/yzliu/smart_project
 conda run -n isaaclab env \
-  PYTHONPATH=/home/yzliu/smart_project/experiments/groot_n17_isaac_smart_task:/home/yzliu/smart_project/leisaac/source/leisaac \
+  PYTHONPATH=/home/yzliu/smart_project/experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task:/home/yzliu/smart_project/leisaac/source/leisaac \
   PYTHONDONTWRITEBYTECODE=1 \
   PYTHONNOUSERSITE=1 \
-  python experiments/groot_n17_isaac_smart_task/run_smart_task_closed_loop.py \
+  python experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task/run_smart_task_closed_loop.py \
     --robot so101 \
     --control-mode joint \
     --no-headless \
@@ -980,10 +843,10 @@ conda run -n isaaclab env \
 ```bash
 cd /home/yzliu/smart_project
 conda run -n isaaclab env \
-  PYTHONPATH=/home/yzliu/smart_project/experiments/groot_n17_isaac_smart_task:/home/yzliu/smart_project/leisaac/source/leisaac \
+  PYTHONPATH=/home/yzliu/smart_project/experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task:/home/yzliu/smart_project/leisaac/source/leisaac \
   PYTHONDONTWRITEBYTECODE=1 \
   PYTHONNOUSERSITE=1 \
-  python experiments/groot_n17_isaac_smart_task/run_smart_task_closed_loop.py \
+  python experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task/run_smart_task_closed_loop.py \
     --robot so101 \
     --control-mode eef \
     --no-headless \
@@ -1000,10 +863,10 @@ conda run -n isaaclab env \
 ```bash
 cd /home/yzliu/smart_project
 conda run -n isaaclab env \
-  PYTHONPATH=/home/yzliu/smart_project/experiments/groot_n17_isaac_smart_task:/home/yzliu/smart_project/leisaac/source/leisaac \
+  PYTHONPATH=/home/yzliu/smart_project/experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task:/home/yzliu/smart_project/leisaac/source/leisaac \
   PYTHONDONTWRITEBYTECODE=1 \
   PYTHONNOUSERSITE=1 \
-  python experiments/groot_n17_isaac_smart_task/run_smart_task_closed_loop.py \
+  python experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task/run_smart_task_closed_loop.py \
     --robot franka \
     --control-mode joint \
     --no-headless \
@@ -1020,10 +883,10 @@ conda run -n isaaclab env \
 ```bash
 cd /home/yzliu/smart_project
 conda run -n isaaclab env \
-  PYTHONPATH=/home/yzliu/smart_project/experiments/groot_n17_isaac_smart_task:/home/yzliu/smart_project/leisaac/source/leisaac \
+  PYTHONPATH=/home/yzliu/smart_project/experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task:/home/yzliu/smart_project/leisaac/source/leisaac \
   PYTHONDONTWRITEBYTECODE=1 \
   PYTHONNOUSERSITE=1 \
-  python experiments/groot_n17_isaac_smart_task/run_smart_task_closed_loop.py \
+  python experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task/run_smart_task_closed_loop.py \
     --robot franka \
     --control-mode eef \
     --no-headless \
@@ -1049,7 +912,7 @@ Franka + EEF/IK
 - runner 调用 Isaac Sim 自带的 `omni.kit.capture.viewport`。
 - mp4 编码依赖同环境已有的 `omni.videoencoding`。
 - 默认只录“主动控制阶段”，不录最后 `--keep-open-s` 的静止观察阶段。
-- 默认输出目录是 `experiments/groot_n17_isaac_smart_task/runs/captures/`。
+- 默认输出目录是 `experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task/runs/captures/`。
 - 默认视频参数是 `960x540 / 15fps / 2Mbps`，目的是让文件不要太大。
 
 如果文件仍然太大，可以调低：

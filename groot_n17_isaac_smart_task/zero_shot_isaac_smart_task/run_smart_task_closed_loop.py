@@ -32,12 +32,16 @@ import torch
 
 
 # 当前文件所在目录：
-# /home/yzliu/smart_project/experiments/groot_n17_isaac_smart_task
+# /home/yzliu/smart_project/experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task
 SCRIPT_DIR = Path(__file__).resolve().parent
+
+# 当前实验目录：
+# /home/yzliu/smart_project/experiments/groot_n17_isaac_smart_task
+EXPERIMENT_ROOT = SCRIPT_DIR.parent
 
 # 项目根目录：
 # /home/yzliu/smart_project
-REPO_ROOT = SCRIPT_DIR.parents[1]
+REPO_ROOT = EXPERIMENT_ROOT.parents[1]
 
 # LeIsaac 的 Python package 源码目录。运行脚本时虽然 README 里已经设置
 # PYTHONPATH，但这里再插一次，方便直接运行或调试。
