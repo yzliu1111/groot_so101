@@ -36,6 +36,7 @@ def configure_workspace_paths() -> None:
     isaaclab_source = leisaac_root / "dependencies" / "IsaacLab" / "source"
 
     os.environ.setdefault("LEISAAC_ASSETS_ROOT", str((leisaac_root / "assets").resolve()))
+    os.environ.setdefault("OMNI_KIT_ACCEPT_EULA", "YES")
 
     add_path(EXPERIMENT_ROOT / "zero_shot_isaac_smart_task")
     add_path(leisaac_root / "source" / "leisaac")
@@ -58,6 +59,12 @@ def print_header() -> None:
     ):
         print(f"{key}:", os.environ.get(key, ""))
     print("PYTHONPATH:", os.environ.get("PYTHONPATH", ""))
+    conda_prefix = os.environ.get("CONDA_PREFIX")
+    if conda_prefix:
+        conda_lib = str(Path(conda_prefix) / "lib")
+        ld_library_path = os.environ.get("LD_LIBRARY_PATH", "")
+        if not ld_library_path.split(":")[0:1] == [conda_lib]:
+            print(f"[WARN] Put {conda_lib} first in LD_LIBRARY_PATH before starting Python to avoid CXXABI noise.")
     print()
 
 
