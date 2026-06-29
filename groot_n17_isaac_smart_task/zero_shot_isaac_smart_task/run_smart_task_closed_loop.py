@@ -99,6 +99,10 @@ TARGET_OBJECT_CANDIDATES = (
     "red_2x4_lego_brick_pick",
     "red_2x4_lego_brick",
 )
+SMART_TARGET_OBJECT_KEY = "red_2x4_lego_brick_pick"
+SMART_TARGET_CUBOID_SIZE = (0.0318, 0.0158, 0.0096)
+SMART_TARGET_CUBOID_MASS = 0.02
+SMART_TARGET_MANAGED_PRIM_PATH = f"{{ENV_REGEX_NS}}/Scene/{SMART_TARGET_OBJECT_KEY}_managed"
 
 # 让 Python 可以 import 同目录的 wire.py。
 if str(SCRIPT_DIR) not in sys.path:
@@ -471,6 +475,144 @@ def resolve_target_object_name(env: Any, requested_name: str) -> str:
         "could not auto-detect SmartTask target object; "
         f"tried {list(TARGET_OBJECT_CANDIDATES)}, available rigid objects are {names}"
     )
+
+
+def is_leisaac_smart_task(task: str) -> bool:
+    """Return whether this runner task is a LeIsaac SO101 SmartTask variant."""
+
+    return task.startswith("LeIsaac-SO101-SmartTask")
+
+
+def resolve_smart_scene_usd(value: str) -> Path:
+    """Resolve the scene USD used by LeIsaac SmartTask in this runner process."""
+
+    scene_dir = LEISAAC_ROOT / "assets" / "scenes" / "smart_scene"
+    if value == "auto":
+        portable_scene = scene_dir / "scene_portable.usda"
+        source_scene = scene_dir / "scene.usd"
+        resolved = portable_scene if portable_scene.exists() else source_scene
+    else:
+        resolved = Path(value).expanduser()
+        if not resolved.is_absolute():
+            resolved = (REPO_ROOT / resolved).resolve()
+        else:
+            resolved = resolved.resolve()
+
+    if not resolved.exists():
+        raise FileNotFoundError(f"SmartTask scene USD does not exist: {resolved}")
+    return resolved
+
+
+def smart_target_pose_from_scene(scene_usd_path: Path) -> tuple[tuple[float, float, float], tuple[float, float, float, float]]:
+    """Read the target pose from the SmartTask scene, falling back to a table-top pose."""
+
+    try:
+        from pxr import Usd, UsdGeom
+
+        stage = Usd.Stage.Open(str(scene_usd_path))
+        if stage is not None:
+            for prim_path in (
+                f"/world/{SMART_TARGET_OBJECT_KEY}",
+                f"/World/{SMART_TARGET_OBJECT_KEY}",
+                f"/{SMART_TARGET_OBJECT_KEY}",
+            ):
+                prim = stage.GetPrimAtPath(prim_path)
+                if not prim or not prim.IsValid():
+                    continue
+                matrix = UsdGeom.Xformable(prim).ComputeLocalToWorldTransform(Usd.TimeCode.Default())
+                if matrix.Orthonormalize(issueWarning=True):
+                    rot = matrix.ExtractRotationQuat()
+                    quat = (rot.GetReal(), rot.GetImaginary()[0], rot.GetImaginary()[1], rot.GetImaginary()[2])
+                else:
+                    quat = (1.0, 0.0, 0.0, 0.0)
+                pos = matrix.ExtractTranslation()
+                return (pos[0], pos[1], pos[2]), quat
+    except Exception as exc:  # noqa: BLE001 - asset fallback should still be usable.
+        print(f"[runner] warning: failed reading SmartTask target pose from {scene_usd_path}: {exc}", flush=True)
+
+    return (0.0, 0.0, 0.02), (1.0, 0.0, 0.0, 0.0)
+
+
+def add_smart_target_cfg(env_cfg: Any, target_asset: str, target_prim_path: str, scene_usd_path: Path) -> None:
+    """Register SmartTask's target object without modifying the LeIsaac source tree."""
+
+    if target_asset == "scene":
+        return
+
+    import isaaclab.sim as sim_utils
+    from isaaclab.assets import RigidObjectCfg
+
+    if target_asset == "cuboid":
+        spawn_cfg = sim_utils.CuboidCfg(
+            size=SMART_TARGET_CUBOID_SIZE,
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(max_depenetration_velocity=1.0),
+            mass_props=sim_utils.MassPropertiesCfg(mass=SMART_TARGET_CUBOID_MASS),
+            collision_props=sim_utils.CollisionPropertiesCfg(),
+            physics_material=sim_utils.RigidBodyMaterialCfg(static_friction=0.9, dynamic_friction=0.7),
+            visual_material=sim_utils.PreviewSurfaceCfg(
+                diffuse_color=(0.78, 0.05, 0.02),
+                roughness=0.55,
+            ),
+        )
+    else:
+        target_usd_path = Path(target_asset).expanduser()
+        if not target_usd_path.is_absolute():
+            target_usd_path = (REPO_ROOT / target_usd_path).resolve()
+        else:
+            target_usd_path = target_usd_path.resolve()
+        if not target_usd_path.exists():
+            raise FileNotFoundError(f"--smart-target-asset USD path does not exist: {target_usd_path}")
+        spawn_cfg = sim_utils.UsdFileCfg(
+            usd_path=str(target_usd_path),
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(max_depenetration_velocity=1.0),
+            mass_props=sim_utils.MassPropertiesCfg(mass=SMART_TARGET_CUBOID_MASS),
+            collision_props=sim_utils.CollisionPropertiesCfg(),
+        )
+
+    pos, rot = smart_target_pose_from_scene(scene_usd_path)
+    setattr(
+        env_cfg.scene,
+        SMART_TARGET_OBJECT_KEY,
+        RigidObjectCfg(
+            prim_path=target_prim_path,
+            spawn=spawn_cfg,
+            init_state=RigidObjectCfg.InitialStateCfg(pos=pos, rot=rot),
+        ),
+    )
+
+
+def install_smart_task_asset_patch(args: argparse.Namespace) -> Path | None:
+    """Patch LeIsaac SmartTask config in-process for portable scene and target fallback."""
+
+    if not is_leisaac_smart_task(args.task):
+        return None
+
+    scene_usd_path = resolve_smart_scene_usd(args.smart_scene_usd)
+
+    import leisaac.assets.scenes.smart_scene as smart_scene
+    import leisaac.tasks.smart_task.smart_task_env_cfg as smart_task_cfg
+
+    original_parse = smart_task_cfg.parse_usd_and_create_subassets
+
+    def parse_usd_and_create_subassets_with_target(usd_path, env_cfg, *parse_args, **parse_kwargs):
+        result = original_parse(str(scene_usd_path), env_cfg, *parse_args, **parse_kwargs)
+        add_smart_target_cfg(env_cfg, args.smart_target_asset, args.smart_target_prim_path, scene_usd_path)
+        return result
+
+    # Keep the imported module constants consistent for __post_init__ and debug logs.
+    smart_scene.SMART_SCENE_USD_PATH = str(scene_usd_path)
+    smart_scene.SMART_SCENE_CFG.spawn.usd_path = str(scene_usd_path)
+    smart_task_cfg.SMART_SCENE_USD_PATH = str(scene_usd_path)
+    smart_task_cfg.SMART_SCENE_CFG.spawn.usd_path = str(scene_usd_path)
+    smart_task_cfg.parse_usd_and_create_subassets = parse_usd_and_create_subassets_with_target
+
+    print(
+        "[runner] SmartTask asset patch "
+        f"scene_usd={scene_usd_path} target_asset={args.smart_target_asset} "
+        f"target_prim_path={args.smart_target_prim_path}",
+        flush=True,
+    )
+    return scene_usd_path
 
 
 def build_oxe_observation(
@@ -1251,6 +1393,29 @@ def parse_args() -> argparse.Namespace:
             "auto supports current red_2x4_lego_brick_pick and legacy red_2x4_lego_brick."
         ),
     )
+    parser.add_argument(
+        "--smart-scene-usd",
+        default="auto",
+        help=(
+            "LeIsaac SmartTask scene USD for this runner process. "
+            "auto uses scene_portable.usda when present, otherwise scene.usd."
+        ),
+    )
+    parser.add_argument(
+        "--smart-target-asset",
+        default="cuboid",
+        help=(
+            "SmartTask target object source for LeIsaac SO101 runs: "
+            "'cuboid' creates a red 2x4-sized primitive fallback, "
+            "'scene' relies on the LeIsaac scene parser, "
+            "or pass a complete USD path."
+        ),
+    )
+    parser.add_argument(
+        "--smart-target-prim-path",
+        default=SMART_TARGET_MANAGED_PRIM_PATH,
+        help="Prim path used when --smart-target-asset is cuboid or a USD path.",
+    )
 
     # IsaacLab env 的设备。一般用 cuda。
     parser.add_argument("--device", default="cuda")
@@ -1466,8 +1631,12 @@ def main() -> None:
     # import franka_smart_task 的副作用是注册 experiments 里的 Franka task id。
     import franka_smart_task  # noqa: F401
 
+    smart_scene_usd_path = install_smart_task_asset_patch(args)
+
     # 读取 task 默认配置，并指定 device / num_envs。
     env_cfg = parse_env_cfg(args.task, device=args.device, num_envs=1)
+    if smart_scene_usd_path is not None and hasattr(env_cfg.scene, "scene"):
+        env_cfg.scene.scene.spawn.usd_path = str(smart_scene_usd_path)
 
     # control-mode 决定 LeIsaac action manager 使用哪套 action cfg：
     # - so101leader：JointPositionAction，action 维度 6。

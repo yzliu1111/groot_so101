@@ -670,6 +670,16 @@ test -f "$LEISAAC_ROOT/assets/scenes/smart_scene/scene_portable.usda" && echo "S
 
 如果检查输出里仍然有 `/home/ubuntu/...`、`/Users/...` 这类绝对路径，先停下来确认缺的是哪个资产。不要用创建旧路径 symlink 的方式长期绕过。
 
+当前随仓库带的 `assets/red_2x4_lego_brick.usd` 还会引用缺失的内部 layer `red_2x4_lego_brick_03.usd`。转换脚本会从 portable scene 里移除这条坏 payload；实验 runner 默认用 `--smart-target-asset cuboid` 在当前进程里显式生成一个红色 2x4 尺寸 cuboid 作为目标物体，不修改 LeIsaac 源码，先保证闭环链路能跑通。
+
+如果之后拿到了完整可 compose 的红色 LEGO USD，不需要改代码，在 runner 命令后追加：
+
+```bash
+--smart-target-asset /path/to/complete_red_2x4_lego_brick.usd
+```
+
+如果要完全依赖 LeIsaac scene parser，不加 fallback，可以显式传 `--smart-target-asset scene`。
+
 ### 7.8 LeIsaac task smoke
 
 task registry 必须在 `AppLauncher` 启动后 import：
@@ -767,6 +777,7 @@ export PYTHONNOUSERSITE=1
 python experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task/run_smart_task_closed_loop.py \
   --robot so101 \
   --control-mode joint \
+  --smart-target-asset cuboid \
   --debug-cameras-only \
   --headless
 ```
@@ -898,6 +909,7 @@ python experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task/run_sma
   --deployment-mode zero-shot-oxe \
   --robot so101 \
   --control-mode joint \
+  --smart-target-asset cuboid \
   --dry-run \
   --max-policy-calls 1 \
   --instruction "Pick up the red 2x4 lego brick."
@@ -957,6 +969,7 @@ python experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task/run_sma
   --deployment-mode so101-finetuned \
   --robot so101 \
   --control-mode joint \
+  --smart-target-asset cuboid \
   --bridge-host "$BRIDGE_HOST" \
   --bridge-port "$BRIDGE_PORT" \
   --dry-run \

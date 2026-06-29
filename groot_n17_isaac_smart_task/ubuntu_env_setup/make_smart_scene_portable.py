@@ -20,6 +20,7 @@ REPO_ROOT = EXPERIMENT_ROOT.parents[1]
 
 ABSOLUTE_PATH_RE = re.compile(r"(?:file:)?/(?:home|Users)/[^@\n\r\"')\]]+")
 PACKMAN_CAMERA_LINE_RE = re.compile(r"(?m)^.*(?:/home/ubuntu/\.cache/packman/|resources/models/camera/camera\.usd).*\n?")
+BROKEN_TARGET_PAYLOAD_LINE_RE = re.compile(r"(?m)^.*red_2x4_lego_brick\.usd.*\n?")
 
 
 def add_path(path: Path) -> None:
@@ -88,7 +89,12 @@ def make_portable_text(text: str) -> str:
     # The camera preview mesh is an Omniverse UI artifact. The task defines real
     # cameras through TiledCameraCfg, so dropping stale packman preview references
     # avoids noisy "Could not open asset ... camera.usd" warnings.
-    return PACKMAN_CAMERA_LINE_RE.sub("", text)
+    text = PACKMAN_CAMERA_LINE_RE.sub("", text)
+
+    # The checked-in red 2x4 LEGO USD has a missing nested layer
+    # (red_2x4_lego_brick_03.usd). The experiment runner registers the target
+    # object in-process instead, with --smart-target-asset as the complete-asset hook.
+    return BROKEN_TARGET_PAYLOAD_LINE_RE.sub("", text)
 
 
 def find_absolute_paths(text: str) -> list[str]:
