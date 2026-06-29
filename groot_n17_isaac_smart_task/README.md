@@ -7,13 +7,21 @@
 | Zero-shot 推理 | `zero_shot_isaac_smart_task/` | `groot_bridge_server.py`、`run_smart_task_closed_loop.py`、`wire.py`、`franka_smart_task/` |
 | Full fine-tune | `full_finetune_so101/` | `train_so101_synthetic_groot.py`、`so101_synthetic_groot_config.py` |
 | Low-memory / LoRA / freeze | `lowmem_lora_freeze_so101/` | `train_so101_synthetic_groot_lowmem.py` |
+| Ubuntu 环境搭建 | `ubuntu_env_setup/` | `README_ZH.md` |
 
 推荐阅读顺序：
 
 ```text
+0. 如果是新 Ubuntu 机器，先看 ubuntu_env_setup/README_ZH.md
 1. zero_shot_isaac_smart_task/README_ZH.md
 2. full_finetune_so101/README_ZH.md
 3. lowmem_lora_freeze_so101/README_ZH.md
 ```
 
-所有命令都以子目录入口为准。
+环境说明单独拆开：
+
+```text
+任意 Ubuntu 机器环境搭建：ubuntu_env_setup/README_ZH.md
+```
+
+所有命令都以子目录入口为准；根目录只保留这个 README。

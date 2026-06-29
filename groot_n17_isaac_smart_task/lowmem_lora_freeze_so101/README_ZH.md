@@ -1,19 +1,20 @@
 # Low-memory / LoRA：SO101 冻结参数与 adapter 微调
 
-本文记录两台机器共用的 GR00T N1.7 低显存训练入口：
+本文记录 GR00T N1.7 在 SO101 prepared 数据上的低显存训练入口：
 
 - 本机 RTX 5060 Ti 16GB：主要做数据 / 配置 / loader / stats / 1-step smoke test。
-- 公司 remote RTX 5090 32GB：主要做低显存策略的正式训练 smoke 和较长 steps 实验。
+- 任意远程 Ubuntu GPU 训练机：主要做低显存策略的正式训练 smoke 和较长 steps 实验。
 
-范围只覆盖已经 prepared 的 SO101 v2.1 数据微调，不覆盖 LeRobot v3 转换和真机部署。所有命令尽量通过 `SMART_PROJECT` 和 `GROOT_ROOT` 两个变量写成同一套；先按机器设置 profile，再复制后面的训练命令。
+范围覆盖已经 prepared 的 SO101 v2.1 数据微调，以及训练后 checkpoint 如何回到 LeIsaac 仿真资产里推理。LeRobot v3 转换看 full fine-tune 文档；任意 Ubuntu 机器搭环境看通用安装剧本。真实 SO101 推理的边界在本文单独说明。
+
+如果要迁移到另一台 Ubuntu GPU 机器，先看通用安装剧本：[ubuntu_env_setup/README_ZH.md](../ubuntu_env_setup/README_ZH.md)。
 
 ## 当前结论
 
-- 远程 5090 PC 上虽然 `nvidia-smi` / 官方建议显示 CUDA 13.0，但目前能跑到 OOM，没有出现明确 CUDA 13.0 版本相关报错。
-- 当前主矛盾不是 CUDA 版本，而是 GR00T N1.7 默认 fine-tune 训练参数量太大。
-- 全量 / 默认 action-head 微调在 32GB 5090 上仍然 OOM，需要先尝试冻结更多权重，或用 LoRA / adapter 路线。
+- 当前主矛盾不是某一台机器的 CUDA 版本，而是 GR00T N1.7 默认 fine-tune 训练参数量太大。
+- 全量 / 默认 action-head 微调在 32GB 级别单卡上仍然可能 OOM，需要先尝试冻结更多权重，或用 LoRA / adapter 路线。
 - 本机 5060 Ti 16GB 不应该作为“正式训练是否可行”的主要判断依据；它适合快速验证脚本、数据、stats 和最小训练 step，OOM 是预期风险。
-- CUDA 12.8 仍是 PyTorch `cu128` 栈的稳妥保底方案；但如果 CUDA 13.0 toolkit 已经能跑到 OOM，先不急着切 sudo 账号重装 12.8。
+- CUDA 12.8 是 PyTorch `cu128` 栈的稳妥保底方案；但如果目标机已有 toolkit 能跑到训练 OOM，先别把问题归因到 CUDA。
 
 ## 先把这件事讲清楚
 
@@ -117,7 +118,7 @@ embodiment 迁移不一定简单：7DoF / Franka-like 经验 -> SO101 关节动�
 
 ### 3.2 建议的实验优先级
 
-不要把 5060 Ti 或 5090 变成无限调参战场。更合理的顺序是：
+不要把 5060 Ti 或某台远程训练机变成无限调参战场。更合理的顺序是：
 
 ```text
 1. 官方冻结能力能覆盖的策略：projector-only / 关闭 diffusion / 关闭 vlln
@@ -167,7 +168,7 @@ embodiment 迁移不一定简单：7DoF / Franka-like 经验 -> SO101 关节动�
 | 仿真闭环 | 在 LeIsaac / IsaacLab SmartTask 中跑成功率 | 证明动作反馈循环可用 |
 | 真实 SO101 | 相机标定、动作缩放、安全限幅、延迟处理 | 这是另一层部署问题 |
 
-当前这份文档主要解决前两关：让本机 5060 Ti 能做最小工程验证，让 5090 32GB 有机会跑过训练 smoke，并把训练策略说清楚。
+当前这份文档主要解决前三关：让本机 5060 Ti 能做最小工程验证，让远程 GPU 训练机有机会跑过训练 smoke，并把训练后 checkpoint 回到 LeIsaac 仿真里验证。
 
 ## 新训练入口
 
@@ -195,6 +196,330 @@ outputs/groot_so101_synthetic_datasets/so101_lego_pick_0609_1722
 outputs/groot_so101_synthetic_datasets/so101_lego_pick_0609_1722_mimic
 ```
 
+这里不是自动扫描 `outputs/groot_so101_synthetic_datasets/` 下的所有目录。脚本默认只使用上面两份
+prepared 数据。如果后面又准备了新的数据集，需要显式传入：
+
+```bash
+--dataset-path "$SMART_PROJECT/outputs/groot_so101_synthetic_datasets/xxx"
+```
+
+`--dataset-path` 可以重复传，也可以用 `:` 分隔多条路径。脚本会把这些路径写进同一个 GR00T dataset
+配置里，当前 `mix_ratio` 是 `1.0`。
+
+## 输出、日志和部署边界
+
+### 训练输出放在哪里
+
+默认输出根目录是：
+
+```text
+outputs/groot_so101_synthetic_finetune
+```
+
+如果命令里有：
+
+```text
+--experiment-name so101_projector_only_bs1_acc16
+```
+
+实际输出会落到：
+
+```text
+outputs/groot_so101_synthetic_finetune/so101_projector_only_bs1_acc16/
+```
+
+里面通常会有：
+
+```text
+experiment_cfg/config.yaml
+experiment_cfg/conf.yaml
+experiment_cfg/lowmem_strategy.json
+processor/
+wandb_config.json
+checkpoint-500/
+checkpoint-1000/
+...
+```
+
+`--save-steps 500` 控制每多少 step 存一次，`--save-total-limit 3` 控制最多保留多少个 checkpoint。
+
+不同策略保存出来的东西不完全一样：
+
+| 策略 | 输出形态 | 部署难度 |
+|---|---|---|
+| `projector-only` | 普通 GR00T checkpoint | 相对直接 |
+| `diffusion-lora` | PEFT adapter，不是完整模型 | 需要 base model + adapter 加载逻辑 |
+| `projector-plus-diffusion-lora` | PEFT adapter + `modules_to_save` | 最复杂，需要单独验证加载 |
+
+### 能不能用 WandB / TensorBoard
+
+当前可以用 WandB。完整 projector-only 训练命令如下：
+
+```bash
+mkdir -p "$SMART_PROJECT/outputs/groot_so101_synthetic_finetune/logs"
+
+cd "$SMART_PROJECT"
+"$GROOT_ROOT/.venv/bin/python" \
+  experiments/groot_n17_isaac_smart_task/lowmem_lora_freeze_so101/train_so101_synthetic_groot_lowmem.py \
+    --strategy projector-only \
+    --skip-stats \
+    --max-steps 2000 \
+    --save-steps 500 \
+    --global-batch-size 1 \
+    --gradient-accumulation-steps 16 \
+    --dataloader-num-workers 2 \
+    --experiment-name so101_projector_only_bs1_acc16 \
+    --use-wandb \
+    --wandb-project finetune-gr00t-n1d7 \
+  2>&1 | tee "$SMART_PROJECT/outputs/groot_so101_synthetic_finetune/logs/so101_projector_only_bs1_acc16_wandb.log"
+```
+
+运行前需要在对应机器的 GR00T venv / shell 里登录：
+
+```bash
+"$GROOT_ROOT/.venv/bin/wandb" login
+```
+
+Isaac-GR00T 当前底层 Trainer 只在 `use_wandb=True` 时把 `report_to` 设成 `wandb`，否则是 `none`。也就是说，
+本项目当前没有 TensorBoard event 文件输出；想用 TensorBoard 需要后续改 GR00T training arguments 或另写日志转换。
+
+不接 WandB 时，完整命令如下。注意先 `mkdir -p`，否则 `tee` 的目标目录不存在时会直接报
+`No such file or directory`：
+
+```bash
+mkdir -p "$SMART_PROJECT/outputs/groot_so101_synthetic_finetune/logs"
+
+cd "$SMART_PROJECT"
+"$GROOT_ROOT/.venv/bin/python" \
+  experiments/groot_n17_isaac_smart_task/lowmem_lora_freeze_so101/train_so101_synthetic_groot_lowmem.py \
+    --strategy projector-only \
+    --skip-stats \
+    --max-steps 2000 \
+    --save-steps 500 \
+    --global-batch-size 1 \
+    --gradient-accumulation-steps 16 \
+    --dataloader-num-workers 2 \
+    --experiment-name so101_projector_only_bs1_acc16 \
+  2>&1 | tee "$SMART_PROJECT/outputs/groot_so101_synthetic_finetune/logs/so101_projector_only_bs1_acc16.log"
+```
+
+如果想用 `nohup` 挂后台，也必须先创建日志目录。否则 shell 会在启动 Python 前就因为重定向失败而退出，表现就是目标目录里什么都没有：
+
+```bash
+mkdir -p "$SMART_PROJECT/outputs/groot_so101_synthetic_finetune/logs"
+
+cd "$SMART_PROJECT"
+nohup "$GROOT_ROOT/.venv/bin/python" \
+  experiments/groot_n17_isaac_smart_task/lowmem_lora_freeze_so101/train_so101_synthetic_groot_lowmem.py \
+    --strategy projector-only \
+    --skip-stats \
+    --max-steps 2000 \
+    --save-steps 500 \
+    --global-batch-size 1 \
+    --gradient-accumulation-steps 16 \
+    --dataloader-num-workers 2 \
+    --experiment-name so101_projector_only_bs1_acc16 \
+  > "$SMART_PROJECT/outputs/groot_so101_synthetic_finetune/logs/so101_projector_only_bs1_acc16.nohup.log" 2>&1 &
+
+echo $! > "$SMART_PROJECT/outputs/groot_so101_synthetic_finetune/logs/so101_projector_only_bs1_acc16.pid"
+tail -f "$SMART_PROJECT/outputs/groot_so101_synthetic_finetune/logs/so101_projector_only_bs1_acc16.nohup.log"
+```
+
+### 训练后的权重怎么部署回 LeIsaac
+
+是的，部署回同事构建的 LeIsaac 环境时，GR00T 端需要变化。当前 zero-shot bridge 默认启动的是：
+
+```text
+model_path = nvidia/GR00T-N1.7-3B
+embodiment_tag = OXE_DROID_RELATIVE_EEF_RELATIVE_JOINT
+```
+
+而 SO101 微调用的是：
+
+```text
+embodiment_tag = NEW_EMBODIMENT
+modality config = full_finetune_so101/so101_synthetic_groot_config.py
+video keys = top / wrist
+state keys = single_arm / gripper
+action keys = single_arm / gripper
+```
+
+所以不能只把 `--model-path` 换成 checkpoint 就结束。至少还要做三件事：
+
+1. bridge 在创建 `Gr00tPolicy` 前加载同一个 `so101_synthetic_groot_config.py`，否则 `NEW_EMBODIMENT` 不知道有哪些 modality。
+2. Isaac runner 发送给 bridge 的 observation 要从 OXE/DROID schema 改成 SO101 `NEW_EMBODIMENT` schema。
+3. bridge / runner 的 action 解码要读取训练后的 `action.single_arm` 和 `action.gripper`，而不是 zero-shot OXE/DROID 的 `action.eef_9d` / `action.joint_position`。
+
+当前代码已经给 `projector-only` 普通 checkpoint 加了这条最小部署路径。
+
+相机 role 要特别注意：
+
+```text
+训练 prepared 数据:
+  observation.images.camera1 -> video.top
+  observation.images.camera3 -> video.wrist
+
+当前新版 leisaac live 场景:
+  camera3 -> role top
+  camera2 -> role wrist
+```
+
+runner 的 `--camera-profile auto` 会在 reset 后打印实际 mapping。新版 SO101 live 场景期望看到：
+
+```text
+mapping={'exterior': 'camera3', 'top': 'camera3', 'wrist': 'camera2'}
+```
+
+也就是说，checkpoint 的 schema 仍然是 `video.top/video.wrist`，但 live camera key 由 runner
+按 role 翻译，不是把训练时的 camera 编号原样照搬到当前场景。
+
+终端 1：启动 GR00T bridge，加载训练后的 checkpoint 和 SO101 modality config。
+
+checkpoint 很大时，让它留在训练/目标 Ubuntu 机器本地即可。bridge 负责加载权重并暴露
+host/port；Isaac runner 只连这个 host/port，不需要本地也有一份权重。当前 bridge 是 TCP
+pickle 协议，默认 `127.0.0.1:5577`，不是 HTTP REST URL；跨机器优先用 SSH tunnel。
+如果已有记录是 `http://host:port/...` 形式的 URL，当前 runner 只取其中的 `host` 和 `port`。
+
+```bash
+export SMART_PROJECT="__FILL_SMART_PROJECT__"
+export GROOT_ROOT="__FILL_ISAAC_GROOT_ROOT__"
+export CHECKPOINT="$SMART_PROJECT/outputs/groot_so101_synthetic_finetune/so101_projector_only_bs1_acc16/checkpoint-2000"
+
+cd "$SMART_PROJECT"
+"$GROOT_ROOT/.venv/bin/python" \
+  experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task/groot_bridge_server.py \
+    --deployment-mode so101-finetuned \
+    --model-path "$CHECKPOINT" \
+    --host 127.0.0.1 \
+    --port 5577 \
+    --device cuda
+```
+
+终端 2A：先做一次 dry-run，只请求一次 GR00T，不执行机器人动作。
+
+```bash
+export SMART_PROJECT="__FILL_SMART_PROJECT__"
+export LEISAAC_ROOT="${LEISAAC_ROOT:-$SMART_PROJECT/leisaac}"
+export LEISAAC_ENV="__FILL_ISAAC_RUNTIME_ENV__"
+
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate "$LEISAAC_ENV"
+
+export OMNI_KIT_ACCEPT_EULA=YES
+export LEISAAC_ASSETS_ROOT="$LEISAAC_ROOT/assets"
+cd "$SMART_PROJECT"
+
+export PYTHONPATH="$SMART_PROJECT/experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task:$LEISAAC_ROOT/source/leisaac:${PYTHONPATH:-}"
+export PYTHONDONTWRITEBYTECODE=1
+export PYTHONNOUSERSITE=1
+export BRIDGE_HOST="${BRIDGE_HOST:-127.0.0.1}"
+export BRIDGE_PORT="${BRIDGE_PORT:-5577}"
+
+python experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task/run_smart_task_closed_loop.py \
+  --deployment-mode so101-finetuned \
+  --robot so101 \
+  --control-mode joint \
+  --bridge-host "$BRIDGE_HOST" \
+  --bridge-port "$BRIDGE_PORT" \
+  --dry-run \
+  --max-policy-calls 1 \
+  --instruction "Pick up the red 2x4 lego brick."
+```
+
+终端 2B：dry-run 能看到 action key 之后，再开 viewport 做短闭环。
+
+```bash
+export SMART_PROJECT="__FILL_SMART_PROJECT__"
+export LEISAAC_ROOT="${LEISAAC_ROOT:-$SMART_PROJECT/leisaac}"
+export LEISAAC_ENV="__FILL_ISAAC_RUNTIME_ENV__"
+
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate "$LEISAAC_ENV"
+
+export OMNI_KIT_ACCEPT_EULA=YES
+export LEISAAC_ASSETS_ROOT="$LEISAAC_ROOT/assets"
+cd "$SMART_PROJECT"
+
+export PYTHONPATH="$SMART_PROJECT/experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task:$LEISAAC_ROOT/source/leisaac:${PYTHONPATH:-}"
+export PYTHONDONTWRITEBYTECODE=1
+export PYTHONNOUSERSITE=1
+
+python experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task/run_smart_task_closed_loop.py \
+  --deployment-mode so101-finetuned \
+  --robot so101 \
+  --control-mode joint \
+  --bridge-host "$BRIDGE_HOST" \
+  --bridge-port "$BRIDGE_PORT" \
+  --no-headless \
+  --render-sleep-s 0.08 \
+  --keep-open-s 60 \
+  --max-policy-calls 8 \
+  --capture-video \
+  --capture-name so101_projector_only_checkpoint_2000 \
+  --instruction "Pick up the red 2x4 lego brick."
+```
+
+如果动作太猛，先加保守执行参数看趋势：
+
+```bash
+--so101-arm-delta-scale 0.3 --so101-max-arm-delta 0.08
+```
+
+如果是 LoRA 策略，当前 bridge 还需要额外支持 PEFT adapter 加载，或者先把 adapter merge 成可由 `Gr00tPolicy`
+直接读取的模型目录。这个部署验证要单独做，不能假设训练保存成功就等于推理能直接加载。
+
+### 真实 SO101 推理现在缺什么
+
+上面的部署命令是“把训练后的 checkpoint 放回 LeIsaac / IsaacLab 仿真资产里推理”。它仍然运行的是：
+
+```text
+Isaac Sim 中的 SO101 follower
+LeIsaac SmartTask observation
+run_smart_task_closed_loop.py
+```
+
+这不是实际 SO101 机械臂部署。
+
+真实 SO101 部署时，GR00T bridge 这一端可以复用：
+
+```bash
+export SMART_PROJECT="__FILL_SMART_PROJECT__"
+export GROOT_ROOT="__FILL_ISAAC_GROOT__"
+export CHECKPOINT="__FILL_FINETUNED_CHECKPOINT_DIR__"
+
+cd "$SMART_PROJECT"
+"$GROOT_ROOT/.venv/bin/python" \
+  experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task/groot_bridge_server.py \
+    --deployment-mode so101-finetuned \
+    --model-path "$CHECKPOINT" \
+    --device cuda
+```
+
+但第二个进程不能再用 `run_smart_task_closed_loop.py`，因为它读的是 IsaacLab env，不是真实相机和真实关节。真实 SO101 还需要新增一个 hardware runner，职责是：
+
+```text
+读取真实 top / wrist 相机
+读取真实 SO101 joint state 和 gripper state
+按 NEW_EMBODIMENT 组 observation:
+  video.top
+  video.wrist
+  state.single_arm
+  state.gripper
+  language.annotation.human.task_description
+请求 bridge 的 get_action
+读取 action.single_arm / action.gripper
+做安全限幅、速度限制、急停检查
+把动作发给真实 SO101
+```
+
+所以当前项目状态是：
+
+| 部署目标 | 当前是否有可运行入口 | 入口 |
+|---|---:|---|
+| LeIsaac 仿真里的 zero-shot base model | 有 | `zero_shot_isaac_smart_task/groot_bridge_server.py` + `run_smart_task_closed_loop.py --deployment-mode zero-shot-oxe` |
+| LeIsaac 仿真里的 SO101 finetuned checkpoint | 有 | `groot_bridge_server.py --deployment-mode so101-finetuned` + `run_smart_task_closed_loop.py --deployment-mode so101-finetuned` |
+| 真实 SO101 finetuned checkpoint | 还没有完整 runner | 需要新增 hardware runner，bridge 可复用 |
+
 ## 机器 Profile 与环境检查
 
 后面所有训练命令都假设已经设置了这两个变量：
@@ -202,6 +527,13 @@ outputs/groot_so101_synthetic_datasets/so101_lego_pick_0609_1722_mimic
 ```text
 SMART_PROJECT -> 当前 smart_project 仓库
 GROOT_ROOT    -> Isaac-GR00T 仓库，且里面已经有 .venv
+```
+
+所有训练命令都在 GR00T venv 里跑，不在 LeIsaac / Isaac runner 的 shell 里跑。如果刚跑过 Isaac / LeIsaac runner，先开新终端，或至少清掉 Isaac 相关环境变量：
+
+```bash
+conda deactivate 2>/dev/null || true
+unset PYTHONPATH PYTHONHOME PYTHONNOUSERSITE PYTHONDONTWRITEBYTECODE
 ```
 
 ### Profile A：本机 5060 Ti
@@ -238,24 +570,24 @@ fi
 5. 如果 16GB OOM，记录即可，不把它当作策略失败结论
 ```
 
-### Profile B：公司 remote 5090
+### Profile B：任意远程 Ubuntu GPU 训练机
 
-remote 5090 是低显存训练的主要实验机器。在 `guest1` 账号下：
+在目标机上先填这几个变量。不要把本机路径复制过去：
 
 ```bash
-export SMART_PROJECT=/home/guest1/smart_project
-export GROOT_ROOT=/home/guest1/Isaac-GR00T
+export SMART_PROJECT="__FILL_TARGET_SMART_PROJECT__"
+export GROOT_ROOT="__FILL_TARGET_ISAAC_GROOT__"
 
-# 如果 CUDA 13.0 toolkit 已经存在，先试它。
-export CUDA_HOME=/usr/local/cuda-13.0
-# 如果后续确认需要 12.8，再切成：
-# export CUDA_HOME=/usr/local/cuda-12.8
+# 没有明确需要 CUDA toolkit / nvcc 时先留空；只做推理或普通 smoke 不一定需要。
+export CUDA_HOME=""
 
-export PATH="$CUDA_HOME/bin:$PATH"
-export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
+if [ -n "${CUDA_HOME:-}" ] && [ -d "$CUDA_HOME" ]; then
+  export PATH="$CUDA_HOME/bin:$PATH"
+  export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
+fi
 ```
 
-remote 5090 建议执行顺序：
+远程训练机建议执行顺序：
 
 ```text
 1. 环境检查
@@ -356,7 +688,7 @@ cd "$SMART_PROJECT"
 --experiment-name so101_local_5060ti_projector_only_smoke
 ```
 
-remote 5090 正式起步：
+远程训练机较长训练起步：
 
 ```bash
 cd "$SMART_PROJECT"
@@ -425,7 +757,7 @@ cd "$SMART_PROJECT"
     --experiment-name so101_local_5060ti_diffusion_lora_r4_smoke
 ```
 
-remote 5090 正式起步：
+远程训练机较长训练起步：
 
 ```bash
 cd "$SMART_PROJECT"
@@ -458,7 +790,7 @@ action_decoder
 position_embedding
 ```
 
-建议只有在前两条能跑通后再试。本机 5060 Ti 不建议一开始跑这条；优先把它当作 remote 5090 或更大显存机器上的第三阶段实验：
+建议只有在前两条能跑通后再试。本机 5060 Ti 不建议一开始跑这条；优先把它当作远程训练机或更大显存机器上的第三阶段实验：
 
 ```bash
 cd "$SMART_PROJECT"
@@ -490,7 +822,7 @@ cd "$SMART_PROJECT"
 --optim adamw_torch
 ```
 
-这里的 `--global-batch-size` 在单卡下基本就是 per-device batch size。5060 Ti 和 32GB 5090 都不要再从 32 起步；本文件所有低显存训练都先从 1 起步。
+这里的 `--global-batch-size` 在单卡下基本就是 per-device batch size。5060 Ti 和 32GB 级别单卡都不要再从 32 起步；本文件所有低显存训练都先从 1 起步。
 
 LoRA 默认 target regex：
 
@@ -528,6 +860,6 @@ du -sh outputs/groot_so101_synthetic_finetune/*
 - OOM 发生在 forward、backward、optimizer step，还是 save checkpoint；
 - 峰值显存。
 
-如果 `projector-only` 和 `diffusion-lora` 都在本机 5060 Ti 上 OOM，只能说明本机不适合承担训练，不代表策略失败。把日志和参数记录下来，转到 remote 5090 继续判断。
+如果 `projector-only` 和 `diffusion-lora` 都在本机 5060 Ti 上 OOM，只能说明本机不适合承担训练，不代表策略失败。把日志和参数记录下来，转到远程 GPU 训练机继续判断。
 
-如果 `projector-only` 和 `diffusion-lora` 都在 remote 5090 32GB 上 OOM，基本可以判断 32GB 级别单卡不适合作为 GR00T N1.7 微调训练机，需要申请更大显存云端资源，或者进一步做更激进的冻结、量化训练、离线特征缓存。
+如果 `projector-only` 和 `diffusion-lora` 都在 32GB 级别远程单卡上 OOM，基本可以判断这一级别单卡不适合作为 GR00T N1.7 微调训练机，需要申请更大显存云端资源，或者进一步做更激进的冻结、量化训练、离线特征缓存。

@@ -1,13 +1,17 @@
 """在 LeIsaac SmartTask 中调用 GR00T N1.7 bridge，并闭环驱动 Isaac 机器人。
 
 运行环境：
-    conda run -n isaaclab ...
+    source "$(conda info --base)/etc/profile.d/conda.sh"
+    conda activate leisaac
+    export LEISAAC_ROOT="$HOME/LeIsaac"
+    python run_smart_task_closed_loop.py ...
 
 这个文件是整个实验的 Isaac 侧主程序。它做四件事：
 
 1. 启动 Isaac Sim / IsaacLab，并加载 LeIsaac 已经注册好的 SmartTask。
 2. 从 SmartTask observation 中取出图像、关节状态、末端位姿。
-3. 把这些 observation 改写成 GR00T N1.7 OXE/DROID embodiment 需要的 schema。
+3. 按 deployment mode 把这些 observation 改写成 GR00T 需要的 schema：
+   zero-shot 使用 OXE/DROID；SO101 微调 checkpoint 使用 NEW_EMBODIMENT。
 4. 调用 GR00T bridge 拿 action，再把 action 转成 LeIsaac 可以执行的命令。
 
 注意：
@@ -20,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 import sys
 import time
 from collections import deque
@@ -32,30 +37,67 @@ import torch
 
 
 # 当前文件所在目录：
-# /home/yzliu/smart_project/experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task
+# $SMART_PROJECT/experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task
 SCRIPT_DIR = Path(__file__).resolve().parent
 
 # 当前实验目录：
-# /home/yzliu/smart_project/experiments/groot_n17_isaac_smart_task
+# $SMART_PROJECT/experiments/groot_n17_isaac_smart_task
 EXPERIMENT_ROOT = SCRIPT_DIR.parent
 
 # 项目根目录：
-# /home/yzliu/smart_project
+# $SMART_PROJECT
 REPO_ROOT = EXPERIMENT_ROOT.parents[1]
 
-# LeIsaac 的 Python package 源码目录。运行脚本时虽然 README 里已经设置
-# PYTHONPATH，但这里再插一次，方便直接运行或调试。
-LEISAAC_SRC = REPO_ROOT / "leisaac" / "source" / "leisaac"
+# LeIsaac 的 repo 根目录。本实验默认优先使用当前项目里的同事 LeIsaac copy；
+# 如果确实要对比外部 checkout，再显式设置 LEISAAC_ROOT。
+LOCAL_LEISAAC_ROOT = REPO_ROOT / "leisaac"
+DEFAULT_LEISAAC_ROOT = LOCAL_LEISAAC_ROOT if LOCAL_LEISAAC_ROOT.exists() else Path.home() / "LeIsaac"
+LEISAAC_ROOT = Path(os.environ.get("LEISAAC_ROOT", DEFAULT_LEISAAC_ROOT)).expanduser().resolve()
 
-# LeIsaac 复制项目中自带的 IsaacLab 依赖目录。用户这份 workspace 是把公司
-# 项目的 leisaac / lerobot 整体复制过来的，所以这里优先把 copied IsaacLab
-# source 放进 sys.path，避免无意中依赖机器上另一份 IsaacLab 源码。
-LEISAAC_ISAACLAB_SRC = REPO_ROOT / "leisaac" / "dependencies" / "IsaacLab" / "source"
+# LeIsaac 内部的 ASSETS_ROOT 会尝试从 git root 推断；当前 workspace 根 .git
+# 可能不是有效仓库，所以这里显式固定到所选 LeIsaac repo 的 assets。
+os.environ.setdefault("LEISAAC_ASSETS_ROOT", str((LEISAAC_ROOT / "assets").resolve()))
+
+# LeIsaac 的 Python package 源码目录。运行脚本时 README 里也会设置 PYTHONPATH，
+# 这里再插一次，方便直接运行或调试。
+LEISAAC_SRC = LEISAAC_ROOT / "source" / "leisaac"
+
+# LeIsaac 仓库自带的 IsaacLab 依赖目录。优先把这份 source 放进 sys.path，
+# 避免无意中依赖机器上另一份 IsaacLab 源码。
+LEISAAC_ISAACLAB_SRC = LEISAAC_ROOT / "dependencies" / "IsaacLab" / "source"
 LEISAAC_ISAACLAB_PACKAGES = (
     LEISAAC_ISAACLAB_SRC / "isaaclab",
     LEISAAC_ISAACLAB_SRC / "isaaclab_assets",
     LEISAAC_ISAACLAB_SRC / "isaaclab_tasks",
     LEISAAC_ISAACLAB_SRC / "isaaclab_mimic",
+)
+
+# Current colleague LeIsaac and the older leisaac2 copy expose the same policy
+# observation keys, but their camera semantics differ:
+# - leisaac-current: camera1=left, camera2=wrist, camera3=front/top.
+# - leisaac2-legacy: camera1=front/top, camera2=left, camera3=template wrist.
+# The runner prints the resolved mapping so the log shows what GR00T saw.
+CAMERA_PROFILE_DEFAULTS = {
+    "leisaac-current": {
+        "exterior": "camera3",
+        "top": "camera3",
+        "wrist": "camera2",
+    },
+    "leisaac2-legacy": {
+        "exterior": "camera1",
+        "top": "camera1",
+        "wrist": "camera3",
+    },
+    "franka-current": {
+        "exterior": "camera1",
+        "top": "camera1",
+        "wrist": "camera2",
+    },
+}
+
+TARGET_OBJECT_CANDIDATES = (
+    "red_2x4_lego_brick_pick",
+    "red_2x4_lego_brick",
 )
 
 # 让 Python 可以 import 同目录的 wire.py。
@@ -323,12 +365,120 @@ class FrameHistory:
         cur = frames[-1]
         return np.stack([old, cur], axis=0)[None, ...].astype(np.uint8)
 
+    def latest(self, key: str) -> np.ndarray:
+        """Return the latest frame as `(B=1, T=1, H, W, C)`."""
+
+        frame = self._frames[key][-1]
+        return frame[None, None, ...].astype(np.uint8)
+
+
+def get_policy_camera(policy_obs: dict[str, torch.Tensor], key: str, role: str) -> torch.Tensor:
+    """Return a selected policy camera tensor with a useful error message."""
+
+    if key not in policy_obs:
+        camera_keys = sorted(name for name in policy_obs if name.startswith("camera"))
+        raise KeyError(
+            f"{role} camera key {key!r} is not in policy obs; "
+            f"available camera keys are {camera_keys}"
+        )
+    return policy_obs[key]
+
+
+def _sensor_cfg_prim_path(sensor: Any) -> str:
+    cfg = getattr(sensor, "cfg", None)
+    return str(getattr(cfg, "prim_path", "") or "")
+
+
+def detect_camera_profile(env: Any) -> str:
+    """Infer whether the active LeIsaac task uses current or legacy camera names."""
+
+    scene = getattr(env, "scene", None)
+    scene_sensors = getattr(scene, "sensors", {}) if scene is not None else {}
+
+    # The legacy SmartTask exposes the template wrist sensor as scene sensor
+    # "wrist" and maps policy camera3 to it.
+    if "wrist" in scene_sensors:
+        return "leisaac2-legacy"
+
+    # Current colleague LeIsaac renamed the robot-mounted wrist sensor to camera2.
+    camera2_prim = _sensor_cfg_prim_path(scene_sensors.get("camera2"))
+    if "wrist" in camera2_prim or "/Robot/" in camera2_prim:
+        return "leisaac-current"
+
+    # Prefer the current layout when auto-detection is inconclusive because the
+    # project-level leisaac directory is expected to track the latest colleague code.
+    return "leisaac-current"
+
+
+def resolve_camera_mapping(args: argparse.Namespace, env: Any) -> tuple[str, dict[str, str]]:
+    """Resolve camera profile defaults plus explicit per-role overrides."""
+
+    profile = args.camera_profile
+    if profile == "auto":
+        profile = "franka-current" if args.robot == "franka" else detect_camera_profile(env)
+
+    defaults = CAMERA_PROFILE_DEFAULTS[profile]
+    mapping = {
+        "exterior": args.exterior_camera_key or defaults["exterior"],
+        "top": args.top_camera_key or defaults["top"],
+        "wrist": args.wrist_camera_key or defaults["wrist"],
+    }
+    return profile, mapping
+
+
+def rigid_object_names(env: Any) -> list[str]:
+    """Return rigid object names from the active IsaacLab scene."""
+
+    scene = getattr(env, "scene", None)
+    if scene is None:
+        return []
+
+    rigid_objects = getattr(scene, "rigid_objects", None)
+    if isinstance(rigid_objects, dict):
+        return sorted(rigid_objects.keys())
+
+    private_rigid_objects = getattr(scene, "_rigid_objects", None)
+    if isinstance(private_rigid_objects, dict):
+        return sorted(private_rigid_objects.keys())
+
+    return []
+
+
+def resolve_target_object_name(env: Any, requested_name: str) -> str:
+    """Resolve the SmartTask target object across current and legacy scenes."""
+
+    names = rigid_object_names(env)
+    if requested_name != "auto":
+        if requested_name in names:
+            return requested_name
+        raise KeyError(
+            f"target object {requested_name!r} is not in scene rigid objects; "
+            f"available rigid objects are {names}"
+        )
+
+    for candidate in TARGET_OBJECT_CANDIDATES:
+        if candidate in names:
+            return candidate
+
+    fuzzy_matches = [
+        name for name in names
+        if "red" in name.lower() and "lego" in name.lower() and "brick" in name.lower()
+    ]
+    if fuzzy_matches:
+        return sorted(fuzzy_matches)[0]
+
+    raise KeyError(
+        "could not auto-detect SmartTask target object; "
+        f"tried {list(TARGET_OBJECT_CANDIDATES)}, available rigid objects are {names}"
+    )
+
 
 def build_oxe_observation(
     policy_obs: dict[str, torch.Tensor],
     history: FrameHistory,
     instruction: str,
     robot: str,
+    camera_mapping: dict[str, str],
 ) -> dict[str, Any]:
     """把 LeIsaac SmartTask observation 映射到 GR00T N1.7 OXE/DROID schema。
 
@@ -340,15 +490,14 @@ def build_oxe_observation(
     输出：
     - GR00T bridge 可直接传给 `policy.get_action()` 的 nested observation dict。
 
-    SO101 mapping：
-    - `camera1` -> `video.exterior_image_1_left`
-    - `camera3` -> `video.wrist_image_left`
+    SO101 mapping depends on `--camera-profile`:
+    - `camera_mapping["exterior"]` -> `video.exterior_image_1_left`
+    - `camera_mapping["wrist"]` -> `video.wrist_image_left`
     - `ee_frame_state` -> `state.eef_9d`
     - SO101 6D joint state pad 到 7D -> `state.joint_position`
     - SO101 gripper joint -> `state.gripper_position`
 
-    Franka mapping：
-    - `camera1` / `camera3` 同上。
+    Franka mapping uses the same selected exterior/wrist camera keys, then:
     - Franka 前 7 个 panda_joint -> `state.joint_position`。
     - 两个 panda_finger joint 的平均值 -> `state.gripper_position`。
 
@@ -358,8 +507,8 @@ def build_oxe_observation(
       joint，其中第 6 个是 gripper。
     """
 
-    exterior = image_to_numpy(policy_obs["camera1"])
-    wrist = image_to_numpy(policy_obs["camera3"])
+    exterior = image_to_numpy(get_policy_camera(policy_obs, camera_mapping["exterior"], "exterior/top"))
+    wrist = image_to_numpy(get_policy_camera(policy_obs, camera_mapping["wrist"], "wrist"))
 
     # GR00T OXE/DROID schema 只使用两路 video key：外部左视角和腕部左视角。
     history.push("exterior_image_1_left", exterior)
@@ -402,6 +551,44 @@ def build_oxe_observation(
         "language": {
             # GR00T policy 对 language 的 batch/time 期望是 list[list[str]]。
             "annotation.language.language_instruction": [[instruction]],
+        },
+    }
+
+
+def build_so101_new_embodiment_observation(
+    policy_obs: dict[str, torch.Tensor],
+    history: FrameHistory,
+    instruction: str,
+    robot: str,
+    camera_mapping: dict[str, str],
+) -> dict[str, Any]:
+    """Map LeIsaac SO101 observations to the trained NEW_EMBODIMENT schema."""
+
+    if robot != "so101":
+        raise ValueError("SO101 NEW_EMBODIMENT schema only supports --robot so101")
+
+    top = image_to_numpy(get_policy_camera(policy_obs, camera_mapping["top"], "top"))
+    wrist = image_to_numpy(get_policy_camera(policy_obs, camera_mapping["wrist"], "wrist"))
+    history.push("top", top)
+    history.push("wrist", wrist)
+
+    joint_all = policy_obs["joint_pos"].detach().cpu().numpy()[0].astype(np.float32)
+    single_arm = np.zeros((1, 1, 5), dtype=np.float32)
+    single_arm[0, 0, : min(5, joint_all.shape[0])] = joint_all[:5]
+    gripper_value = float(joint_all[5]) if joint_all.shape[0] > 5 else 0.0
+    gripper = np.array([[[gripper_value]]], dtype=np.float32)
+
+    return {
+        "video": {
+            "top": history.latest("top"),
+            "wrist": history.latest("wrist"),
+        },
+        "state": {
+            "single_arm": single_arm,
+            "gripper": gripper,
+        },
+        "language": {
+            "annotation.human.task_description": [[instruction]],
         },
     }
 
@@ -459,6 +646,51 @@ def joint_action_to_leisaac_tensor(
         usable = min(6, joint.shape[-1])
         command[0, :usable] = joint[0, 0, :usable]
     return torch.from_numpy(command).to(env_device)
+
+
+def so101_new_embodiment_action_to_leisaac_tensor(
+    action: dict[str, np.ndarray],
+    env_device: str,
+    fallback_joint: torch.Tensor,
+    arm_delta_scale: float = 1.0,
+    max_arm_delta: float | None = None,
+    gripper_min: float | None = None,
+    gripper_max: float | None = None,
+) -> torch.Tensor:
+    """Convert trained SO101 NEW_EMBODIMENT actions to LeIsaac 6D joint targets."""
+
+    current = fallback_joint.detach().cpu().numpy()[0].astype(np.float32)
+    command = current.copy()
+
+    if "single_arm" in action:
+        arm = np.asarray(action["single_arm"], dtype=np.float32)
+        if arm.ndim != 3:
+            raise ValueError(f"expected single_arm shape (B,T,D), got {arm.shape}")
+        usable = min(5, arm.shape[-1])
+        # The SO101 config marks single_arm as relative joint action, so convert
+        # it into the absolute joint target expected by LeIsaac JointPositionAction.
+        arm_delta = arm[0, 0, :usable] * float(arm_delta_scale)
+        if max_arm_delta is not None:
+            bound = abs(float(max_arm_delta))
+            arm_delta = np.clip(arm_delta, -bound, bound)
+        command[:usable] = current[:usable] + arm_delta
+    else:
+        print("[runner] warning: GR00T action lacks single_arm; holding arm joints", flush=True)
+
+    if "gripper" in action:
+        gripper = np.asarray(action["gripper"], dtype=np.float32)
+        if gripper.ndim != 3:
+            raise ValueError(f"expected gripper shape (B,T,D), got {gripper.shape}")
+        gripper_value = float(gripper[0, 0, 0])
+        if gripper_min is not None or gripper_max is not None:
+            lower = -np.inf if gripper_min is None else float(gripper_min)
+            upper = np.inf if gripper_max is None else float(gripper_max)
+            gripper_value = float(np.clip(gripper_value, lower, upper))
+        command[5] = gripper_value
+    else:
+        print("[runner] warning: GR00T action lacks gripper; holding gripper", flush=True)
+
+    return torch.from_numpy(command[None, :]).to(env_device)
 
 
 def eef_action_to_leisaac_tensor(
@@ -649,7 +881,14 @@ def save_policy_camera_frames(policy_obs: dict[str, torch.Tensor], output_dir: s
     print(f"[runner] camera-debug saved policy camera frames: {saved}", flush=True)
 
 
-def print_camera_debug(env: Any, policy_obs: dict[str, torch.Tensor], robot_kind: str, frame_dir: str | None) -> None:
+def print_camera_debug(
+    env: Any,
+    policy_obs: dict[str, torch.Tensor],
+    robot_kind: str,
+    frame_dir: str | None,
+    camera_mapping: dict[str, str] | None = None,
+    target_object_name: str | None = None,
+) -> None:
     """打印 SmartTask/Franka 相机诊断信息。
 
     诊断目标：
@@ -660,6 +899,8 @@ def print_camera_debug(env: Any, policy_obs: dict[str, torch.Tensor], robot_kind
     """
 
     print("[runner] camera-debug begin", flush=True)
+    if camera_mapping is not None:
+        print(f"[runner] camera-debug selected mapping: {camera_mapping}", flush=True)
 
     for key in sorted(policy_obs):
         if not key.startswith("camera"):
@@ -722,9 +963,13 @@ def print_camera_debug(env: Any, policy_obs: dict[str, torch.Tensor], robot_kind
             flush=True,
         )
 
-    if "wrist" in scene_sensors:
-        wrist_paths = sensor_prim_paths(scene_sensors["wrist"])
-        wrist_path = wrist_paths[0] if wrist_paths else getattr(scene_sensors["wrist"].cfg, "prim_path", "")
+    wrist_sensor_name = (camera_mapping or {}).get("wrist")
+    if wrist_sensor_name not in scene_sensors and "wrist" in scene_sensors:
+        wrist_sensor_name = "wrist"
+    if wrist_sensor_name in scene_sensors:
+        wrist_sensor = scene_sensors[wrist_sensor_name]
+        wrist_paths = sensor_prim_paths(wrist_sensor)
+        wrist_path = wrist_paths[0] if wrist_paths else getattr(wrist_sensor.cfg, "prim_path", "")
         wrist_pose = usd_world_pose(stage, wrist_path)
         hand_pos = body_positions.get("panda_hand")
         if hand_pos is None:
@@ -734,14 +979,19 @@ def print_camera_debug(env: Any, policy_obs: dict[str, torch.Tensor], robot_kind
             delta = wrist_pos - hand_pos
             print(
                 "[runner] camera-debug wrist_to_hand "
-                f"wrist_path={wrist_path} delta_pos_w={format_vec(delta)} distance={float(np.linalg.norm(delta)):.4f}",
+                f"sensor={wrist_sensor_name} wrist_path={wrist_path} "
+                f"delta_pos_w={format_vec(delta)} distance={float(np.linalg.norm(delta)):.4f}",
                 flush=True,
             )
 
-    if "red_2x4_lego_brick" in env.scene.rigid_objects:
-        lego = env.scene["red_2x4_lego_brick"]
+    print(f"[runner] camera-debug scene rigid objects: {rigid_object_names(env)}", flush=True)
+    if target_object_name is not None and target_object_name in rigid_object_names(env):
+        lego = env.scene[target_object_name]
         lego_pos = tensor_first_row(lego.data.root_pos_w)
-        print(f"[runner] camera-debug lego pos_w={format_vec(lego_pos)}", flush=True)
+        print(
+            f"[runner] camera-debug target object={target_object_name} pos_w={format_vec(lego_pos)}",
+            flush=True,
+        )
 
     if frame_dir is not None:
         save_policy_camera_frames(policy_obs, frame_dir)
@@ -749,7 +999,7 @@ def print_camera_debug(env: Any, policy_obs: dict[str, torch.Tensor], robot_kind
     print("[runner] camera-debug end", flush=True)
 
 
-def smart_task_metrics(env: Any, robot_kind: str) -> dict[str, float]:
+def smart_task_metrics(env: Any, robot_kind: str, target_object_name: str) -> dict[str, float]:
     """从 Isaac scene 中读取几个用于判断 pick 进展的诊断指标。
 
     指标：
@@ -760,7 +1010,7 @@ def smart_task_metrics(env: Any, robot_kind: str) -> dict[str, float]:
     这些不是严格成功判据，只是帮助我们观察动作有没有朝正确方向发展。
     """
 
-    lego = env.scene["red_2x4_lego_brick"]
+    lego = env.scene[target_object_name]
     robot = env.scene["robot"]
     ee_frame = env.scene["ee_frame"]
 
@@ -781,13 +1031,13 @@ def smart_task_metrics(env: Any, robot_kind: str) -> dict[str, float]:
     }
 
 
-def print_metrics(env: Any, prefix: str, robot_kind: str) -> None:
+def print_metrics(env: Any, prefix: str, robot_kind: str, target_object_name: str) -> None:
     """用统一格式打印 SmartTask 诊断指标。"""
 
-    metrics = smart_task_metrics(env, robot_kind)
+    metrics = smart_task_metrics(env, robot_kind, target_object_name)
     print(
         "[runner] "
-        f"{prefix} metrics "
+        f"{prefix} metrics target={target_object_name} "
         f"lego_z_minus_base={metrics['lego_z_minus_base']:.4f} "
         f"jaw_to_lego={metrics['jaw_to_lego']:.4f} "
         f"gripper={metrics['gripper']:.4f}",
@@ -953,6 +1203,36 @@ def parse_args() -> argparse.Namespace:
     # 目录新增注册的 Groot-Franka-SmartTask-v0。
     parser.add_argument("--robot", choices=("so101", "franka"), default="so101")
 
+    parser.add_argument(
+        "--deployment-mode",
+        choices=("zero-shot-oxe", "so101-finetuned"),
+        default="zero-shot-oxe",
+        help=(
+            "zero-shot-oxe expects the base GR00T OXE/DROID bridge; "
+            "so101-finetuned expects a NEW_EMBODIMENT SO101 checkpoint bridge."
+        ),
+    )
+
+    parser.add_argument(
+        "--policy-schema",
+        choices=("oxe", "so101-new-embodiment"),
+        default=None,
+        help="Observation/action schema expected by the GR00T bridge.",
+    )
+
+    parser.add_argument(
+        "--camera-profile",
+        choices=("auto", *CAMERA_PROFILE_DEFAULTS.keys()),
+        default="auto",
+        help=(
+            "Resolve LeIsaac policy camera keys. auto detects current leisaac vs leisaac2 legacy; "
+            "explicit per-role camera keys below override the profile."
+        ),
+    )
+    parser.add_argument("--exterior-camera-key", default=None, help="Policy camera key for OXE/DROID exterior_image_1_left.")
+    parser.add_argument("--top-camera-key", default=None, help="Policy camera key for SO101 NEW_EMBODIMENT video.top.")
+    parser.add_argument("--wrist-camera-key", default=None, help="Policy camera key for wrist video input.")
+
     # IsaacLab task id。None 表示按 --robot 自动选择默认 task。
     parser.add_argument("--task", default=None)
 
@@ -962,6 +1242,15 @@ def parse_args() -> argparse.Namespace:
 
     # 传给 GR00T 的自然语言任务指令。
     parser.add_argument("--instruction", default="Pick up the red 2x4 lego brick.")
+
+    parser.add_argument(
+        "--target-object-key",
+        default="auto",
+        help=(
+            "Scene rigid-object key used for SmartTask metrics/debug. "
+            "auto supports current red_2x4_lego_brick_pick and legacy red_2x4_lego_brick."
+        ),
+    )
 
     # IsaacLab env 的设备。一般用 cuda。
     parser.add_argument("--device", default="cuda")
@@ -974,6 +1263,30 @@ def parse_args() -> argparse.Namespace:
         choices=("joint", "eef"),
         default="joint",
         help="joint uses GR00T joint_position as SO101 joints; eef uses GR00T eef_9d + gripper_position through LeIsaac IK.",
+    )
+    parser.add_argument(
+        "--so101-arm-delta-scale",
+        type=float,
+        default=1.0,
+        help="Scale finetuned SO101 relative arm deltas before adding them to current joints.",
+    )
+    parser.add_argument(
+        "--so101-max-arm-delta",
+        type=float,
+        default=None,
+        help="Optional absolute clamp for each finetuned SO101 arm joint delta before execution.",
+    )
+    parser.add_argument(
+        "--so101-gripper-min",
+        type=float,
+        default=None,
+        help="Optional lower clamp for finetuned SO101 absolute gripper target.",
+    )
+    parser.add_argument(
+        "--so101-gripper-max",
+        type=float,
+        default=None,
+        help="Optional upper clamp for finetuned SO101 absolute gripper target.",
     )
 
     # 请求 GR00T 的次数。每次请求会返回一个 action chunk。
@@ -1083,8 +1396,24 @@ def parse_args() -> argparse.Namespace:
     )
 
     args = parser.parse_args()
+    if args.deployment_mode == "so101-finetuned":
+        if args.robot != "so101":
+            raise ValueError("--deployment-mode so101-finetuned requires --robot so101")
+        if args.control_mode != "joint":
+            raise ValueError("--deployment-mode so101-finetuned currently requires --control-mode joint")
+        if args.policy_schema not in (None, "so101-new-embodiment"):
+            raise ValueError("--deployment-mode so101-finetuned requires --policy-schema so101-new-embodiment")
+        args.policy_schema = "so101-new-embodiment"
+    elif args.policy_schema is None:
+        args.policy_schema = "oxe"
+
     if args.task is None:
         args.task = "Groot-Franka-SmartTask-v0" if args.robot == "franka" else "LeIsaac-SO101-SmartTask-v0"
+    if args.policy_schema == "so101-new-embodiment":
+        if args.robot != "so101":
+            raise ValueError("--policy-schema so101-new-embodiment requires --robot so101")
+        if args.control_mode != "joint":
+            raise ValueError("--policy-schema so101-new-embodiment currently requires --control-mode joint")
     if args.debug_cameras_only:
         args.debug_cameras = True
     return args
@@ -1108,7 +1437,7 @@ def keep_open(simulation_app: Any, env: Any, seconds: float) -> None:
 def action_chunk_len(action: dict[str, np.ndarray]) -> int:
     """从 GR00T action dict 中推断 action chunk 的时间长度 T。"""
 
-    for key in ("joint_position", "eef_9d", "gripper_position"):
+    for key in ("joint_position", "eef_9d", "gripper_position", "single_arm", "gripper"):
         if key in action:
             arr = np.asarray(action[key])
             if arr.ndim >= 2:
@@ -1163,7 +1492,13 @@ def main() -> None:
         env_cfg.terminations.success = None
 
     # 创建 gymnasium env，并拿 unwrapped 环境方便访问 scene、sim、cfg 等属性。
-    env = gym.make(args.task, cfg=env_cfg).unwrapped
+    # gym.make() 期间也可能因为 scene/asset 配置错误失败；这时必须主动关闭
+    # Isaac app，否则进程会停在 Omniverse 清理阶段占着 GPU。
+    try:
+        env = gym.make(args.task, cfg=env_cfg).unwrapped
+    except Exception:
+        simulation_app.close()
+        raise
 
     # 相机历史缓存，用于构造 GR00T 的两帧 video 输入。
     history = FrameHistory(horizon=max(args.warmup_frames, 2))
@@ -1180,13 +1515,21 @@ def main() -> None:
         # 因为此时 sensor/view/prim 才完整实例化。
         obs, _ = env.reset()
         policy_obs = obs["policy"]
+        resolved_camera_profile, camera_mapping = resolve_camera_mapping(args, env)
+        target_object_name = resolve_target_object_name(env, args.target_object_key)
+        print(
+            f"[runner] camera profile={args.camera_profile} resolved={resolved_camera_profile} "
+            f"mapping={camera_mapping}",
+            flush=True,
+        )
+        print(f"[runner] target object={target_object_name}", flush=True)
 
         if args.debug_cameras:
             debug_frame_dir = args.debug_camera_frame_dir
             if debug_frame_dir is None and args.debug_cameras_only:
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                 debug_frame_dir = f"runs/camera_debug/{args.robot}_{args.control_mode}_{timestamp}"
-            print_camera_debug(env, policy_obs, args.robot, debug_frame_dir)
+            print_camera_debug(env, policy_obs, args.robot, debug_frame_dir, camera_mapping, target_object_name)
 
         if args.debug_cameras_only:
             keep_open(simulation_app, env, args.keep_open_s)
@@ -1201,26 +1544,33 @@ def main() -> None:
         print(f"[runner] bridge modality: {ping.get('modality')}", flush=True)
 
         print(f"[runner] initial joint_pos values={tensor_values(policy_obs['joint_pos'])}", flush=True)
-        print_metrics(env, "initial", args.robot)
+        print_metrics(env, "initial", args.robot, target_object_name)
+
+        build_observation = (
+            build_so101_new_embodiment_observation
+            if args.policy_schema == "so101-new-embodiment"
+            else build_oxe_observation
+        )
 
         # warmup：重复把当前 observation 放入 history，确保 history 至少有两帧。
         for _ in range(args.warmup_frames):
-            build_oxe_observation(policy_obs, history, args.instruction, args.robot)
+            build_observation(policy_obs, history, args.instruction, args.robot, camera_mapping)
 
         stop_run = False
 
         # 外层循环：每次向 GR00T 请求一个 action chunk。
         for call_idx in range(args.max_policy_calls):
-            groot_obs = build_oxe_observation(
+            groot_obs = build_observation(
                 policy_obs,
                 history,
                 args.instruction,
                 args.robot,
+                camera_mapping,
             )
 
             print(f"[runner] request action {call_idx + 1}/{args.max_policy_calls}", flush=True)
 
-            # 向 bridge 发起 get_action 请求。这里的 observation 会被 msgpack + numpy
+            # 向 bridge 发起 get_action 请求。这里的 observation 会被标准库 pickle
             # 编码成 bytes，经本地 TCP 发给 GR00T venv 里的 bridge。
             reply = request(
                 args.bridge_host,
@@ -1237,7 +1587,7 @@ def main() -> None:
             print(f"[runner] action summary: {summarize_action(action)}", flush=True)
 
             if args.dry_run:
-                print_metrics(env, "dry-run", args.robot)
+                print_metrics(env, "dry-run", args.robot, target_object_name)
                 continue
 
             # 决定这个 chunk 执行多少步。
@@ -1254,7 +1604,24 @@ def main() -> None:
 
             # 内层循环：逐步执行 action chunk。
             for step_idx in range(num_action_steps):
-                if args.control_mode == "eef":
+                if args.policy_schema == "so101-new-embodiment":
+                    step_action = {}
+                    if "single_arm" in action and action["single_arm"].shape[1] > step_idx:
+                        step_action["single_arm"] = action["single_arm"][:, step_idx : step_idx + 1, :]
+                    if "gripper" in action and action["gripper"].shape[1] > step_idx:
+                        step_action["gripper"] = action["gripper"][:, step_idx : step_idx + 1, :]
+                    if not step_action:
+                        step_action = action
+                    command = so101_new_embodiment_action_to_leisaac_tensor(
+                        step_action,
+                        env.device,
+                        policy_obs["joint_pos"],
+                        arm_delta_scale=args.so101_arm_delta_scale,
+                        max_arm_delta=args.so101_max_arm_delta,
+                        gripper_min=args.so101_gripper_min,
+                        gripper_max=args.so101_gripper_max,
+                    )
+                elif args.control_mode == "eef":
                     # EEF 路线：取当前时间步的 eef_9d 和 gripper_position。
                     step_action = {}
                     if "eef_9d" in action and action["eef_9d"].shape[1] > step_idx:
@@ -1320,7 +1687,7 @@ def main() -> None:
                 policy_obs = obs["policy"]
 
                 # 用新 observation 更新相机历史。
-                build_oxe_observation(policy_obs, history, args.instruction, args.robot)
+                build_observation(policy_obs, history, args.instruction, args.robot, camera_mapping)
 
                 if terminated[0] or timed_out[0]:
                     print(f"[runner] episode ended: terminated={terminated[0]} timed_out={timed_out[0]}", flush=True)
@@ -1336,7 +1703,7 @@ def main() -> None:
                     time.sleep(args.render_sleep_s)
 
             print(f"[runner] latest joint_pos values={tensor_values(policy_obs['joint_pos'])}", flush=True)
-            print_metrics(env, f"after policy call {call_idx + 1}", args.robot)
+            print_metrics(env, f"after policy call {call_idx + 1}", args.robot, target_object_name)
 
             if stop_run:
                 break

@@ -10,7 +10,7 @@
     再通过本地 TCP socket 接收 Isaac 侧传来的 observation，返回 action。
 
 通信协议：
-    具体的 msgpack + numpy 序列化逻辑在 `wire.py` 中。这里使用四个 endpoint：
+    具体的 socket + pickle 序列化逻辑在 `wire.py` 中。这里使用四个 endpoint：
 
     - `ping`：Isaac 侧用来确认 bridge 已启动，并读取 GR00T modality schema。
     - `get_action`：Isaac 侧传 observation，GR00T 侧返回 action。
@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import os
 import socket
 import sys
@@ -32,6 +33,11 @@ from typing import Any
 # 当前文件所在目录，也就是
 # experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task。
 SCRIPT_DIR = Path(__file__).resolve().parent
+EXPERIMENT_ROOT = SCRIPT_DIR.parent
+DEFAULT_BASE_MODEL_PATH = "nvidia/GR00T-N1.7-3B"
+DEFAULT_ZERO_SHOT_EMBODIMENT = "OXE_DROID_RELATIVE_EEF_RELATIVE_JOINT"
+FINETUNED_SO101_EMBODIMENT = "NEW_EMBODIMENT"
+DEFAULT_SO101_MODALITY_CONFIG = EXPERIMENT_ROOT / "full_finetune_so101" / "so101_synthetic_groot_config.py"
 
 # 把当前目录插入 sys.path，是为了让 bridge 可以 import 同目录下的 wire.py。
 # 这里不用安装成包，保持实验脚本轻量、可直接复制。
@@ -41,6 +47,26 @@ if str(SCRIPT_DIR) not in sys.path:
 # noqa: E402 表示忽略“import 不在文件顶部”的 lint 警告。
 # 我们必须先改 sys.path，才能稳定 import 本地 wire.py。
 from wire import recv_message, send_message  # noqa: E402
+
+
+def _load_modality_config(path_value: str | None) -> None:
+    """Load a custom GR00T modality config before resolving an embodiment tag."""
+
+    if path_value is None:
+        return
+
+    path = Path(path_value).expanduser().resolve()
+    if not path.exists() or path.suffix != ".py":
+        raise FileNotFoundError(f"modality config does not exist: {path}")
+
+    spec = importlib.util.spec_from_file_location(path.stem, path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load modality config: {path}")
+
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[path.stem] = module
+    spec.loader.exec_module(module)
+    print(f"[bridge] loaded modality config: {path}", flush=True)
 
 
 def _load_policy(args: argparse.Namespace):
@@ -61,6 +87,8 @@ def _load_policy(args: argparse.Namespace):
     # 这些 import 必须放在函数内部，而不是文件顶部。
     # 原因：这个文件只能在 GR00T venv 里运行；如果 IsaacLab 环境误 import
     # 这个模块，顶部 import gr00t 会立刻失败。延迟 import 能让错误边界更清楚。
+    _load_modality_config(args.modality_config_path)
+
     from gr00t.data.embodiment_tags import EmbodimentTag
     from gr00t.policy.gr00t_policy import Gr00tPolicy, Gr00tSimPolicyWrapper
 
@@ -198,12 +226,28 @@ def parse_args() -> argparse.Namespace:
 
     parser = argparse.ArgumentParser()
 
+    parser.add_argument(
+        "--deployment-mode",
+        choices=("zero-shot-oxe", "so101-finetuned"),
+        default="zero-shot-oxe",
+        help=(
+            "zero-shot-oxe loads the base OXE/DROID policy; "
+            "so101-finetuned loads a checkpoint trained with NEW_EMBODIMENT."
+        ),
+    )
+
     # GR00T 模型路径。可以是 HuggingFace repo id，也可以是本地 checkpoint 目录。
-    parser.add_argument("--model-path", default="nvidia/GR00T-N1.7-3B")
+    parser.add_argument("--model-path", default=DEFAULT_BASE_MODEL_PATH)
+
+    parser.add_argument(
+        "--modality-config-path",
+        default=None,
+        help="Optional Python file that registers a custom GR00T modality config before loading the policy.",
+    )
 
     # N1.7 base model 当前可用的预训练 embodiment 之一。
     # 这个 tag 的 video/state/action schema 被 Isaac runner 手工适配。
-    parser.add_argument("--embodiment-tag", default="OXE_DROID_RELATIVE_EEF_RELATIVE_JOINT")
+    parser.add_argument("--embodiment-tag", default=DEFAULT_ZERO_SHOT_EMBODIMENT)
 
     # 推理设备。通常用 cuda；如果只是调试 schema，也可以尝试 cpu，但会非常慢。
     parser.add_argument("--device", default="cuda")
@@ -226,7 +270,21 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Use GR00T's flat sim-policy wrapper instead of the nested native schema.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    if args.deployment_mode == "so101-finetuned":
+        if args.model_path == DEFAULT_BASE_MODEL_PATH:
+            parser.error("--deployment-mode so101-finetuned requires --model-path to point at a trained checkpoint")
+        if args.embodiment_tag == DEFAULT_ZERO_SHOT_EMBODIMENT:
+            args.embodiment_tag = FINETUNED_SO101_EMBODIMENT
+        elif args.embodiment_tag.upper() != FINETUNED_SO101_EMBODIMENT:
+            parser.error("--deployment-mode so101-finetuned requires --embodiment-tag NEW_EMBODIMENT")
+        else:
+            args.embodiment_tag = FINETUNED_SO101_EMBODIMENT
+        if args.modality_config_path is None:
+            args.modality_config_path = str(DEFAULT_SO101_MODALITY_CONFIG)
+
+    return args
 
 
 if __name__ == "__main__":

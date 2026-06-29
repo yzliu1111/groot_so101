@@ -21,6 +21,7 @@ from isaaclab_assets.robots.franka import FRANKA_PANDA_HIGH_PD_CFG
 
 from leisaac.assets.scenes.smart_scene import SMART_SCENE_USD_PATH
 from leisaac.tasks.smart_task.smart_task_env_cfg import (
+    RED,
     SmartTaskEnvCfg,
     SmartTaskSceneCfg,
     SmartTaskTerminationCfg,
@@ -127,7 +128,7 @@ class FrankaSmartTaskSceneCfg(SmartTaskSceneCfg):
     # `stack_ik_rel_visuomotor_env_cfg.py` 里的 Franka wrist camera offset。
     # 它保留 wrist/gripper 视角语义：相机服务于末端附近观测，不强行在初始帧
     # 看向 lego；全局目标定位交给 Franka 专属 overview `camera1`。
-    wrist: TiledCameraCfg = TiledCameraCfg(
+    camera2: TiledCameraCfg = TiledCameraCfg(
         prim_path="{ENV_REGEX_NS}/Robot/panda_hand/wrist_camera",
         offset=TiledCameraCfg.OffsetCfg(
             pos=(0.13, 0.0, -0.15),
@@ -159,9 +160,9 @@ class FrankaSmartTaskTerminationCfg(SmartTaskTerminationCfg):
 
     def __post_init__(self) -> None:
         # SmartTask 原 success 逻辑比较松；runner 默认仍会禁用它。
-        # 这里仅把 robot base body 从 SO101 的 "base" 改成 Franka 的 "panda_link0"，
-        # 方便显式打开 --use-env-success-termination 时不报 body name 错。
-        if self.success is not None:
+        # 兼容旧版 SmartTask 的 lego_height_above_base 参数；新版 object_lifted
+        # 没有 robot_base_name，因此只在参数已存在时修改。
+        if self.success is not None and "robot_base_name" in self.success.params:
             self.success.params["robot_base_name"] = "panda_link0"
 
 
@@ -200,7 +201,7 @@ class FrankaSmartTaskEnvCfg(SmartTaskEnvCfg):
             self,
             random_options=[
                 randomize_object_uniform(
-                    "red_2x4_lego_brick",
+                    RED,
                     pose_range={
                         "x": (-0.05, 0.05),
                         "y": (-0.05, 0.05),
