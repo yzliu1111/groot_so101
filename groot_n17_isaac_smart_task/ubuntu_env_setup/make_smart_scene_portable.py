@@ -50,7 +50,7 @@ def import_sdf(leisaac_root: Path):
     try:
         from pxr import Sdf
     except ModuleNotFoundError as exc:
-        print("[INFO] pxr is not importable before Kit startup; launching headless Isaac app once.")
+        print("[INFO] pxr is not importable before Kit startup; launching headless Isaac app once.", flush=True)
         configure_workspace_paths(leisaac_root)
         try:
             from isaaclab.app import AppLauncher
@@ -68,19 +68,11 @@ def import_sdf(leisaac_root: Path):
     return Sdf, None
 
 
-def export_usd_to_text(source_path: Path, leisaac_root: Path) -> str:
-    Sdf, simulation_app = import_sdf(leisaac_root)
+def export_usd_to_text(source_path: Path, Sdf) -> str:
     layer = Sdf.Layer.FindOrOpen(str(source_path))
-    try:
-        if layer is None:
-            raise SystemExit(f"Could not open USD layer: {source_path}")
-        return layer.ExportToString()
-    finally:
-        if simulation_app is not None:
-            try:
-                simulation_app.close()
-            except Exception as exc:  # noqa: BLE001
-                print(f"[WARN] SimulationApp close failed: {exc!r}")
+    if layer is None:
+        raise SystemExit(f"Could not open USD layer: {source_path}")
+    return layer.ExportToString()
 
 
 def make_portable_text(text: str) -> str:
@@ -118,29 +110,44 @@ def main() -> None:
     source_path = Path(args.source).expanduser().resolve() if args.source else scene_dir / "scene.usd"
     output_path = Path(args.output).expanduser().resolve() if args.output else scene_dir / "scene_portable.usda"
 
+    print(f"[INFO] Source scene: {source_path}", flush=True)
+    print(f"[INFO] Output scene: {output_path}", flush=True)
+
     if not source_path.exists():
         raise SystemExit(f"Source scene does not exist: {source_path}")
 
-    text = export_usd_to_text(source_path, leisaac_root)
-    portable_text = make_portable_text(text)
+    simulation_app = None
+    try:
+        Sdf, simulation_app = import_sdf(leisaac_root)
+        text = export_usd_to_text(source_path, Sdf)
+        portable_text = make_portable_text(text)
 
-    remaining_paths = find_absolute_paths(portable_text)
-    if args.check:
+        remaining_paths = find_absolute_paths(portable_text)
+        if args.check:
+            if remaining_paths:
+                print("[WARN] Remaining absolute USD paths:", flush=True)
+                for path in remaining_paths:
+                    print(f"  {path}", flush=True)
+            else:
+                print("[ OK ] No absolute /home or /Users USD paths remain after rewrite.", flush=True)
+
+        if args.write:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(portable_text, encoding="utf-8")
+            if not output_path.exists():
+                raise SystemExit(f"Portable scene was not written: {output_path}")
+            print(f"[ OK ] Wrote portable scene: {output_path}", flush=True)
+        elif not args.check:
+            print(portable_text, flush=True)
+
         if remaining_paths:
-            print("[WARN] Remaining absolute USD paths:")
-            for path in remaining_paths:
-                print(f"  {path}")
-        else:
-            print("[ OK ] No absolute /home or /Users USD paths remain after rewrite.")
-
-    if args.write:
-        output_path.write_text(portable_text, encoding="utf-8")
-        print(f"[ OK ] Wrote portable scene: {output_path}")
-    elif not args.check:
-        print(portable_text)
-
-    if remaining_paths:
-        sys.exit(2)
+            sys.exit(2)
+    finally:
+        if simulation_app is not None:
+            try:
+                simulation_app.close()
+            except Exception as exc:  # noqa: BLE001
+                print(f"[WARN] SimulationApp close failed: {exc!r}", flush=True)
 
 
 if __name__ == "__main__":

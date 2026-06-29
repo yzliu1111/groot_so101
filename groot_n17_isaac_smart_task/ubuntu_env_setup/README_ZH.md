@@ -654,10 +654,19 @@ export LEISAAC_ASSETS_ROOT="$LEISAAC_ROOT/assets"
 export OMNI_KIT_ACCEPT_EULA=YES
 
 python "$SMART_PROJECT/experiments/groot_n17_isaac_smart_task/ubuntu_env_setup/make_smart_scene_portable.py" --write --check
-test -f "$LEISAAC_ROOT/assets/scenes/smart_scene/scene_portable.usda"
+test -f "$LEISAAC_ROOT/assets/scenes/smart_scene/scene_portable.usda" && echo "SmartTask portable scene OK"
 ```
 
 如果脚本打印 `pxr is not importable before Kit startup; launching headless Isaac app once.`，这是正常 fallback：pip IsaacSim 环境里 USD/pxr 绑定常常要在 Kit 初始化后才进入 Python 路径。
+
+成功时至少应看到这两行：
+
+```text
+[ OK ] No absolute /home or /Users USD paths remain after rewrite.
+[ OK ] Wrote portable scene: /home/guest1/smart_project/leisaac/assets/scenes/smart_scene/scene_portable.usda
+```
+
+如果没有看到 `Wrote portable scene`，不要继续跑 7.8/推理，先定位转换脚本为什么没有写出 `scene_portable.usda`。
 
 如果检查输出里仍然有 `/home/ubuntu/...`、`/Users/...` 这类绝对路径，先停下来确认缺的是哪个资产。不要用创建旧路径 symlink 的方式长期绕过。
 
