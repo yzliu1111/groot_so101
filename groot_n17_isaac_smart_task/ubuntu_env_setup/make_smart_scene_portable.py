@@ -22,6 +22,12 @@ ABSOLUTE_PATH_RE = re.compile(r"(?:file:)?/(?:home|Users)/[^@\n\r\"')\]]+")
 PACKMAN_CAMERA_LINE_RE = re.compile(r"(?m)^.*(?:/home/ubuntu/\.cache/packman/|resources/models/camera/camera\.usd).*\n?")
 
 
+def add_path(path: Path) -> None:
+    path = path.resolve()
+    if path.exists() and str(path) not in sys.path:
+        sys.path.insert(0, str(path))
+
+
 def resolve_leisaac_root() -> Path:
     smart_project = Path(os.environ.get("SMART_PROJECT", REPO_ROOT)).expanduser().resolve()
     local_leisaac_root = smart_project / "leisaac"
@@ -29,23 +35,52 @@ def resolve_leisaac_root() -> Path:
     return Path(os.environ.get("LEISAAC_ROOT", default_leisaac_root)).expanduser().resolve()
 
 
-def import_sdf():
+def configure_workspace_paths(leisaac_root: Path) -> None:
+    isaaclab_source = leisaac_root / "dependencies" / "IsaacLab" / "source"
+    os.environ.setdefault("LEISAAC_ASSETS_ROOT", str((leisaac_root / "assets").resolve()))
+    os.environ.setdefault("OMNI_KIT_ACCEPT_EULA", "YES")
+
+    add_path(EXPERIMENT_ROOT / "zero_shot_isaac_smart_task")
+    add_path(leisaac_root / "source" / "leisaac")
+    for package_name in ("isaaclab", "isaaclab_assets", "isaaclab_tasks", "isaaclab_mimic"):
+        add_path(isaaclab_source / package_name)
+
+
+def import_sdf(leisaac_root: Path):
     try:
         from pxr import Sdf
     except ModuleNotFoundError as exc:
-        raise SystemExit(
-            "pxr is not importable. Run this inside the Isaac/LeIsaac environment, "
-            'for example after `conda activate "$LEISAAC_ENV"`.'
-        ) from exc
-    return Sdf
+        print("[INFO] pxr is not importable before Kit startup; launching headless Isaac app once.")
+        configure_workspace_paths(leisaac_root)
+        try:
+            from isaaclab.app import AppLauncher
+
+            app_launcher = AppLauncher({"headless": True, "enable_cameras": False})
+            simulation_app = app_launcher.app
+            from pxr import Sdf
+        except Exception as app_exc:  # noqa: BLE001 - diagnostic setup path
+            raise SystemExit(
+                "pxr is not importable, and starting Isaac/Kit did not make it available. "
+                "Run this inside the Isaac/LeIsaac environment and set "
+                'LD_LIBRARY_PATH="$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}" before Python.'
+            ) from app_exc
+        return Sdf, simulation_app
+    return Sdf, None
 
 
-def export_usd_to_text(source_path: Path) -> str:
-    Sdf = import_sdf()
+def export_usd_to_text(source_path: Path, leisaac_root: Path) -> str:
+    Sdf, simulation_app = import_sdf(leisaac_root)
     layer = Sdf.Layer.FindOrOpen(str(source_path))
-    if layer is None:
-        raise SystemExit(f"Could not open USD layer: {source_path}")
-    return layer.ExportToString()
+    try:
+        if layer is None:
+            raise SystemExit(f"Could not open USD layer: {source_path}")
+        return layer.ExportToString()
+    finally:
+        if simulation_app is not None:
+            try:
+                simulation_app.close()
+            except Exception as exc:  # noqa: BLE001
+                print(f"[WARN] SimulationApp close failed: {exc!r}")
 
 
 def make_portable_text(text: str) -> str:
@@ -77,6 +112,7 @@ def main() -> None:
     args = parser.parse_args()
 
     leisaac_root = resolve_leisaac_root()
+    configure_workspace_paths(leisaac_root)
     assets_root = Path(os.environ.get("LEISAAC_ASSETS_ROOT", leisaac_root / "assets")).expanduser().resolve()
     scene_dir = assets_root / "scenes" / "smart_scene"
     source_path = Path(args.source).expanduser().resolve() if args.source else scene_dir / "scene.usd"
@@ -85,7 +121,7 @@ def main() -> None:
     if not source_path.exists():
         raise SystemExit(f"Source scene does not exist: {source_path}")
 
-    text = export_usd_to_text(source_path)
+    text = export_usd_to_text(source_path, leisaac_root)
     portable_text = make_portable_text(text)
 
     remaining_paths = find_absolute_paths(portable_text)

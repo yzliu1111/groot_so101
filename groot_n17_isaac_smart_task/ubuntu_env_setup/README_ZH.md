@@ -23,10 +23,10 @@ canonical 来源：
 
 ```bash
 # 当前项目目录。里面应该有 experiments/、outputs/ 等。
-export SMART_PROJECT="__FILL_TARGET_SMART_PROJECT__"
+export SMART_PROJECT="/home/guest1/smart_project"
 
 # Isaac-GR00T 仓库目录。里面应该有 .venv 或 uv 环境。
-export GROOT_ROOT="__FILL_TARGET_ISAAC_GROOT__"
+export GROOT_ROOT="/home/guest1/Isaac-GR00T"
 
 # LeIsaac / LeRobot 源码目录。
 # 本机 canonical:     export LEISAAC_ROOT="$HOME/LeIsaac"
@@ -39,7 +39,7 @@ export LEROBOT_ROOT=""
 # 本机 canonical:     export LEISAAC_ENV="leisaac"
 # 目标机若还没单独建 leisaac env：填当前实际使用的 Isaac env，例如 isaaclab；
 # 如果旧 env 已经被 pip 搅乱，则后面第 7 节建议新建 leisaac_clean。
-export LEISAAC_ENV="__FILL_ISAAC_RUNTIME_ENV__"
+export LEISAAC_ENV="leisaac"
 export LEROBOT_ENV="lerobot"
 
 # Isaac Sim / Kit EULA。后面所有 Isaac / LeIsaac 命令都默认继承这个值。
@@ -50,7 +50,7 @@ export ISAACSIM_ROOT=""
 
 # GR00T 训练 / DeepSpeed 需要真实 CUDA toolkit，也就是 $CUDA_HOME/bin/nvcc。
 # 推理和 Isaac runner 可以先没有 nvcc；训练前必须补齐。
-export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda-12.8}"
+export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda-13.0}"
 if [ ! -x "$CUDA_HOME/bin/nvcc" ] && [ -x /usr/local/cuda/bin/nvcc ]; then
   export CUDA_HOME=/usr/local/cuda
 fi
@@ -79,7 +79,7 @@ which nvcc || true
 nvcc --version || true
 ```
 
-如果 `SMART_PROJECT`、`GROOT_ROOT` 或 `LEISAAC_ENV` 还是 `__FILL...__`，不要继续。`LEROBOT_ROOT`、`ISAACSIM_ROOT` 可以按任务需要留空。
+如果 `SMART_PROJECT`、`GROOT_ROOT` 或 `LEISAAC_ENV` 为空，或者路径不存在，不要继续。`LEROBOT_ROOT`、`ISAACSIM_ROOT` 可以按任务需要留空。
 如果要跑 GR00T 训练，`CUDA_HOME/bin/nvcc` 必须存在；如果只跑 Isaac runner / GR00T bridge 推理，可以先没有 nvcc。
 
 当前已知机器 profile：
@@ -102,10 +102,11 @@ export GROOT_ROOT=/home/guest1/Isaac-GR00T
 export LEISAAC_ROOT="$SMART_PROJECT/leisaac"
 export LEISAAC_ASSETS_ROOT="$LEISAAC_ROOT/assets"
 export OMNI_KIT_ACCEPT_EULA=YES
+export CUDA_HOME=/usr/local/cuda-13.0
 
 # 如果目标机还没有单独 leisaac env，就填当前实际的 Isaac runtime env。
 # 如果当前 env 已经坏了，不要继续修，后面第 7 节改用 leisaac_clean。
-export LEISAAC_ENV="__FILL_EXISTING_ISAAC_ENV_OR_leisaac_clean__"
+export LEISAAC_ENV="leisaac"
 ```
 
 不要把下面三类东西混成一个 Python 环境：
@@ -126,7 +127,7 @@ canonical 本机已经验证过：Isaac runtime env 里 **不安装 LeRobot** �
 |---|---|---|
 | 只训练 / lowmem 微调 | `SMART_PROJECT`、`GROOT_ROOT`、prepared 数据、GR00T venv | Isaac Sim、IsaacLab、LeIsaac |
 | 重新做 v3 -> v2.1 数据转换 | 上面这些 + `conda activate "$LEROBOT_ENV"` | Isaac Sim、IsaacLab |
-| 在 LeIsaac 场景里部署推理 | GR00T venv + `conda activate "$LEISAAC_ENV"` + Isaac Sim + IsaacLab + LeIsaac | LeRobot |
+| 在 LeIsaac 场景里部署推理 | GR00T venv + `conda activate leisaac` + Isaac Sim + IsaacLab + LeIsaac | LeRobot |
 | 真实 SO101 推理 | GR00T venv + 真实机器人/相机 runner | IsaacLab 可选，当前仓库还没有完整真机 runner |
 
 这也是为什么不要把所有东西塞进一个 Python 环境。后面所有命令按这三类终端分工：
@@ -135,7 +136,7 @@ canonical 本机已经验证过：Isaac runtime env 里 **不安装 LeRobot** �
 |---|---|---|---|
 | GR00T 终端 | `$GROOT_ROOT/.venv/bin/python` | stats、训练、bridge server | Isaac runner |
 | LeRobot 终端 | `conda activate "$LEROBOT_ENV"` | v3 -> v2.1 数据转换 | GR00T 训练、Isaac runner |
-| LeIsaac 终端 | `conda activate "$LEISAAC_ENV"` | LeIsaac / IsaacLab runner | GR00T 训练、LeRobot 数据转换 |
+| LeIsaac 终端 | `conda activate leisaac` | LeIsaac / IsaacLab runner | GR00T 训练、LeRobot 数据转换 |
 
 后面涉及 Python 环境的命令块都会写清楚它属于哪个终端。只要你切换任务，就先回到对应终端模板，不要把上一个环境的 `PYTHONPATH`、`PYTHONNOUSERSITE` 或 Isaac Sim hook 顺手带过去。
 
@@ -170,14 +171,14 @@ ls -ld /usr/local/cuda /usr/local/cuda-* 2>/dev/null || true
 如果这台机器要跑 GR00T fine-tune / DeepSpeed 训练，继续设置并验证 CUDA toolkit：
 
 ```bash
-export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda-12.8}"
+export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda-13.0}"
 if [ ! -x "$CUDA_HOME/bin/nvcc" ] && [ -x /usr/local/cuda/bin/nvcc ]; then
   export CUDA_HOME=/usr/local/cuda
 fi
 
 if [ ! -x "$CUDA_HOME/bin/nvcc" ]; then
   echo "ERROR: GR00T training needs CUDA_HOME/bin/nvcc; current CUDA_HOME=$CUDA_HOME" >&2
-  echo "Install CUDA Toolkit 12.8 or set CUDA_HOME to the real toolkit path." >&2
+  echo "Install CUDA Toolkit or set CUDA_HOME to the real toolkit path." >&2
   return 1 2>/dev/null || exit 1
 fi
 
@@ -451,7 +452,7 @@ git submodule update --init --recursive
 
 ```bash
 conda env list
-export LEISAAC_ENV="__FILL_EXISTING_ISAAC_ENV__"
+export LEISAAC_ENV="leisaac"
 ```
 
 然后可以直接跳到 7.5 做只读验证。不要先往这个 env 里乱装包。
@@ -470,15 +471,15 @@ conda deactivate 2>/dev/null || true
 unset PYTHONPATH PYTHONHOME
 
 conda create -n "$LEISAAC_ENV" python=3.11 -y
-conda activate "$LEISAAC_ENV"
+conda activate leisaac
 export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}"
 ```
 
-如果目标机有 CUDA 12.8 toolkit，可以启用；没有也先不要因为推理/runner 强行装 toolkit：
+如果目标机有 CUDA 13.0 toolkit，可以启用；没有也先不要因为推理/runner 强行装 toolkit：
 
 ```bash
-if [ -d /usr/local/cuda-12.8 ]; then
-  export CUDA_HOME=/usr/local/cuda-12.8
+if [ -d /usr/local/cuda-13.0 ]; then
+  export CUDA_HOME=/usr/local/cuda-13.0
   export PATH="$CUDA_HOME/bin:$PATH"
   export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
 fi
@@ -542,7 +543,7 @@ python -m pip install --no-build-isolation -e "$LEISAAC_ROOT/source/leisaac"
 
 ```bash
 source "$(conda info --base)/etc/profile.d/conda.sh"
-conda activate "$LEISAAC_ENV"
+conda activate leisaac
 export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}"
 python -m pip check
 ```
@@ -585,8 +586,8 @@ PY
 再用项目 probe 启动 Isaac app：
 
 ```bash
-export SMART_PROJECT="__FILL_TARGET_SMART_PROJECT__"
-export LEISAAC_ROOT="${LEISAAC_ROOT:-$SMART_PROJECT/leisaac}"
+export SMART_PROJECT="/home/guest1/smart_project"
+export LEISAAC_ROOT="$SMART_PROJECT/leisaac"
 export LEISAAC_ASSETS_ROOT="$LEISAAC_ROOT/assets"
 export OMNI_KIT_ACCEPT_EULA=YES
 export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}"
@@ -601,6 +602,10 @@ python "$SMART_PROJECT/experiments/groot_n17_isaac_smart_task/ubuntu_env_setup/i
 LeIsaac repo 本体不包含所有 USD 资产。最小 `LiftCube-Direct` smoke 需要这两个：
 
 ```bash
+export SMART_PROJECT="/home/guest1/smart_project"
+export LEISAAC_ROOT="$SMART_PROJECT/leisaac"
+export LEISAAC_ASSETS_ROOT="$LEISAAC_ROOT/assets"
+
 cd "$LEISAAC_ROOT"
 
 curl -L -o /tmp/table_with_cube_asset.zip \
@@ -624,6 +629,13 @@ test -f "$LEISAAC_ROOT/assets/scenes/table_with_cube/scene.usd"
 test -f "$LEISAAC_ROOT/assets/robots/so101_follower.usd"
 ```
 
+`test -f ...` 成功时不会输出任何内容；没有输出通常就是通过。想看到明确结果可以这样跑：
+
+```bash
+test -f "$LEISAAC_ROOT/assets/scenes/table_with_cube/scene.usd" && echo "table_with_cube scene OK"
+test -f "$LEISAAC_ROOT/assets/robots/so101_follower.usd" && echo "so101_follower USD OK"
+```
+
 ### 7.7 生成 SmartTask portable scene
 
 如果要跑 `LeIsaac-SO101-SmartTask-v0`，先把历史机器里的绝对 USD 引用转成 repo-local 引用。这个步骤不覆盖原始 `scene.usd`，只生成：
@@ -634,16 +646,18 @@ $LEISAAC_ROOT/assets/scenes/smart_scene/scene_portable.usda
 
 ```bash
 source "$(conda info --base)/etc/profile.d/conda.sh"
-conda activate "$LEISAAC_ENV"
+conda activate leisaac
 export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}"
-export SMART_PROJECT="__FILL_TARGET_SMART_PROJECT__"
-export LEISAAC_ROOT="${LEISAAC_ROOT:-$SMART_PROJECT/leisaac}"
+export SMART_PROJECT="/home/guest1/smart_project"
+export LEISAAC_ROOT="$SMART_PROJECT/leisaac"
 export LEISAAC_ASSETS_ROOT="$LEISAAC_ROOT/assets"
 export OMNI_KIT_ACCEPT_EULA=YES
 
 python "$SMART_PROJECT/experiments/groot_n17_isaac_smart_task/ubuntu_env_setup/make_smart_scene_portable.py" --write --check
 test -f "$LEISAAC_ROOT/assets/scenes/smart_scene/scene_portable.usda"
 ```
+
+如果脚本打印 `pxr is not importable before Kit startup; launching headless Isaac app once.`，这是正常 fallback：pip IsaacSim 环境里 USD/pxr 绑定常常要在 Kit 初始化后才进入 Python 路径。
 
 如果检查输出里仍然有 `/home/ubuntu/...`、`/Users/...` 这类绝对路径，先停下来确认缺的是哪个资产。不要用创建旧路径 symlink 的方式长期绕过。
 
@@ -652,8 +666,12 @@ test -f "$LEISAAC_ROOT/assets/scenes/smart_scene/scene_portable.usda"
 task registry 必须在 `AppLauncher` 启动后 import：
 
 ```bash
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate leisaac
+export SMART_PROJECT="/home/guest1/smart_project"
+export LEISAAC_ROOT="$SMART_PROJECT/leisaac"
+export LEISAAC_ASSETS_ROOT="$LEISAAC_ROOT/assets"
 export OMNI_KIT_ACCEPT_EULA=YES
-: "${LEISAAC_ROOT:?set LEISAAC_ROOT first}"
 export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}"
 
 python - <<'PY'
@@ -677,8 +695,12 @@ PY
 期望能看到 15 个左右的 `LeIsaac-...` task。然后跑最小 make/reset/step：
 
 ```bash
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate leisaac
+export SMART_PROJECT="/home/guest1/smart_project"
+export LEISAAC_ROOT="$SMART_PROJECT/leisaac"
+export LEISAAC_ASSETS_ROOT="$LEISAAC_ROOT/assets"
 export OMNI_KIT_ACCEPT_EULA=YES
-: "${LEISAAC_ROOT:?set LEISAAC_ROOT first}"
 export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}"
 
 python - <<'PY'
@@ -720,11 +742,11 @@ PY
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda deactivate 2>/dev/null || true
 unset PYTHONPATH PYTHONHOME
-conda activate "$LEISAAC_ENV"
+conda activate leisaac
 export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}"
 
-export SMART_PROJECT="__FILL_TARGET_SMART_PROJECT__"
-export LEISAAC_ROOT="${LEISAAC_ROOT:-$SMART_PROJECT/leisaac}"
+export SMART_PROJECT="/home/guest1/smart_project"
+export LEISAAC_ROOT="$SMART_PROJECT/leisaac"
 export LEISAAC_ASSETS_ROOT="$LEISAAC_ROOT/assets"
 export OMNI_KIT_ACCEPT_EULA=YES
 
@@ -780,13 +802,15 @@ PY
 
 这个命令属于 **GR00T 训练终端**，不是 Isaac runner 终端。
 
-最稳妥做法是开一个新终端，只设置 `SMART_PROJECT` 和 `GROOT_ROOT`，然后跑 `$GROOT_ROOT/.venv/bin/python`。不要先 `conda activate "$LEISAAC_ENV"`，不要带 Isaac Sim 的 `PYTHONPATH`。
+最稳妥做法是开一个新终端，只设置 `SMART_PROJECT` 和 `GROOT_ROOT`，然后跑 `$GROOT_ROOT/.venv/bin/python`。不要先 `conda activate leisaac`，不要带 Isaac Sim 的 `PYTHONPATH`。
 
 ```bash
 conda deactivate 2>/dev/null || true
 unset PYTHONPATH PYTHONHOME PYTHONNOUSERSITE PYTHONDONTWRITEBYTECODE ISAAC_PATH ISAACLAB_PATH
+export SMART_PROJECT="/home/guest1/smart_project"
+export GROOT_ROOT="/home/guest1/Isaac-GR00T"
 
-export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda-12.8}"
+export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda-13.0}"
 if [ ! -x "$CUDA_HOME/bin/nvcc" ] && [ -x /usr/local/cuda/bin/nvcc ]; then
   export CUDA_HOME=/usr/local/cuda
 fi
@@ -831,6 +855,8 @@ PY
 ```bash
 conda deactivate 2>/dev/null || true
 unset PYTHONPATH PYTHONHOME PYTHONNOUSERSITE PYTHONDONTWRITEBYTECODE ISAAC_PATH ISAACLAB_PATH
+export SMART_PROJECT="/home/guest1/smart_project"
+export GROOT_ROOT="/home/guest1/Isaac-GR00T"
 
 cd "$SMART_PROJECT"
 "$GROOT_ROOT/.venv/bin/python" \
@@ -846,11 +872,12 @@ cd "$SMART_PROJECT"
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda deactivate 2>/dev/null || true
 unset PYTHONPATH PYTHONHOME
-: "${LEISAAC_ENV:?set LEISAAC_ENV first}"
-conda activate "$LEISAAC_ENV"
+export SMART_PROJECT="/home/guest1/smart_project"
+export LEISAAC_ENV="leisaac"
+conda activate leisaac
 export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}"
 
-export LEISAAC_ROOT="${LEISAAC_ROOT:-$SMART_PROJECT/leisaac}"
+export LEISAAC_ROOT="$SMART_PROJECT/leisaac"
 export LEISAAC_ASSETS_ROOT="$LEISAAC_ROOT/assets"
 export OMNI_KIT_ACCEPT_EULA=YES
 cd "$SMART_PROJECT"
@@ -882,6 +909,8 @@ host/port 形式的本地 TCP API，默认 `127.0.0.1:5577`；如果你已有 AP
 ```bash
 conda deactivate 2>/dev/null || true
 unset PYTHONPATH PYTHONHOME PYTHONNOUSERSITE PYTHONDONTWRITEBYTECODE ISAAC_PATH ISAACLAB_PATH
+export SMART_PROJECT="/home/guest1/smart_project"
+export GROOT_ROOT="/home/guest1/Isaac-GR00T"
 export CHECKPOINT="__FILL_FINETUNED_CHECKPOINT_DIR__"
 
 cd "$SMART_PROJECT"
@@ -900,11 +929,12 @@ cd "$SMART_PROJECT"
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda deactivate 2>/dev/null || true
 unset PYTHONPATH PYTHONHOME
-: "${LEISAAC_ENV:?set LEISAAC_ENV first}"
-conda activate "$LEISAAC_ENV"
+export SMART_PROJECT="/home/guest1/smart_project"
+export LEISAAC_ENV="leisaac"
+conda activate leisaac
 export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}"
 
-export LEISAAC_ROOT="${LEISAAC_ROOT:-$SMART_PROJECT/leisaac}"
+export LEISAAC_ROOT="$SMART_PROJECT/leisaac"
 export LEISAAC_ASSETS_ROOT="$LEISAAC_ROOT/assets"
 export OMNI_KIT_ACCEPT_EULA=YES
 cd "$SMART_PROJECT"
@@ -976,7 +1006,7 @@ chmod u+x isaaclab.sh
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda deactivate 2>/dev/null || true
 unset PYTHONPATH PYTHONHOME
-conda activate "$LEISAAC_ENV"
+conda activate leisaac
 python -c "import isaacsim; print(getattr(isaacsim, '__file__', '<namespace>'))"
 python -m pip show isaacsim isaacsim-core isaaclab
 ```
