@@ -680,6 +680,26 @@ test -f "$LEISAAC_ROOT/assets/scenes/smart_scene/scene_portable.usda" && echo "S
 
 如果要完全依赖 LeIsaac scene parser，不加 fallback，可以显式传 `--smart-target-asset scene`。
 
+runner 会在日志里打印：
+
+```text
+[runner] SmartTask target cfg ...
+[runner] target object state prim_path=... root_pos_w=...
+```
+
+如果可视化里看不到替代块，先用放大尺寸和显式位置确认：
+
+```bash
+--smart-target-pos 0.0 0.25 0.07 \
+--smart-target-cuboid-size 0.06 0.03 0.02
+```
+
+确认位置正确后，再把尺寸改回接近真实 2x4 LEGO：
+
+```bash
+--smart-target-cuboid-size 0.0318 0.0158 0.0096
+```
+
 ### 7.8 LeIsaac task smoke
 
 task registry 必须在 `AppLauncher` 启动后 import：

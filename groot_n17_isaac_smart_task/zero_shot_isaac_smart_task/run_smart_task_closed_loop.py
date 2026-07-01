@@ -503,8 +503,14 @@ def resolve_smart_scene_usd(value: str) -> Path:
     return resolved
 
 
-def smart_target_pose_from_scene(scene_usd_path: Path) -> tuple[tuple[float, float, float], tuple[float, float, float, float]]:
+def smart_target_pose_from_scene(
+    scene_usd_path: Path,
+    override_pos: tuple[float, float, float] | None = None,
+) -> tuple[tuple[float, float, float], tuple[float, float, float, float]]:
     """Read the target pose from the SmartTask scene, falling back to a table-top pose."""
+
+    if override_pos is not None:
+        return override_pos, (1.0, 0.0, 0.0, 0.0)
 
     try:
         from pxr import Usd, UsdGeom
@@ -530,10 +536,17 @@ def smart_target_pose_from_scene(scene_usd_path: Path) -> tuple[tuple[float, flo
     except Exception as exc:  # noqa: BLE001 - asset fallback should still be usable.
         print(f"[runner] warning: failed reading SmartTask target pose from {scene_usd_path}: {exc}", flush=True)
 
-    return (0.0, 0.0, 0.02), (1.0, 0.0, 0.0, 0.0)
+    return (0.0, 0.25, 0.07), (1.0, 0.0, 0.0, 0.0)
 
 
-def add_smart_target_cfg(env_cfg: Any, target_asset: str, target_prim_path: str, scene_usd_path: Path) -> None:
+def add_smart_target_cfg(
+    env_cfg: Any,
+    target_asset: str,
+    target_prim_path: str,
+    scene_usd_path: Path,
+    target_pos: tuple[float, float, float] | None,
+    cuboid_size: tuple[float, float, float],
+) -> None:
     """Register SmartTask's target object without modifying the LeIsaac source tree."""
 
     if target_asset == "scene":
@@ -544,7 +557,7 @@ def add_smart_target_cfg(env_cfg: Any, target_asset: str, target_prim_path: str,
 
     if target_asset == "cuboid":
         spawn_cfg = sim_utils.CuboidCfg(
-            size=SMART_TARGET_CUBOID_SIZE,
+            size=cuboid_size,
             rigid_props=sim_utils.RigidBodyPropertiesCfg(max_depenetration_velocity=1.0),
             mass_props=sim_utils.MassPropertiesCfg(mass=SMART_TARGET_CUBOID_MASS),
             collision_props=sim_utils.CollisionPropertiesCfg(),
@@ -569,7 +582,7 @@ def add_smart_target_cfg(env_cfg: Any, target_asset: str, target_prim_path: str,
             collision_props=sim_utils.CollisionPropertiesCfg(),
         )
 
-    pos, rot = smart_target_pose_from_scene(scene_usd_path)
+    pos, rot = smart_target_pose_from_scene(scene_usd_path, target_pos)
     setattr(
         env_cfg.scene,
         SMART_TARGET_OBJECT_KEY,
@@ -578,6 +591,13 @@ def add_smart_target_cfg(env_cfg: Any, target_asset: str, target_prim_path: str,
             spawn=spawn_cfg,
             init_state=RigidObjectCfg.InitialStateCfg(pos=pos, rot=rot),
         ),
+    )
+    print(
+        "[runner] SmartTask target cfg "
+        f"key={SMART_TARGET_OBJECT_KEY} source={target_asset} prim_path={target_prim_path} "
+        f"init_pos={tuple(round(float(v), 4) for v in pos)} "
+        f"cuboid_size={tuple(round(float(v), 4) for v in cuboid_size)}",
+        flush=True,
     )
 
 
@@ -593,10 +613,19 @@ def install_smart_task_asset_patch(args: argparse.Namespace) -> Path | None:
     import leisaac.tasks.smart_task.smart_task_env_cfg as smart_task_cfg
 
     original_parse = smart_task_cfg.parse_usd_and_create_subassets
+    target_pos = tuple(args.smart_target_pos) if args.smart_target_pos is not None else None
+    cuboid_size = tuple(args.smart_target_cuboid_size)
 
     def parse_usd_and_create_subassets_with_target(usd_path, env_cfg, *parse_args, **parse_kwargs):
         result = original_parse(str(scene_usd_path), env_cfg, *parse_args, **parse_kwargs)
-        add_smart_target_cfg(env_cfg, args.smart_target_asset, args.smart_target_prim_path, scene_usd_path)
+        add_smart_target_cfg(
+            env_cfg,
+            args.smart_target_asset,
+            args.smart_target_prim_path,
+            scene_usd_path,
+            target_pos,
+            cuboid_size,
+        )
         return result
 
     # Keep the imported module constants consistent for __post_init__ and debug logs.
@@ -1416,6 +1445,22 @@ def parse_args() -> argparse.Namespace:
         default=SMART_TARGET_MANAGED_PRIM_PATH,
         help="Prim path used when --smart-target-asset is cuboid or a USD path.",
     )
+    parser.add_argument(
+        "--smart-target-pos",
+        nargs=3,
+        type=float,
+        default=None,
+        metavar=("X", "Y", "Z"),
+        help="Optional SmartTask target center position override in scene-local meters.",
+    )
+    parser.add_argument(
+        "--smart-target-cuboid-size",
+        nargs=3,
+        type=float,
+        default=SMART_TARGET_CUBOID_SIZE,
+        metavar=("X", "Y", "Z"),
+        help="Fallback cuboid size in meters when --smart-target-asset cuboid is used.",
+    )
 
     # IsaacLab env 的设备。一般用 cuda。
     parser.add_argument("--device", default="cuda")
@@ -1692,6 +1737,15 @@ def main() -> None:
             flush=True,
         )
         print(f"[runner] target object={target_object_name}", flush=True)
+        target_asset = env.scene[target_object_name]
+        target_cfg = getattr(target_asset, "cfg", None)
+        target_prim_path = getattr(target_cfg, "prim_path", "<unknown>")
+        print(
+            "[runner] target object state "
+            f"prim_path={target_prim_path} "
+            f"root_pos_w={format_vec(tensor_first_row(target_asset.data.root_pos_w))}",
+            flush=True,
+        )
 
         if args.debug_cameras:
             debug_frame_dir = args.debug_camera_frame_dir
