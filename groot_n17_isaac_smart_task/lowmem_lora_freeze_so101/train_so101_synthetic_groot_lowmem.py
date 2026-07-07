@@ -95,6 +95,27 @@ def _run(cmd: list[str], *, cwd: Path, dry_run: bool) -> None:
         subprocess.run(cmd, cwd=cwd, check=True)
 
 
+def _is_lerobot_prepared_dataset(path: Path) -> bool:
+    return (path / "meta" / "info.json").exists() and (path / "meta" / "modality.json").exists()
+
+
+def _discover_prepared_datasets(root: Path) -> list[Path]:
+    root = root.expanduser().resolve()
+    if not root.exists():
+        raise FileNotFoundError(f"Dataset root does not exist: {root}")
+    if _is_lerobot_prepared_dataset(root):
+        return [root]
+
+    datasets: list[Path] = []
+    for dirpath, _, filenames in os.walk(root, followlinks=True):
+        path = Path(dirpath)
+        if path.name == "meta" and "info.json" in filenames:
+            dataset_path = path.parent
+            if _is_lerobot_prepared_dataset(dataset_path):
+                datasets.append(dataset_path.resolve())
+    return sorted(set(datasets))
+
+
 def _modality_config_path(camera_layout: str) -> Path:
     if camera_layout == "dual":
         return DUAL_MODALITY_CONFIG_PATH
@@ -111,16 +132,31 @@ def _default_prepared_datasets(camera_layout: str) -> list[Path]:
     ]
 
 
-def _split_path_values(values: list[str] | None, camera_layout: str) -> list[Path]:
-    if values is None:
-        return [path.resolve() for path in _default_prepared_datasets(camera_layout)]
-
+def _split_path_values(
+    values: list[str] | None,
+    roots: list[Path] | None,
+    camera_layout: str,
+) -> list[Path]:
     paths: list[Path] = []
-    for value in values:
-        for item in value.split(os.pathsep):
-            if item:
-                paths.append(Path(item).resolve())
-    return paths
+
+    if values:
+        for value in values:
+            for item in value.split(os.pathsep):
+                if item:
+                    paths.append(Path(item).expanduser().resolve())
+
+    if roots:
+        for root in roots:
+            discovered = _discover_prepared_datasets(root)
+            if not discovered:
+                raise FileNotFoundError(f"No prepared LeRobot datasets found under: {root}")
+            paths.extend(discovered)
+
+    if not paths:
+        paths = [path.resolve() for path in _default_prepared_datasets(camera_layout)]
+
+    deduped = list(dict.fromkeys(paths))
+    return deduped
 
 
 def _json_object(value: str) -> dict[str, Any]:
@@ -321,6 +357,15 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Prepared GR00T/LeRobot v2.1 dataset path. Repeat or pass os.pathsep-separated paths.",
     )
+    parser.add_argument(
+        "--dataset-root",
+        "--prepared-root",
+        dest="dataset_root",
+        action="append",
+        type=Path,
+        default=None,
+        help="Directory to recursively scan for prepared GR00T/LeRobot datasets.",
+    )
     parser.add_argument("--groot-root", type=Path, default=DEFAULT_GROOT_ROOT)
     parser.add_argument(
         "--output-dir",
@@ -400,7 +445,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     modality_config_path = _modality_config_path(args.camera_layout).resolve()
-    dataset_paths = _split_path_values(args.dataset_path, args.camera_layout)
+    dataset_paths = _split_path_values(args.dataset_path, args.dataset_root, args.camera_layout)
     _check_dataset_paths(dataset_paths)
     settings = _strategy_settings(args)
 

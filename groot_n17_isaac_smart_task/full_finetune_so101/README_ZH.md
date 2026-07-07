@@ -93,6 +93,39 @@ conda run -n lerobot python \
     --prepare-only
 ```
 
+如果数据按任务分目录存放，例如：
+
+```text
+dataset/custom/
+  pick_only/
+    run_a/
+    run_b/
+  place_only/
+    run_c/
+```
+
+并且每个叶子目录都是 LeRobot v3 数据集，直接用 `--source-root` 递归发现：
+
+```bash
+cd /home/yzliu/smart_project
+conda run -n lerobot python \
+  experiments/groot_n17_isaac_smart_task/full_finetune_so101/train_so101_synthetic_groot.py \
+    --source-root "$SMART_PROJECT/dataset/custom" \
+    --prepared-root "$SMART_PROJECT/outputs/groot_so101_synthetic_datasets/custom" \
+    --force-prepare \
+    --skip-stats \
+    --prepare-only
+```
+
+脚本只会接受带 `meta/info.json` 且 `codebase_version == v3.0` 的目录。prepared 输出名会带上相对任务路径，
+例如 `pick_only/run_a` 会输出到：
+
+```text
+outputs/groot_so101_synthetic_datasets/custom/pick_only/run_a
+```
+
+这样 v3 源数据和 v2.1 prepared 数据都按任务树组织，不需要把所有数据集摊平成一个目录。
+
 第二阶段：在 GR00T venv 里生成统计并启动 fine-tune 入口。
 
 ```bash
@@ -208,6 +241,12 @@ experiments/groot_n17_isaac_smart_task/full_finetune_so101/so101_synthetic_groot
 
 ```text
 outputs/groot_so101_synthetic_datasets/so101_lego_pick_0609_1722_wrist_only
+```
+
+如果使用 `--source-root` 的任务树输出，后缀只加在叶子数据集目录上，例如：
+
+```text
+outputs/groot_so101_synthetic_datasets/custom/pick_only/run_a_wrist_only
 ```
 
 如果你的单相机数据里 wrist 图像不是 `observation.images.camera3`，只需要把

@@ -198,8 +198,7 @@ outputs/groot_so101_synthetic_datasets/so101_lego_pick_0609_1722
 outputs/groot_so101_synthetic_datasets/so101_lego_pick_0609_1722_mimic
 ```
 
-这里不是自动扫描 `outputs/groot_so101_synthetic_datasets/` 下的所有目录。脚本默认只使用上面两份
-prepared 数据。如果后面又准备了新的数据集，需要显式传入：
+脚本默认只使用上面两份 prepared 数据。如果后面又准备了新的数据集，可以显式传入：
 
 ```bash
 --dataset-path "$SMART_PROJECT/outputs/groot_so101_synthetic_datasets/xxx"
@@ -207,6 +206,20 @@ prepared 数据。如果后面又准备了新的数据集，需要显式传入�
 
 `--dataset-path` 可以重复传，也可以用 `:` 分隔多条路径。脚本会把这些路径写进同一个 GR00T dataset
 配置里，当前 `mix_ratio` 是 `1.0`。
+
+如果 prepared 数据已经按任务目录批量放好，也可以递归扫描：
+
+```bash
+--dataset-root "$SMART_PROJECT/outputs/groot_so101_synthetic_datasets/custom"
+```
+
+`--prepared-root` 是同一个参数的别名，方便和准备阶段的 `--prepared-root` 对齐：
+
+```bash
+--prepared-root "$SMART_PROJECT/outputs/groot_so101_synthetic_datasets/custom"
+```
+
+脚本会选择下面所有带 `meta/info.json` 和 `meta/modality.json` 的 prepared LeRobot 数据集。
 
 ## 输出、日志和部署边界
 

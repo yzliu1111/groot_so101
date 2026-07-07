@@ -56,6 +56,110 @@ V21_DATA_PATH = "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parq
 V21_VIDEO_PATH = "videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4"
 
 
+def _is_lerobot_v3_dataset(path: Path) -> bool:
+    info_path = path / "meta" / "info.json"
+    if not info_path.exists():
+        return False
+    try:
+        with info_path.open("r") as f:
+            info = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return False
+    return info.get("codebase_version") == "v3.0"
+
+
+def _safe_dataset_stem(value: str) -> str:
+    safe = "".join(char if char.isalnum() or char in "._-" else "_" for char in value)
+    return safe.strip("._-") or "dataset"
+
+
+def _discover_lerobot_v3_datasets(root: Path) -> list[Path]:
+    root = root.expanduser().resolve()
+    if not root.exists():
+        raise FileNotFoundError(f"Source root does not exist: {root}")
+    if _is_lerobot_v3_dataset(root):
+        return [root]
+
+    datasets: list[Path] = []
+    for dirpath, _, filenames in os.walk(root, followlinks=True):
+        path = Path(dirpath)
+        if path.name == "meta" and "info.json" in filenames:
+            dataset_path = path.parent
+            if _is_lerobot_v3_dataset(dataset_path):
+                datasets.append(dataset_path)
+    return sorted(set(datasets))
+
+
+def _camera_layout_leaf_name(name: str, camera_layout: str) -> str:
+    if camera_layout == "dual":
+        return name
+    return f"{name}_{camera_layout.replace('-', '_')}"
+
+
+def _prepared_relative_path(
+    source_path: Path,
+    root: Path | None,
+    camera_layout: str,
+) -> Path:
+    if root is None:
+        return Path(_camera_layout_leaf_name(_safe_dataset_stem(source_path.name), camera_layout))
+
+    rel = source_path.relative_to(root)
+    parts = [_safe_dataset_stem(part) for part in rel.parts]
+    if not parts:
+        parts = [_safe_dataset_stem(source_path.name)]
+    parts[-1] = _camera_layout_leaf_name(parts[-1], camera_layout)
+    return Path(*parts)
+
+
+def _format_relative_path(path: Path) -> str:
+    return path.as_posix()
+
+
+def _resolve_source_datasets(args: argparse.Namespace) -> list[tuple[Path, Path]]:
+    source_specs: list[tuple[Path, Path | None]] = []
+
+    if args.source_dataset:
+        source_specs.extend((path.expanduser().resolve(), None) for path in args.source_dataset)
+
+    if args.source_root:
+        for root_value in args.source_root:
+            root = root_value.expanduser().resolve()
+            discovered = _discover_lerobot_v3_datasets(root)
+            if not discovered:
+                raise FileNotFoundError(f"No LeRobot v3 datasets found under source root: {root}")
+            source_specs.extend((path, root) for path in discovered)
+
+    if not source_specs:
+        source_specs.extend((path.resolve(), None) for path in DEFAULT_DATASETS)
+
+    seen_sources: set[Path] = set()
+    resolved: list[tuple[Path, Path]] = []
+    for source_path, root in source_specs:
+        source_path = source_path.expanduser()
+        resolved_source_path = source_path.resolve()
+        if resolved_source_path in seen_sources:
+            continue
+        seen_sources.add(resolved_source_path)
+        if not _is_lerobot_v3_dataset(source_path):
+            raise ValueError(f"Expected a LeRobot v3 dataset with meta/info.json: {source_path}")
+        prepared_relative_path = _prepared_relative_path(source_path, root, args.camera_layout)
+        resolved.append((resolved_source_path, prepared_relative_path))
+
+    names: dict[Path, Path] = {}
+    for source_path, prepared_relative_path in resolved:
+        previous = names.get(prepared_relative_path)
+        if previous is not None:
+            raise ValueError(
+                "Prepared dataset path collision: "
+                f"{_format_relative_path(prepared_relative_path)!r} from {previous} and {source_path}. "
+                "Use separate --prepared-root values or rename one source dataset."
+            )
+        names[prepared_relative_path] = source_path
+
+    return resolved
+
+
 def _json_default(value: Any) -> Any:
     if hasattr(value, "as_py"):
         return value.as_py()
@@ -182,12 +286,6 @@ def _camera_layout_settings(
             raise ValueError("wrist-only camera layout requires --wrist-camera-key")
         return {"wrist": wrist_camera_key}, WRIST_ONLY_MODALITY_CONFIG_PATH
     raise ValueError(f"Unsupported camera layout: {camera_layout}")
-
-
-def _prepared_dataset_name(source_path: Path, camera_layout: str) -> str:
-    if camera_layout == "dual":
-        return source_path.name
-    return f"{source_path.name}_{camera_layout.replace('-', '_')}"
 
 
 def _write_modality_json(output_path: Path, video_key_map: dict[str, str]) -> None:
@@ -562,6 +660,16 @@ def parse_args() -> argparse.Namespace:
         help="LeRobot v3 source dataset. Repeat to mix multiple datasets.",
     )
     parser.add_argument(
+        "--source-root",
+        action="append",
+        type=Path,
+        default=None,
+        help=(
+            "Directory to recursively scan for LeRobot v3 datasets. Repeat to mix "
+            "task folders such as dataset/custom/pick_only/* and dataset/custom/place_only/*."
+        ),
+    )
+    parser.add_argument(
         "--prepared-root",
         type=Path,
         default=REPO_ROOT / "outputs" / "groot_so101_synthetic_datasets",
@@ -618,21 +726,17 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    source_paths = args.source_dataset or list(DEFAULT_DATASETS)
     video_key_map, modality_config_path = _camera_layout_settings(
         args.camera_layout,
         args.top_camera_key,
         args.wrist_camera_key,
     )
     modality_config_path = modality_config_path.resolve()
+    source_specs = _resolve_source_datasets(args)
 
     prepared_paths: list[Path] = []
-    for source_path in source_paths:
-        source_path = source_path.resolve()
-        prepared_path = args.prepared_root.resolve() / _prepared_dataset_name(
-            source_path,
-            args.camera_layout,
-        )
+    for source_path, prepared_relative_path in source_specs:
+        prepared_path = args.prepared_root.resolve() / prepared_relative_path
         if not args.skip_prepare:
             prepare_dataset(
                 source_path,
