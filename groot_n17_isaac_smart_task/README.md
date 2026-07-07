@@ -2,6 +2,9 @@
 
 这个实验现在按三步组织。根目录只保留这个索引；代码、说明和运行产物都放进对应阶段子目录。
 
+当前默认 GR00T 环境是 Python 3.12 checkout：`~/Isaac-GR00T-py312`。旧的
+`~/Isaac-GR00T` Python 3.10 checkout 只作为回滚 / 对照环境，不再作为新命令默认路径。
+
 | 阶段 | 目录 | 主要文件 |
 |---|---|---|
 | Zero-shot 推理 | `zero_shot_isaac_smart_task/` | `groot_bridge_server.py`、`run_smart_task_closed_loop.py`、`wire.py`、`franka_smart_task/` |

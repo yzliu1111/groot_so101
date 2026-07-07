@@ -14,7 +14,7 @@ Recommended local flow:
 
 2. Run GR00T stats/fine-tuning from the Isaac-GR00T virtualenv:
 
-    /home/yzliu/Isaac-GR00T/.venv/bin/python \
+    ${GROOT_ROOT:-$HOME/Isaac-GR00T-py312}/.venv/bin/python \
       experiments/groot_n17_isaac_smart_task/full_finetune_so101/train_so101_synthetic_groot.py \
         --skip-prepare
 
@@ -41,12 +41,15 @@ import pyarrow.parquet as pq
 SCRIPT_DIR = Path(__file__).resolve().parent
 EXPERIMENT_ROOT = SCRIPT_DIR.parent
 REPO_ROOT = EXPERIMENT_ROOT.parents[1]
-DEFAULT_GROOT_ROOT = Path("/home/yzliu/Isaac-GR00T")
+DEFAULT_GROOT_ROOT = Path(
+    os.environ.get("GROOT_ROOT", str(Path.home() / "Isaac-GR00T-py312"))
+).expanduser()
 DEFAULT_DATASETS = (
     REPO_ROOT / "dataset" / "so101_lego_pick_0609_1722",
     REPO_ROOT / "dataset" / "so101_lego_pick_0609_1722_mimic",
 )
-MODALITY_CONFIG_PATH = SCRIPT_DIR / "so101_synthetic_groot_config.py"
+DUAL_MODALITY_CONFIG_PATH = SCRIPT_DIR / "so101_synthetic_groot_config.py"
+WRIST_ONLY_MODALITY_CONFIG_PATH = SCRIPT_DIR / "so101_synthetic_groot_wrist_only_config.py"
 LEROBOT_SRC = REPO_ROOT / "lerobot" / "src"
 
 V21_DATA_PATH = "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet"
@@ -165,7 +168,29 @@ def _feature_subset(info: dict[str, Any], video_keys: list[str]) -> dict[str, An
     return {key: value for key, value in info["features"].items() if key in keep_keys}
 
 
-def _write_modality_json(output_path: Path, top_camera_key: str, wrist_camera_key: str) -> None:
+def _camera_layout_settings(
+    camera_layout: str,
+    top_camera_key: str,
+    wrist_camera_key: str,
+) -> tuple[dict[str, str], Path]:
+    if camera_layout == "dual":
+        if not top_camera_key or not wrist_camera_key:
+            raise ValueError("dual camera layout requires both top/front and wrist camera keys")
+        return {"top": top_camera_key, "wrist": wrist_camera_key}, DUAL_MODALITY_CONFIG_PATH
+    if camera_layout == "wrist-only":
+        if not wrist_camera_key:
+            raise ValueError("wrist-only camera layout requires --wrist-camera-key")
+        return {"wrist": wrist_camera_key}, WRIST_ONLY_MODALITY_CONFIG_PATH
+    raise ValueError(f"Unsupported camera layout: {camera_layout}")
+
+
+def _prepared_dataset_name(source_path: Path, camera_layout: str) -> str:
+    if camera_layout == "dual":
+        return source_path.name
+    return f"{source_path.name}_{camera_layout.replace('-', '_')}"
+
+
+def _write_modality_json(output_path: Path, video_key_map: dict[str, str]) -> None:
     _write_json(
         output_path / "meta" / "modality.json",
         {
@@ -178,8 +203,8 @@ def _write_modality_json(output_path: Path, top_camera_key: str, wrist_camera_ke
                 "gripper": {"start": 5, "end": 6},
             },
             "video": {
-                "top": {"original_key": top_camera_key},
-                "wrist": {"original_key": wrist_camera_key},
+                config_key: {"original_key": original_key}
+                for config_key, original_key in video_key_map.items()
             },
             "annotation": {
                 "human.task_description": {"original_key": "task_index"},
@@ -379,8 +404,7 @@ def prepare_dataset(
     output_path: Path,
     *,
     groot_root: Path,
-    top_camera_key: str,
-    wrist_camera_key: str,
+    video_key_map: dict[str, str],
     instruction_override: str | None,
     force: bool,
     max_episodes: int | None,
@@ -407,7 +431,7 @@ def prepare_dataset(
     if not records:
         raise ValueError(f"No episodes selected for {source_path}")
 
-    video_keys = list(dict.fromkeys([top_camera_key, wrist_camera_key]))
+    video_keys = list(dict.fromkeys(video_key_map.values()))
     missing_video_keys = [key for key in video_keys if key not in info["features"]]
     if missing_video_keys:
         raise KeyError(f"Video keys not found in {source_path}: {missing_video_keys}")
@@ -437,7 +461,7 @@ def prepare_dataset(
             for record in records
         ],
     )
-    _write_modality_json(output_path, top_camera_key, wrist_camera_key)
+    _write_modality_json(output_path, video_key_map)
     return output_path
 
 
@@ -448,7 +472,12 @@ def _run(cmd: list[str], *, cwd: Path, dry_run: bool) -> None:
         subprocess.run(cmd, cwd=cwd, check=True)
 
 
-def generate_stats(dataset_path: Path, groot_root: Path, dry_run: bool) -> None:
+def generate_stats(
+    dataset_path: Path,
+    groot_root: Path,
+    modality_config_path: Path,
+    dry_run: bool,
+) -> None:
     _run(
         [
             sys.executable,
@@ -458,14 +487,18 @@ def generate_stats(dataset_path: Path, groot_root: Path, dry_run: bool) -> None:
             "--embodiment-tag",
             "NEW_EMBODIMENT",
             "--modality-config-path",
-            str(MODALITY_CONFIG_PATH),
+            str(modality_config_path),
         ],
         cwd=groot_root,
         dry_run=dry_run,
     )
 
 
-def launch_finetune(args: argparse.Namespace, prepared_paths: list[Path]) -> None:
+def launch_finetune(
+    args: argparse.Namespace,
+    prepared_paths: list[Path],
+    modality_config_path: Path,
+) -> None:
     cmd = [
         sys.executable,
         "gr00t/experiment/launch_finetune.py",
@@ -476,7 +509,7 @@ def launch_finetune(args: argparse.Namespace, prepared_paths: list[Path]) -> Non
         "--embodiment-tag",
         "NEW_EMBODIMENT",
         "--modality-config-path",
-        str(MODALITY_CONFIG_PATH),
+        str(modality_config_path),
         "--num-gpus",
         str(args.num_gpus),
         "--output-dir",
@@ -549,6 +582,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--wrist-camera-key", default="observation.images.camera3")
     parser.add_argument(
+        "--camera-layout",
+        choices=("dual", "wrist-only"),
+        default="dual",
+        help=(
+            "dual maps top/front + wrist cameras; wrist-only trains with only "
+            "--wrist-camera-key and writes prepared datasets with a _wrist_only suffix."
+        ),
+    )
+    parser.add_argument(
         "--instruction",
         default=None,
         help="Optional language override, e.g. 'Pick up the red 2x4 lego brick.'.",
@@ -577,18 +619,26 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     source_paths = args.source_dataset or list(DEFAULT_DATASETS)
+    video_key_map, modality_config_path = _camera_layout_settings(
+        args.camera_layout,
+        args.top_camera_key,
+        args.wrist_camera_key,
+    )
+    modality_config_path = modality_config_path.resolve()
 
     prepared_paths: list[Path] = []
     for source_path in source_paths:
         source_path = source_path.resolve()
-        prepared_path = args.prepared_root.resolve() / source_path.name
+        prepared_path = args.prepared_root.resolve() / _prepared_dataset_name(
+            source_path,
+            args.camera_layout,
+        )
         if not args.skip_prepare:
             prepare_dataset(
                 source_path,
                 prepared_path,
                 groot_root=args.groot_root.resolve(),
-                top_camera_key=args.top_camera_key,
-                wrist_camera_key=args.wrist_camera_key,
+                video_key_map=video_key_map,
                 instruction_override=args.instruction,
                 force=args.force_prepare,
                 max_episodes=args.max_episodes,
@@ -597,7 +647,12 @@ def main() -> None:
 
     if not args.skip_stats:
         for prepared_path in prepared_paths:
-            generate_stats(prepared_path, args.groot_root.resolve(), args.dry_run)
+            generate_stats(
+                prepared_path,
+                args.groot_root.resolve(),
+                modality_config_path,
+                args.dry_run,
+            )
 
     if args.prepare_only:
         print("[done] prepared datasets:")
@@ -605,7 +660,7 @@ def main() -> None:
             print(f"  {path}")
         return
 
-    launch_finetune(args, prepared_paths)
+    launch_finetune(args, prepared_paths, modality_config_path)
 
 
 if __name__ == "__main__":

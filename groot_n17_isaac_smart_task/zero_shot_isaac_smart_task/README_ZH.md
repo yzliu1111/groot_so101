@@ -8,11 +8,14 @@
 
 如果要在任意 Ubuntu 机器上先搭环境，看通用安装剧本：[ubuntu_env_setup/README_ZH.md](../ubuntu_env_setup/README_ZH.md)。
 
+当前默认 GR00T 环境是 Python 3.12 checkout：`~/Isaac-GR00T-py312`。旧
+`~/Isaac-GR00T` Python 3.10 checkout 只作为回滚 / 对照环境。
+
 ## 机器视角
 
 | 机器 | 推荐用途 | 需要放的资产 |
 |---|---|---|
-| 本机 RTX 5060 Ti | 主要 zero-shot 调试机：Isaac viewport、camera debug、2x2 视频对照 | `smart_project`、`leisaac/`、`Isaac-GR00T`、`conda isaaclab` |
+| 本机 RTX 5060 Ti | 主要 zero-shot 调试机：Isaac viewport、camera debug、2x2 视频对照 | `smart_project`、`leisaac/`、`Isaac-GR00T-py312`、`conda isaaclab` |
 | 其他 Ubuntu GPU 机器 | 只要已经按通用安装剧本补齐 Isaac/LeIsaac runtime，也可以跑同一套命令；env 名不必叫 `leisaac` | `SMART_PROJECT`、`LEISAAC_ROOT`、`LEISAAC_ENV`、`GROOT_ROOT` |
 
 本阶段的核心不是训练，而是问：base GR00T N1.7 在 LeIsaac SmartTask 场景里能不能产生有意义的动作流。

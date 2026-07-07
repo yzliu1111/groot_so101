@@ -1,7 +1,7 @@
 """GR00T N1.7 bridge server：在 GR00T 虚拟环境中加载模型并对外提供推理服务。
 
 运行环境：
-    /home/yzliu/Isaac-GR00T/.venv/bin/python
+    ${GROOT_ROOT:-$HOME/Isaac-GR00T-py312}/.venv/bin/python
 
 为什么需要这个 bridge：
     Isaac Sim / IsaacLab 的环境非常重，GR00T N1.7 的依赖也非常重。两者直接

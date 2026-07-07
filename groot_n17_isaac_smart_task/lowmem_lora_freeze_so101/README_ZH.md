@@ -15,6 +15,8 @@
 - 全量 / 默认 action-head 微调在 32GB 级别单卡上仍然可能 OOM，需要先尝试冻结更多权重，或用 LoRA / adapter 路线。
 - 本机 5060 Ti 16GB 不应该作为“正式训练是否可行”的主要判断依据；它适合快速验证脚本、数据、stats 和最小训练 step，OOM 是预期风险。
 - CUDA 12.8 是 PyTorch `cu128` 栈的稳妥保底方案；但如果目标机已有 toolkit 能跑到训练 OOM，先别把问题归因到 CUDA。
+- 当前默认 GR00T checkout 是 `~/Isaac-GR00T-py312` / Python 3.12 / torch 2.9。
+  旧 `~/Isaac-GR00T` / Python 3.10 只作为回滚和历史对照。
 
 ## 先把这件事讲清楚
 
@@ -62,7 +64,7 @@ LoRA 的一个额外现实问题是：checkpoint 往往是 “base model + adapt
 
 官方 fine-tune API 有一部分现成冻结开关，但没有看到现成 LoRA 训练入口。
 
-本地 `Isaac-GR00T` 里可以看到：
+本地 `Isaac-GR00T-py312` 里可以看到：
 
 ```text
 gr00t/configs/finetune_config.py
@@ -373,6 +375,21 @@ mapping={'exterior': 'camera3', 'top': 'camera3', 'wrist': 'camera2'}
 也就是说，checkpoint 的 schema 仍然是 `video.top/video.wrist`，但 live camera key 由 runner
 按 role 翻译，不是把训练时的 camera 编号原样照搬到当前场景。
 
+如果 checkpoint 是用 wrist-only 单相机数据训练的，训练时也要显式传：
+
+```bash
+--camera-layout wrist-only
+```
+
+这会让 lowmem 脚本加载：
+
+```text
+full_finetune_so101/so101_synthetic_groot_wrist_only_config.py
+```
+
+默认 prepared dataset 路径也会切到 `_wrist_only` 后缀。wrist-only checkpoint 后续部署时同样必须加载
+这份 wrist-only modality config，不能再按 `video.top/video.wrist` 的双相机 schema 解释。
+
 终端 1：启动 GR00T bridge，加载训练后的 checkpoint 和 SO101 modality config。
 
 checkpoint 很大时，让它留在训练/目标 Ubuntu 机器本地即可。bridge 负责加载权重并暴露
@@ -542,7 +559,7 @@ unset PYTHONPATH PYTHONHOME PYTHONNOUSERSITE PYTHONDONTWRITEBYTECODE
 
 ```bash
 export SMART_PROJECT=/home/yzliu/smart_project
-export GROOT_ROOT=/home/yzliu/Isaac-GR00T
+export GROOT_ROOT=/home/yzliu/Isaac-GR00T-py312
 
 # 只指向本机实际存在的 CUDA toolkit；12.8 最贴合 PyTorch cu128 栈。
 unset CUDA_HOME
@@ -619,7 +636,7 @@ else:
 PY
 ```
 
-`peft` 是 Isaac-GR00T 官方 `pyproject.toml` 里的依赖，正常 `uv sync --python 3.10 && uv pip install -e .` 后应该已经存在。
+`peft` 是 Isaac-GR00T 官方 `pyproject.toml` 里的依赖，正常 `uv sync --python 3.12` 后应该已经存在。
 
 ### 本机 5060 Ti 快速 dry-run
 

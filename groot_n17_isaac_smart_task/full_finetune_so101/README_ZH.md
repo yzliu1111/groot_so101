@@ -23,7 +23,7 @@
 /home/yzliu/smart_project/dataset/so101_lego_pick_0609_1722
 /home/yzliu/smart_project/dataset/so101_lego_pick_0609_1722_mimic
 /home/yzliu/smart_project/outputs/groot_so101_synthetic_datasets/
-/home/yzliu/Isaac-GR00T
+/home/yzliu/Isaac-GR00T-py312
 
 远程 Linux GPU 训练机：
 $SMART_PROJECT/outputs/groot_so101_synthetic_datasets/
@@ -75,7 +75,7 @@ meta/relative_stats.json
 
 ```text
 LeRobot 数据/schema 转换 -> conda lerobot
-GR00T stats / launch_finetune -> /home/yzliu/Isaac-GR00T/.venv
+GR00T stats / launch_finetune -> /home/yzliu/Isaac-GR00T-py312/.venv
 Isaac closed-loop -> conda isaaclab
 ```
 
@@ -97,7 +97,7 @@ conda run -n lerobot python \
 
 ```bash
 cd /home/yzliu/smart_project
-/home/yzliu/Isaac-GR00T/.venv/bin/python \
+/home/yzliu/Isaac-GR00T-py312/.venv/bin/python \
   experiments/groot_n17_isaac_smart_task/full_finetune_so101/train_so101_synthetic_groot.py \
     --skip-prepare \
     --max-steps 2000 \
@@ -107,6 +107,9 @@ cd /home/yzliu/smart_project
 
 本机 RTX 5060 Ti 16GB 更适合做数据转换、loader smoke test、stats 生成和小步数逻辑验证；完整
 GR00T 微调大概率仍然需要上云或使用 40GB+ 显存设备。
+
+当前默认 GR00T checkout 是 `~/Isaac-GR00T-py312` / Python 3.12。旧
+`~/Isaac-GR00T` / Python 3.10 只作为回滚和历史对照。
 
 如果要迁移到另一台 Ubuntu 机器，直接看通用迁移指南；低显存策略和微调后部署看第三阶段文档：
 
@@ -134,7 +137,7 @@ v2.1: data/chunk-000/episode_000000.parquet
 GR00T 官方仓库里有转换器：
 
 ```text
-/home/yzliu/Isaac-GR00T/scripts/lerobot_conversion/convert_v3_to_v2.py
+/home/yzliu/Isaac-GR00T-py312/scripts/lerobot_conversion/convert_v3_to_v2.py
 ```
 
 这个转换器的 `convert_dataset()` 是原地转换：会把原始目录移动成 `_v3.0` 备份，再把 v2.1 写回原路径。
@@ -188,13 +191,36 @@ observation.images.camera2 -> 不送入 GR00T 微调
 
 这里把 `camera1` 命名为 `top`，是因为实际图像语义是 top/global 视角，而不是 front 视角。
 
+如果只有 wrist 单相机数据，不要改双相机配置文件；改用独立的 wrist-only 配置：
+
+```text
+experiments/groot_n17_isaac_smart_task/full_finetune_so101/so101_synthetic_groot_wrist_only_config.py
+```
+
+准备数据时加：
+
+```bash
+--camera-layout wrist-only \
+--wrist-camera-key observation.images.camera3
+```
+
+默认输出目录名会自动加 `_wrist_only` 后缀，例如：
+
+```text
+outputs/groot_so101_synthetic_datasets/so101_lego_pick_0609_1722_wrist_only
+```
+
+如果你的单相机数据里 wrist 图像不是 `observation.images.camera3`，只需要把
+`--wrist-camera-key` 换成真实 feature key。训练和部署同一个 checkpoint 时必须加载同一份
+wrist-only modality config。
+
 ## 本机 5060 Ti 固定 profile
 
 本机路径固定如下。以后回到这台机器，先复制这一段：
 
 ```bash
 export SMART_PROJECT=/home/yzliu/smart_project
-export GROOT_ROOT=/home/yzliu/Isaac-GR00T
+export GROOT_ROOT=/home/yzliu/Isaac-GR00T-py312
 export LEISAAC_ROOT=/home/yzliu/LeIsaac
 export LEROBOT_ROOT="$SMART_PROJECT/lerobot"
 ```
@@ -251,7 +277,7 @@ conda run -n lerobot python \
 
 ```bash
 cd /home/yzliu/smart_project
-/home/yzliu/Isaac-GR00T/.venv/bin/python \
+/home/yzliu/Isaac-GR00T-py312/.venv/bin/python \
   experiments/groot_n17_isaac_smart_task/full_finetune_so101/train_so101_synthetic_groot.py \
     --skip-prepare \
     --max-steps 1 \

@@ -23,13 +23,14 @@ from typing import Any
 SCRIPT_DIR = Path(__file__).resolve().parent
 EXPERIMENT_ROOT = SCRIPT_DIR.parent
 REPO_ROOT = EXPERIMENT_ROOT.parents[1]
-DEFAULT_GROOT_ROOT = Path(os.environ.get("GROOT_ROOT", "/home/yzliu/Isaac-GR00T"))
+DEFAULT_GROOT_ROOT = Path(
+    os.environ.get("GROOT_ROOT", str(Path.home() / "Isaac-GR00T-py312"))
+).expanduser()
 DEFAULT_PREPARED_ROOT = REPO_ROOT / "outputs" / "groot_so101_synthetic_datasets"
-DEFAULT_PREPARED_DATASETS = (
-    DEFAULT_PREPARED_ROOT / "so101_lego_pick_0609_1722",
-    DEFAULT_PREPARED_ROOT / "so101_lego_pick_0609_1722_mimic",
+DUAL_MODALITY_CONFIG_PATH = EXPERIMENT_ROOT / "full_finetune_so101" / "so101_synthetic_groot_config.py"
+WRIST_ONLY_MODALITY_CONFIG_PATH = (
+    EXPERIMENT_ROOT / "full_finetune_so101" / "so101_synthetic_groot_wrist_only_config.py"
 )
-MODALITY_CONFIG_PATH = EXPERIMENT_ROOT / "full_finetune_so101" / "so101_synthetic_groot_config.py"
 
 DEFAULT_LORA_TARGET_REGEX = (
     r"action_head\.model\..*(to_q|to_k|to_v|to_out\.0|proj_out_1|proj_out_2)$"
@@ -94,9 +95,25 @@ def _run(cmd: list[str], *, cwd: Path, dry_run: bool) -> None:
         subprocess.run(cmd, cwd=cwd, check=True)
 
 
-def _split_path_values(values: list[str] | None) -> list[Path]:
+def _modality_config_path(camera_layout: str) -> Path:
+    if camera_layout == "dual":
+        return DUAL_MODALITY_CONFIG_PATH
+    if camera_layout == "wrist-only":
+        return WRIST_ONLY_MODALITY_CONFIG_PATH
+    raise ValueError(f"Unsupported camera layout: {camera_layout}")
+
+
+def _default_prepared_datasets(camera_layout: str) -> list[Path]:
+    suffix = "" if camera_layout == "dual" else f"_{camera_layout.replace('-', '_')}"
+    return [
+        DEFAULT_PREPARED_ROOT / f"so101_lego_pick_0609_1722{suffix}",
+        DEFAULT_PREPARED_ROOT / f"so101_lego_pick_0609_1722_mimic{suffix}",
+    ]
+
+
+def _split_path_values(values: list[str] | None, camera_layout: str) -> list[Path]:
     if values is None:
-        return [path.resolve() for path in DEFAULT_PREPARED_DATASETS]
+        return [path.resolve() for path in _default_prepared_datasets(camera_layout)]
 
     paths: list[Path] = []
     for value in values:
@@ -123,7 +140,12 @@ def _check_dataset_paths(dataset_paths: list[Path]) -> None:
         raise FileNotFoundError(f"Prepared dataset meta/info.json not found:\n  {joined}")
 
 
-def _generate_stats(dataset_path: Path, groot_root: Path, dry_run: bool) -> None:
+def _generate_stats(
+    dataset_path: Path,
+    groot_root: Path,
+    modality_config_path: Path,
+    dry_run: bool,
+) -> None:
     _run(
         [
             sys.executable,
@@ -133,7 +155,7 @@ def _generate_stats(dataset_path: Path, groot_root: Path, dry_run: bool) -> None
             "--embodiment-tag",
             "NEW_EMBODIMENT",
             "--modality-config-path",
-            str(MODALITY_CONFIG_PATH),
+            str(modality_config_path),
         ],
         cwd=groot_root,
         dry_run=dry_run,
@@ -305,6 +327,12 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=REPO_ROOT / "outputs" / "groot_so101_synthetic_finetune",
     )
+    parser.add_argument(
+        "--camera-layout",
+        choices=("dual", "wrist-only"),
+        default="dual",
+        help="Select the SO101 GR00T modality config and default prepared dataset suffix.",
+    )
     parser.add_argument("--base-model-path", default="nvidia/GR00T-N1.7-3B")
     parser.add_argument("--backbone-model-name", default="nvidia/Cosmos-Reason2-2B")
     parser.add_argument("--embodiment-tag", default="NEW_EMBODIMENT")
@@ -371,7 +399,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    dataset_paths = _split_path_values(args.dataset_path)
+    modality_config_path = _modality_config_path(args.camera_layout).resolve()
+    dataset_paths = _split_path_values(args.dataset_path, args.camera_layout)
     _check_dataset_paths(dataset_paths)
     settings = _strategy_settings(args)
 
@@ -380,15 +409,22 @@ def main() -> None:
 
     if not args.skip_stats:
         for dataset_path in dataset_paths:
-            _generate_stats(dataset_path, args.groot_root.resolve(), args.dry_run)
+            _generate_stats(
+                dataset_path,
+                args.groot_root.resolve(),
+                modality_config_path,
+                args.dry_run,
+            )
 
-    _load_modality_config(MODALITY_CONFIG_PATH)
+    _load_modality_config(modality_config_path)
     _patch_groot_pipeline(args, settings)
     config = _build_config(args, dataset_paths, settings)
 
     print("[config] datasets:")
     for path in dataset_paths:
         print(f"  {path}")
+    print(f"[config] camera_layout: {args.camera_layout}")
+    print(f"[config] modality_config: {modality_config_path}")
     print(f"[config] strategy: {args.strategy}")
     print(f"[config] output_dir: {args.output_dir.resolve()}")
     print(f"[config] experiment_name: {args.experiment_name}")

@@ -25,8 +25,8 @@ canonical 来源：
 # 当前项目目录。里面应该有 experiments/、outputs/ 等。
 export SMART_PROJECT="/home/guest1/smart_project"
 
-# Isaac-GR00T 仓库目录。里面应该有 .venv 或 uv 环境。
-export GROOT_ROOT="/home/guest1/Isaac-GR00T"
+# Isaac-GR00T 仓库目录。当前默认使用 Python 3.12 checkout。
+export GROOT_ROOT="/home/guest1/Isaac-GR00T-py312"
 
 # LeIsaac / LeRobot 源码目录。
 # 本机 canonical:     export LEISAAC_ROOT="$HOME/LeIsaac"
@@ -87,7 +87,7 @@ nvcc --version || true
 ```bash
 # 本机 5060 Ti canonical profile
 export SMART_PROJECT=/home/yzliu/smart_project
-export GROOT_ROOT=/home/yzliu/Isaac-GR00T
+export GROOT_ROOT=/home/yzliu/Isaac-GR00T-py312
 export LEISAAC_ROOT=/home/yzliu/LeIsaac
 export LEISAAC_ASSETS_ROOT="$LEISAAC_ROOT/assets"
 export LEISAAC_ENV=leisaac
@@ -98,7 +98,7 @@ export CUDA_HOME=/usr/local/cuda-12.8
 ```bash
 # 5090 目标机当前 profile：LeIsaac repo 在 smart_project 里面
 export SMART_PROJECT=/home/guest1/smart_project
-export GROOT_ROOT=/home/guest1/Isaac-GR00T
+export GROOT_ROOT=/home/guest1/Isaac-GR00T-py312
 export LEISAAC_ROOT="$SMART_PROJECT/leisaac"
 export LEISAAC_ASSETS_ROOT="$LEISAAC_ROOT/assets"
 export OMNI_KIT_ACCEPT_EULA=YES
@@ -109,6 +109,30 @@ export CUDA_HOME=/usr/local/cuda-13.0
 export LEISAAC_ENV="leisaac"
 ```
 
+公司 AWS / 训练机如果系统 CUDA toolkit 是 13.2，也不要直接套 Thor / Spark 的
+deployment 脚本，除非那台机器真的是对应的 aarch64 平台。官方 GR00T N1.7 当前区分是：
+
+```text
+x86_64 dGPU，例如 H100/L40/4090/5090/AWS GPU -> Python 3.12 + root pyproject + PyTorch cu128 wheels
+Jetson Thor / DGX Spark aarch64                    -> Python 3.12 + scripts/deployment/thor 或 spark 的 cu13 栈
+```
+
+所以 AWS x86 GPU 上仍先走本文件第 5 节的 `uv sync --python 3.12`。如果只是推理或
+普通训练入口，看到 `torch.version.cuda` 是 `12.8` 是正常的，它表示 PyTorch wheel
+的用户态 CUDA 运行时，不等于机器不能有 `/usr/local/cuda-13.2`。只有当 DeepSpeed /
+CUDA extension 明确需要 `nvcc` 时，才把 `CUDA_HOME` 指向那台机器真实存在的 toolkit，
+例如：
+
+```bash
+export CUDA_HOME=/usr/local/cuda-13.2
+export PATH="$CUDA_HOME/bin:$PATH"
+export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
+```
+
+如果编译类错误显示 CUDA 13.2 与 PyTorch cu128 wheel 不兼容，优先记录错误并改用官方
+dGPU/容器路径或 CUDA 12.8 toolkit，不要把 Thor / Spark 的 aarch64 cu13 依赖栈强行装到
+x86 AWS 主机。
+
 不要把下面三类东西混成一个 Python 环境：
 
 ```text
@@ -118,6 +142,9 @@ LeRobot conda：LeRobot dataset / 数据转换 / 可视化，也就是 $LEROBOT_
 ```
 
 canonical 本机已经验证过：Isaac runtime env 里 **不安装 LeRobot** 是正确状态。`lerobot: NOT FOUND` 在 `$LEISAAC_ENV` 中不是错误。
+
+当前 GR00T 默认是 `~/Isaac-GR00T-py312` / Python 3.12。旧的
+`~/Isaac-GR00T` / Python 3.10 只保留作回滚点，不再作为新实验的默认 `GROOT_ROOT`。
 
 ## 1. 先决定这台机器要承担什么
 
@@ -284,8 +311,8 @@ cd "$GROOT_ROOT"
 curl -LsSf https://astral.sh/uv/install.sh | sh
 source "$HOME/.local/bin/env"
 
-uv sync --python 3.10
-uv pip install -e .
+export UV_HTTP_TIMEOUT=300
+uv sync --python 3.12
 ```
 
 如果已经有 `$GROOT_ROOT/.venv`，只做验证：
@@ -318,6 +345,19 @@ GR00T import 验证：
 
 ```bash
 "$GROOT_ROOT/.venv/bin/python" -c "import gr00t; print('GR00T import ok')"
+```
+
+官方 open-loop smoke：
+
+```bash
+cd "$GROOT_ROOT"
+uv run python scripts/deployment/standalone_inference_script.py \
+  --model-path nvidia/GR00T-N1.7-3B \
+  --dataset-path demo_data/droid_sample \
+  --embodiment-tag OXE_DROID_RELATIVE_EEF_RELATIVE_JOINT \
+  --traj-ids 1 2 \
+  --inference-mode pytorch \
+  --execution-horizon 8
 ```
 
 ## 6. LeRobot 数据转换环境
@@ -848,7 +888,7 @@ PY
 conda deactivate 2>/dev/null || true
 unset PYTHONPATH PYTHONHOME PYTHONNOUSERSITE PYTHONDONTWRITEBYTECODE ISAAC_PATH ISAACLAB_PATH
 export SMART_PROJECT="/home/guest1/smart_project"
-export GROOT_ROOT="/home/guest1/Isaac-GR00T"
+export GROOT_ROOT="/home/guest1/Isaac-GR00T-py312"
 
 export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda-13.0}"
 if [ ! -x "$CUDA_HOME/bin/nvcc" ] && [ -x /usr/local/cuda/bin/nvcc ]; then
@@ -896,7 +936,7 @@ PY
 conda deactivate 2>/dev/null || true
 unset PYTHONPATH PYTHONHOME PYTHONNOUSERSITE PYTHONDONTWRITEBYTECODE ISAAC_PATH ISAACLAB_PATH
 export SMART_PROJECT="/home/guest1/smart_project"
-export GROOT_ROOT="/home/guest1/Isaac-GR00T"
+export GROOT_ROOT="/home/guest1/Isaac-GR00T-py312"
 
 cd "$SMART_PROJECT"
 "$GROOT_ROOT/.venv/bin/python" \
@@ -951,7 +991,7 @@ host/port 形式的本地 TCP API，默认 `127.0.0.1:5577`；如果你已有 AP
 conda deactivate 2>/dev/null || true
 unset PYTHONPATH PYTHONHOME PYTHONNOUSERSITE PYTHONDONTWRITEBYTECODE ISAAC_PATH ISAACLAB_PATH
 export SMART_PROJECT="/home/guest1/smart_project"
-export GROOT_ROOT="/home/guest1/Isaac-GR00T"
+export GROOT_ROOT="/home/guest1/Isaac-GR00T-py312"
 export CHECKPOINT="__FILL_FINETUNED_CHECKPOINT_DIR__"
 
 cd "$SMART_PROJECT"
