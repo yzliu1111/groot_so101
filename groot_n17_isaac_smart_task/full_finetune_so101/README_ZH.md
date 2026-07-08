@@ -126,12 +126,91 @@ outputs/groot_so101_synthetic_datasets/custom/pick_only/run_a
 
 这样 v3 源数据和 v2.1 prepared 数据都按任务树组织，不需要把所有数据集摊平成一个目录。
 
+### 相机输入选择
+
+`train_so101_synthetic_groot.py` 已经支持双相机和 wrist 单相机两种转换形态。这里的参数要在
+prepared 数据阶段就定下来，因为它会同时影响：
+
+- prepared 数据里保留哪些 video feature。
+- `meta/modality.json` 里 `video.top` / `video.wrist` 指向哪些原始图像 key。
+- 后续 GR00T stats / fine-tune 使用哪份 modality config。
+
+默认双相机输入是：
+
+```text
+observation.images.camera1 -> video.top
+observation.images.camera3 -> video.wrist
+```
+
+如果你的双相机数据不是这两个 key，要显式指定：
+
+```bash
+cd /home/yzliu/smart_project
+conda run -n lerobot python \
+  experiments/groot_n17_isaac_smart_task/full_finetune_so101/train_so101_synthetic_groot.py \
+    --source-root "$SMART_PROJECT/dataset/custom" \
+    --prepared-root "$SMART_PROJECT/outputs/groot_so101_synthetic_datasets/custom_dual" \
+    --camera-layout dual \
+    --front-camera-key observation.images.front \
+    --wrist-camera-key observation.images.wrist \
+    --force-prepare \
+    --skip-stats \
+    --prepare-only
+```
+
+`--front-camera-key` 是 `--top-camera-key` 的别名；GR00T 配置里仍然叫 `video.top`，因为这里表示
+front/top/global 这一类非腕部视角。
+
+如果数据只有 wrist 单相机，使用 wrist-only 转换：
+
+```bash
+cd /home/yzliu/smart_project
+conda run -n lerobot python \
+  experiments/groot_n17_isaac_smart_task/full_finetune_so101/train_so101_synthetic_groot.py \
+    --source-root "$SMART_PROJECT/dataset/custom_wrist_only" \
+    --prepared-root "$SMART_PROJECT/outputs/groot_so101_synthetic_datasets/custom_wrist_only" \
+    --camera-layout wrist-only \
+    --wrist-camera-key observation.images.wrist \
+    --force-prepare \
+    --skip-stats \
+    --prepare-only
+```
+
+wrist-only 输出目录的叶子数据集名会自动加 `_wrist_only` 后缀，例如：
+
+```text
+outputs/groot_so101_synthetic_datasets/custom_wrist_only/pick_only/run_a_wrist_only
+```
+
+注意：同一轮 `--source-root` 递归转换使用同一组 camera key。也就是说，如果一个任务目录下不同数据集的
+camera feature 名字不一致，应当分批转换，或先把 v3 数据集里的 feature key 规范成统一名字；不要把
+不同 camera schema 的数据集混在同一个转换命令里。
+
 第二阶段：在 GR00T venv 里生成统计并启动 fine-tune 入口。
 
 ```bash
 cd /home/yzliu/smart_project
 /home/yzliu/Isaac-GR00T-py312/.venv/bin/python \
   experiments/groot_n17_isaac_smart_task/full_finetune_so101/train_so101_synthetic_groot.py \
+    --skip-prepare \
+    --max-steps 2000 \
+    --save-steps 500 \
+    --global-batch-size 32
+```
+
+如果第一阶段使用了 `--source-root`、`--prepared-root`、`--camera-layout` 或自定义 camera key，第二阶段也要传入
+同一组路径和 `--camera-layout`。`--skip-prepare` 只表示“不重新写 prepared 数据”，不是“忽略数据选择参数”。
+
+例如 wrist-only 数据的 stats / fine-tune 入口应当这样启动：
+
+```bash
+cd /home/yzliu/smart_project
+/home/yzliu/Isaac-GR00T-py312/.venv/bin/python \
+  experiments/groot_n17_isaac_smart_task/full_finetune_so101/train_so101_synthetic_groot.py \
+    --source-root "$SMART_PROJECT/dataset/custom_wrist_only" \
+    --prepared-root "$SMART_PROJECT/outputs/groot_so101_synthetic_datasets/custom_wrist_only" \
+    --camera-layout wrist-only \
+    --wrist-camera-key observation.images.wrist \
     --skip-prepare \
     --max-steps 2000 \
     --save-steps 500 \
@@ -287,7 +366,8 @@ Isaac / LeIsaac 自检放在 zero-shot 文档里，因为它属于仿真部署�
 
 ## 本机 5060 Ti：推荐命令
 
-先准备 prepared copy：
+先准备默认双相机 prepared copy。默认使用 `observation.images.camera1` 作为 front/top，
+`observation.images.camera3` 作为 wrist：
 
 ```bash
 cd /home/yzliu/smart_project
@@ -299,7 +379,21 @@ conda run -n lerobot python \
     --prepare-only
 ```
 
-只做 1 episode metadata/video smoke：
+如果只准备 wrist 单相机 prepared copy，要显式使用 `--camera-layout wrist-only`：
+
+```bash
+cd /home/yzliu/smart_project
+conda run -n lerobot python \
+  experiments/groot_n17_isaac_smart_task/full_finetune_so101/train_so101_synthetic_groot.py \
+    --camera-layout wrist-only \
+    --wrist-camera-key observation.images.camera3 \
+    --instruction "Pick up the red 2x4 lego brick." \
+    --force-prepare \
+    --skip-stats \
+    --prepare-only
+```
+
+只做默认双相机 1 episode metadata/video smoke：
 
 ```bash
 cd /home/yzliu/smart_project
@@ -312,12 +406,42 @@ conda run -n lerobot python \
     --instruction "Pick up the red 2x4 lego brick."
 ```
 
-在 GR00T venv 里跑 stats / 最小 fine-tune smoke：
+只做 wrist 单相机 1 episode metadata/video smoke：
+
+```bash
+cd /home/yzliu/smart_project
+conda run -n lerobot python \
+  experiments/groot_n17_isaac_smart_task/full_finetune_so101/train_so101_synthetic_groot.py \
+    --camera-layout wrist-only \
+    --wrist-camera-key observation.images.camera3 \
+    --max-episodes 1 \
+    --force-prepare \
+    --skip-stats \
+    --prepare-only \
+    --instruction "Pick up the red 2x4 lego brick."
+```
+
+在 GR00T venv 里跑默认双相机 stats / 最小 fine-tune smoke：
 
 ```bash
 cd /home/yzliu/smart_project
 /home/yzliu/Isaac-GR00T-py312/.venv/bin/python \
   experiments/groot_n17_isaac_smart_task/full_finetune_so101/train_so101_synthetic_groot.py \
+    --skip-prepare \
+    --max-steps 1 \
+    --save-steps 1 \
+    --global-batch-size 1 \
+    --gradient-accumulation-steps 1
+```
+
+在 GR00T venv 里跑 wrist 单相机 stats / 最小 fine-tune smoke：
+
+```bash
+cd /home/yzliu/smart_project
+/home/yzliu/Isaac-GR00T-py312/.venv/bin/python \
+  experiments/groot_n17_isaac_smart_task/full_finetune_so101/train_so101_synthetic_groot.py \
+    --camera-layout wrist-only \
+    --wrist-camera-key observation.images.camera3 \
     --skip-prepare \
     --max-steps 1 \
     --save-steps 1 \
