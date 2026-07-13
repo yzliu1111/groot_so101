@@ -485,7 +485,7 @@ Isaac 侧的 `build_oxe_observation()` 把 LeIsaac observation 映射成这个 s
 
 ### 6.1 图像映射
 
-runner 使用两路图像，但现在按 role 映射，不按固定 camera 编号理解：
+runner 按相机语义 role 映射，不把固定 camera 编号当成语义：
 
 ```text
 zero-shot OXE:
@@ -493,28 +493,38 @@ zero-shot OXE:
   role wrist    -> GR00T video.wrist_image_left
 
 SO101 finetuned NEW_EMBODIMENT:
-  role top      -> GR00T video.top
-  role wrist    -> GR00T video.wrist
+  wrist-only -> GR00T video.wrist
+  dual       -> GR00T video.top + video.wrist
+  triple     -> GR00T video.top + video.left + video.wrist
 ```
 
-默认 `--camera-profile auto` 会在 reset 后打印实际解析结果，例如新版 SO101 live 场景通常是：
+这里有三套不同名字，不能混用：
 
 ```text
-mapping={'exterior': 'camera3', 'top': 'camera3', 'wrist': 'camera2'}
+训练数据 feature: observation.images.camera1 / camera2 / camera3
+GR00T 稳定语义:    video.top / video.left / video.wrist
+Isaac live key:    camera3 / camera1 / camera2
 ```
 
-这表示：当前 live 场景里的 `camera3` 承担 top/global 视角，`camera2` 承担 wrist 视角。
-如果你刻意使用旧版 `leisaac2`，auto 会落到 legacy profile：
+当前同事 LeIsaac 的默认 live 映射是：
 
 ```text
-mapping={'exterior': 'camera1', 'top': 'camera1', 'wrist': 'camera3'}
+camera3 -> video.top   (front/top)
+camera1 -> video.left  (left)
+camera2 -> video.wrist (wrist)
 ```
 
-如果 auto 判断不符合现场，可以显式覆盖：
+部署参数只写 `obs["policy"]` 里的短 key：
 
 ```bash
---top-camera-key camera3 --wrist-camera-key camera2
+--front-observation-key camera3 \
+--left-observation-key camera1 \
+--wrist-observation-key camera2
 ```
+
+旧参数 `--top-camera-key` / `--front-camera-key` / `--left-camera-key` /
+`--wrist-camera-key` 保留为兼容别名。runner reset 后会逐行打印
+`Isaac obs['policy'][...] -> GR00T video...`，并在请求模型前检查 key 是否存在。
 
 调试相机时可以运行：
 
@@ -899,6 +909,7 @@ cd "$SMART_PROJECT"
 "$GROOT_ROOT/.venv/bin/python" \
   experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task/groot_bridge_server.py \
     --deployment-mode so101-finetuned \
+    --camera-layout dual \
     --model-path "$CHECKPOINT" \
     --host 127.0.0.1 \
     --port 5577 \
@@ -921,6 +932,9 @@ export PYTHONNOUSERSITE=1
 
 python experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task/run_smart_task_closed_loop.py \
   --deployment-mode so101-finetuned \
+  --camera-layout dual \
+  --front-observation-key camera3 \
+  --wrist-observation-key camera2 \
   --robot so101 \
   --control-mode joint \
   --headless \
@@ -936,6 +950,9 @@ export BRIDGE_PORT="${BRIDGE_PORT:-5577}"
 
 python experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task/run_smart_task_closed_loop.py \
   --deployment-mode so101-finetuned \
+  --camera-layout dual \
+  --front-observation-key camera3 \
+  --wrist-observation-key camera2 \
   --robot so101 \
   --control-mode joint \
   --bridge-host "$BRIDGE_HOST" \
@@ -951,6 +968,9 @@ python experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task/run_sma
 ```bash
 python experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task/run_smart_task_closed_loop.py \
   --deployment-mode so101-finetuned \
+  --camera-layout dual \
+  --front-observation-key camera3 \
+  --wrist-observation-key camera2 \
   --robot so101 \
   --control-mode joint \
   --bridge-host "$BRIDGE_HOST" \
@@ -963,6 +983,26 @@ python experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task/run_sma
   --capture-name so101_finetuned_checkpoint_probe \
   --instruction "Pick up the red 2x4 lego brick."
 ```
+
+上面是 dual 示例。checkpoint 使用哪种训练布局，bridge 和 runner 就必须同时使用同一种布局：
+
+```text
+wrist-only:
+  bridge --camera-layout wrist-only
+  runner --camera-layout wrist-only --wrist-observation-key camera2
+
+dual:
+  bridge --camera-layout dual
+  runner --camera-layout dual --front-observation-key camera3 --wrist-observation-key camera2
+
+triple:
+  bridge --camera-layout triple
+  runner --camera-layout triple --front-observation-key camera3 \
+         --left-observation-key camera1 --wrist-observation-key camera2
+```
+
+bridge 会报告实际 modality；runner 会检查它是否分别等于 `[wrist]`、`[top,wrist]` 或
+`[top,left,wrist]`。两边布局不一致时，在第一次模型请求前直接退出。
 
 如果动作幅度太大或方向需要先保守观察，可以先加：
 

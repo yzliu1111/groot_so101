@@ -219,7 +219,9 @@ outputs/groot_so101_synthetic_datasets/so101_lego_pick_0609_1722_mimic
 --prepared-root "$SMART_PROJECT/outputs/groot_so101_synthetic_datasets/custom"
 ```
 
-脚本会选择下面所有带 `meta/info.json` 和 `meta/modality.json` 的 prepared LeRobot 数据集。
+脚本会选择下面所有带 `meta/info.json` 和 `meta/modality.json` 的 prepared LeRobot 数据集，并检查
+每个数据集的 video keys 是否与 `--camera-layout` 一致。不要把 wrist-only、dual、triple prepared
+数据集放在同一次递归扫描范围内；不一致时脚本会在训练前列出具体路径并退出。
 
 ## 输出、日志和部署边界
 
@@ -349,19 +351,20 @@ model_path = nvidia/GR00T-N1.7-3B
 embodiment_tag = OXE_DROID_RELATIVE_EEF_RELATIVE_JOINT
 ```
 
-而 SO101 微调用的是：
+而 SO101 微调按 `--camera-layout` 使用三种 video schema：
 
 ```text
 embodiment_tag = NEW_EMBODIMENT
-modality config = full_finetune_so101/so101_synthetic_groot_config.py
-video keys = top / wrist
+wrist-only -> video.wrist
+dual       -> video.top / video.wrist
+triple     -> video.top / video.left / video.wrist
 state keys = single_arm / gripper
 action keys = single_arm / gripper
 ```
 
 所以不能只把 `--model-path` 换成 checkpoint 就结束。至少还要做三件事：
 
-1. bridge 在创建 `Gr00tPolicy` 前加载同一个 `so101_synthetic_groot_config.py`，否则 `NEW_EMBODIMENT` 不知道有哪些 modality。
+1. bridge 在创建 `Gr00tPolicy` 前加载与训练 layout 对应的 modality config，否则 `NEW_EMBODIMENT` 不知道有哪些 video modality。
 2. Isaac runner 发送给 bridge 的 observation 要从 OXE/DROID schema 改成 SO101 `NEW_EMBODIMENT` schema。
 3. bridge / runner 的 action 解码要读取训练后的 `action.single_arm` 和 `action.gripper`，而不是 zero-shot OXE/DROID 的 `action.eef_9d` / `action.joint_position`。
 
@@ -372,17 +375,21 @@ action keys = single_arm / gripper
 ```text
 训练 prepared 数据:
   observation.images.camera1 -> video.top
+  observation.images.camera2 -> video.left（triple 才使用）
   observation.images.camera3 -> video.wrist
 
 当前新版 leisaac live 场景:
-  camera3 -> role top
-  camera2 -> role wrist
+  camera3 -> video.top
+  camera1 -> video.left（triple 才使用）
+  camera2 -> video.wrist
 ```
 
-runner 的 `--camera-profile auto` 会在 reset 后打印实际 mapping。新版 SO101 live 场景期望看到：
+runner reset 后会打印实际映射。triple 模式期望看到：
 
 ```text
-mapping={'exterior': 'camera3', 'top': 'camera3', 'wrist': 'camera2'}
+Isaac obs['policy']['camera3'] -> GR00T video.top
+Isaac obs['policy']['camera1'] -> GR00T video.left
+Isaac obs['policy']['camera2'] -> GR00T video.wrist
 ```
 
 也就是说，checkpoint 的 schema 仍然是 `video.top/video.wrist`，但 live camera key 由 runner
@@ -403,6 +410,10 @@ full_finetune_so101/so101_synthetic_groot_wrist_only_config.py
 默认 prepared dataset 路径也会切到 `_wrist_only` 后缀。wrist-only checkpoint 后续部署时同样必须加载
 这份 wrist-only modality config，不能再按 `video.top/video.wrist` 的双相机 schema 解释。
 
+三路相机训练使用 `--camera-layout triple`，lowmem 脚本会加载
+`full_finetune_so101/so101_synthetic_groot_triple_config.py`，默认 prepared dataset 叶子目录使用
+`_triple` 后缀。bridge 和 runner 部署时也必须同时选择 `triple`。
+
 终端 1：启动 GR00T bridge，加载训练后的 checkpoint 和 SO101 modality config。
 
 checkpoint 很大时，让它留在训练/目标 Ubuntu 机器本地即可。bridge 负责加载权重并暴露
@@ -419,6 +430,7 @@ cd "$SMART_PROJECT"
 "$GROOT_ROOT/.venv/bin/python" \
   experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task/groot_bridge_server.py \
     --deployment-mode so101-finetuned \
+    --camera-layout dual \
     --model-path "$CHECKPOINT" \
     --host 127.0.0.1 \
     --port 5577 \
@@ -447,6 +459,9 @@ export BRIDGE_PORT="${BRIDGE_PORT:-5577}"
 
 python experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task/run_smart_task_closed_loop.py \
   --deployment-mode so101-finetuned \
+  --camera-layout dual \
+  --front-observation-key camera3 \
+  --wrist-observation-key camera2 \
   --robot so101 \
   --control-mode joint \
   --bridge-host "$BRIDGE_HOST" \
@@ -476,6 +491,9 @@ export PYTHONNOUSERSITE=1
 
 python experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task/run_smart_task_closed_loop.py \
   --deployment-mode so101-finetuned \
+  --camera-layout dual \
+  --front-observation-key camera3 \
+  --wrist-observation-key camera2 \
   --robot so101 \
   --control-mode joint \
   --bridge-host "$BRIDGE_HOST" \
@@ -488,6 +506,23 @@ python experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task/run_sma
   --capture-name so101_projector_only_checkpoint_2000 \
   --instruction "Pick up the red 2x4 lego brick."
 ```
+
+上面命令以 dual 为例。wrist-only 改为：
+
+```text
+bridge: --camera-layout wrist-only
+runner: --camera-layout wrist-only --wrist-observation-key camera2
+```
+
+triple 改为：
+
+```text
+bridge: --camera-layout triple
+runner: --camera-layout triple --front-observation-key camera3 \
+        --left-observation-key camera1 --wrist-observation-key camera2
+```
+
+bridge 和 runner 的 `--camera-layout` 必须与训练 checkpoint 一致。
 
 如果动作太猛，先加保守执行参数看趋势：
 

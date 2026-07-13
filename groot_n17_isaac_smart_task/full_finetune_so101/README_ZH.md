@@ -128,11 +128,11 @@ outputs/groot_so101_synthetic_datasets/custom/pick_only/run_a
 
 ### 相机输入选择
 
-`train_so101_synthetic_groot.py` 已经支持双相机和 wrist 单相机两种转换形态。这里的参数要在
+`train_so101_synthetic_groot.py` 支持 `wrist-only`、`dual`、`triple` 三种转换形态。这里的参数要在
 prepared 数据阶段就定下来，因为它会同时影响：
 
 - prepared 数据里保留哪些 video feature。
-- `meta/modality.json` 里 `video.top` / `video.wrist` 指向哪些原始图像 key。
+- `meta/modality.json` 里 `video.top` / `video.left` / `video.wrist` 指向哪些原始图像 key。
 - 后续 GR00T stats / fine-tune 使用哪份 modality config。
 
 默认双相机输入是：
@@ -151,15 +151,41 @@ conda run -n lerobot python \
     --source-root "$SMART_PROJECT/dataset/custom" \
     --prepared-root "$SMART_PROJECT/outputs/groot_so101_synthetic_datasets/custom_dual" \
     --camera-layout dual \
-    --front-camera-key observation.images.front \
-    --wrist-camera-key observation.images.wrist \
+    --dataset-front-camera-key observation.images.front \
+    --dataset-wrist-camera-key observation.images.wrist \
     --force-prepare \
     --skip-stats \
     --prepare-only
 ```
 
-`--front-camera-key` 是 `--top-camera-key` 的别名；GR00T 配置里仍然叫 `video.top`，因为这里表示
-front/top/global 这一类非腕部视角。
+GR00T 配置里仍然叫 `video.top`，因为这里表示 front/top/global 这一类非腕部视角。
+旧参数 `--front-camera-key` / `--top-camera-key` / `--wrist-camera-key` 仍保留为兼容别名。
+
+如果三路图像全部用于训练，使用 `triple`，并明确指定 front/top、left、wrist 三个完整 feature key：
+
+```bash
+conda run -n lerobot python \
+  experiments/groot_n17_isaac_smart_task/full_finetune_so101/train_so101_synthetic_groot.py \
+    --source-root "$SMART_PROJECT/dataset/custom" \
+    --prepared-root "$SMART_PROJECT/outputs/groot_so101_synthetic_datasets/custom_triple" \
+    --camera-layout triple \
+    --dataset-front-camera-key observation.images.camera1 \
+    --dataset-left-camera-key observation.images.camera2 \
+    --dataset-wrist-camera-key observation.images.camera3 \
+    --force-prepare \
+    --skip-stats \
+    --prepare-only
+```
+
+这个命令写入的语义映射是：
+
+```text
+observation.images.camera1 -> video.top
+observation.images.camera2 -> video.left
+observation.images.camera3 -> video.wrist
+```
+
+`triple` 输出目录的叶子数据集名自动加 `_triple` 后缀，避免覆盖默认 dual prepared copy。
 
 如果数据只有 wrist 单相机，使用 wrist-only 转换：
 
@@ -170,7 +196,7 @@ conda run -n lerobot python \
     --source-root "$SMART_PROJECT/dataset/custom_wrist_only" \
     --prepared-root "$SMART_PROJECT/outputs/groot_so101_synthetic_datasets/custom_wrist_only" \
     --camera-layout wrist-only \
-    --wrist-camera-key observation.images.wrist \
+    --dataset-wrist-camera-key observation.images.wrist \
     --force-prepare \
     --skip-stats \
     --prepare-only
@@ -210,7 +236,7 @@ cd /home/yzliu/smart_project
     --source-root "$SMART_PROJECT/dataset/custom_wrist_only" \
     --prepared-root "$SMART_PROJECT/outputs/groot_so101_synthetic_datasets/custom_wrist_only" \
     --camera-layout wrist-only \
-    --wrist-camera-key observation.images.wrist \
+    --dataset-wrist-camera-key observation.images.wrist \
     --skip-prepare \
     --max-steps 2000 \
     --save-steps 500 \
@@ -293,7 +319,7 @@ language:
   annotation.human.task_description
 ```
 
-训练相机映射是：
+默认 dual 训练相机映射是：
 
 ```text
 observation.images.camera1 -> video.top
@@ -309,11 +335,21 @@ observation.images.camera2 -> 不送入 GR00T 微调
 experiments/groot_n17_isaac_smart_task/full_finetune_so101/so101_synthetic_groot_wrist_only_config.py
 ```
 
+三路相机全部输入时使用：
+
+```text
+experiments/groot_n17_isaac_smart_task/full_finetune_so101/so101_synthetic_groot_triple_config.py
+
+video.top   <- front/top dataset feature
+video.left  <- left dataset feature
+video.wrist <- wrist dataset feature
+```
+
 准备数据时加：
 
 ```bash
 --camera-layout wrist-only \
---wrist-camera-key observation.images.camera3
+--dataset-wrist-camera-key observation.images.camera3
 ```
 
 默认输出目录名会自动加 `_wrist_only` 后缀，例如：
@@ -329,7 +365,7 @@ outputs/groot_so101_synthetic_datasets/custom/pick_only/run_a_wrist_only
 ```
 
 如果你的单相机数据里 wrist 图像不是 `observation.images.camera3`，只需要把
-`--wrist-camera-key` 换成真实 feature key。训练和部署同一个 checkpoint 时必须加载同一份
+`--dataset-wrist-camera-key` 换成真实 feature key。训练和部署同一个 checkpoint 时必须加载同一份
 wrist-only modality config。
 
 ## 本机 5060 Ti 固定 profile
@@ -386,7 +422,23 @@ cd /home/yzliu/smart_project
 conda run -n lerobot python \
   experiments/groot_n17_isaac_smart_task/full_finetune_so101/train_so101_synthetic_groot.py \
     --camera-layout wrist-only \
-    --wrist-camera-key observation.images.camera3 \
+    --dataset-wrist-camera-key observation.images.camera3 \
+    --instruction "Pick up the red 2x4 lego brick." \
+    --force-prepare \
+    --skip-stats \
+    --prepare-only
+```
+
+如果准备三路相机 prepared copy：
+
+```bash
+cd /home/yzliu/smart_project
+conda run -n lerobot python \
+  experiments/groot_n17_isaac_smart_task/full_finetune_so101/train_so101_synthetic_groot.py \
+    --camera-layout triple \
+    --dataset-front-camera-key observation.images.camera1 \
+    --dataset-left-camera-key observation.images.camera2 \
+    --dataset-wrist-camera-key observation.images.camera3 \
     --instruction "Pick up the red 2x4 lego brick." \
     --force-prepare \
     --skip-stats \
@@ -413,7 +465,7 @@ cd /home/yzliu/smart_project
 conda run -n lerobot python \
   experiments/groot_n17_isaac_smart_task/full_finetune_so101/train_so101_synthetic_groot.py \
     --camera-layout wrist-only \
-    --wrist-camera-key observation.images.camera3 \
+    --dataset-wrist-camera-key observation.images.camera3 \
     --max-episodes 1 \
     --force-prepare \
     --skip-stats \
@@ -441,7 +493,7 @@ cd /home/yzliu/smart_project
 /home/yzliu/Isaac-GR00T-py312/.venv/bin/python \
   experiments/groot_n17_isaac_smart_task/full_finetune_so101/train_so101_synthetic_groot.py \
     --camera-layout wrist-only \
-    --wrist-camera-key observation.images.camera3 \
+    --dataset-wrist-camera-key observation.images.camera3 \
     --skip-prepare \
     --max-steps 1 \
     --save-steps 1 \

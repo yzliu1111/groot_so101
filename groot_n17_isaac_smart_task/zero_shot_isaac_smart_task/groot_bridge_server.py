@@ -37,7 +37,18 @@ EXPERIMENT_ROOT = SCRIPT_DIR.parent
 DEFAULT_BASE_MODEL_PATH = "nvidia/GR00T-N1.7-3B"
 DEFAULT_ZERO_SHOT_EMBODIMENT = "OXE_DROID_RELATIVE_EEF_RELATIVE_JOINT"
 FINETUNED_SO101_EMBODIMENT = "NEW_EMBODIMENT"
-DEFAULT_SO101_MODALITY_CONFIG = EXPERIMENT_ROOT / "full_finetune_so101" / "so101_synthetic_groot_config.py"
+SO101_MODALITY_CONFIGS = {
+    "dual": EXPERIMENT_ROOT / "full_finetune_so101" / "so101_synthetic_groot_config.py",
+    "wrist-only": (
+        EXPERIMENT_ROOT / "full_finetune_so101" / "so101_synthetic_groot_wrist_only_config.py"
+    ),
+    "triple": EXPERIMENT_ROOT / "full_finetune_so101" / "so101_synthetic_groot_triple_config.py",
+}
+SO101_VIDEO_KEYS = {
+    "wrist-only": ("wrist",),
+    "dual": ("top", "wrist"),
+    "triple": ("top", "left", "wrist"),
+}
 
 # 把当前目录插入 sys.path，是为了让 bridge 可以 import 同目录下的 wire.py。
 # 这里不用安装成包，保持实验脚本轻量、可直接复制。
@@ -137,6 +148,23 @@ def _summarize_modality(policy: Any) -> dict[str, Any]:
     return summary
 
 
+def _validate_so101_camera_layout(args: argparse.Namespace, modality: dict[str, Any]) -> None:
+    """Fail before serving when the checkpoint schema and requested layout differ."""
+
+    if args.deployment_mode != "so101-finetuned":
+        return
+
+    actual_video_keys = tuple(modality.get("video", {}).get("modality_keys", ()))
+    expected_video_keys = SO101_VIDEO_KEYS[args.camera_layout]
+    if actual_video_keys != expected_video_keys:
+        raise ValueError(
+            "SO101 camera layout does not match the loaded GR00T modality config: "
+            f"layout={args.camera_layout!r} expected_video_keys={list(expected_video_keys)} "
+            f"actual_video_keys={list(actual_video_keys)} "
+            f"modality_config={args.modality_config_path}"
+        )
+
+
 def serve(args: argparse.Namespace) -> None:
     """启动 bridge server 主循环。
 
@@ -154,8 +182,11 @@ def serve(args: argparse.Namespace) -> None:
 
     print("[bridge] loading GR00T policy...", flush=True)
     policy = _load_policy(args)
+    modality = _summarize_modality(policy)
+    _validate_so101_camera_layout(args, modality)
     print("[bridge] policy loaded", flush=True)
-    print(f"[bridge] modality: {_summarize_modality(policy)}", flush=True)
+    print(f"[bridge] camera layout: {args.camera_layout}", flush=True)
+    print(f"[bridge] modality: {modality}", flush=True)
 
     # `AF_INET` 表示 IPv4；`SOCK_STREAM` 表示 TCP。
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
@@ -182,7 +213,14 @@ def serve(args: argparse.Namespace) -> None:
 
                     if endpoint == "ping":
                         # 健康检查：返回 ok 和 modality summary。
-                        send_message(conn, {"ok": True, "modality": _summarize_modality(policy)})
+                        send_message(
+                            conn,
+                            {
+                                "ok": True,
+                                "camera_layout": args.camera_layout,
+                                "modality": modality,
+                            },
+                        )
 
                     elif endpoint == "reset":
                         # 预留接口：如果 policy 内部有历史状态，可以通过 reset 清掉。
@@ -236,6 +274,16 @@ def parse_args() -> argparse.Namespace:
         ),
     )
 
+    parser.add_argument(
+        "--camera-layout",
+        choices=("wrist-only", "dual", "triple"),
+        default="dual",
+        help=(
+            "SO101 finetuned video schema: wrist-only=[wrist], "
+            "dual=[top,wrist], triple=[top,left,wrist]."
+        ),
+    )
+
     # GR00T 模型路径。可以是 HuggingFace repo id，也可以是本地 checkpoint 目录。
     parser.add_argument("--model-path", default=DEFAULT_BASE_MODEL_PATH)
 
@@ -282,7 +330,9 @@ def parse_args() -> argparse.Namespace:
         else:
             args.embodiment_tag = FINETUNED_SO101_EMBODIMENT
         if args.modality_config_path is None:
-            args.modality_config_path = str(DEFAULT_SO101_MODALITY_CONFIG)
+            args.modality_config_path = str(SO101_MODALITY_CONFIGS[args.camera_layout])
+    elif args.camera_layout != "dual":
+        parser.error("--camera-layout wrist-only/triple requires --deployment-mode so101-finetuned")
 
     return args
 

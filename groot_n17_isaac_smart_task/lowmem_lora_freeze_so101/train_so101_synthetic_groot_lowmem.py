@@ -31,6 +31,14 @@ DUAL_MODALITY_CONFIG_PATH = EXPERIMENT_ROOT / "full_finetune_so101" / "so101_syn
 WRIST_ONLY_MODALITY_CONFIG_PATH = (
     EXPERIMENT_ROOT / "full_finetune_so101" / "so101_synthetic_groot_wrist_only_config.py"
 )
+TRIPLE_MODALITY_CONFIG_PATH = (
+    EXPERIMENT_ROOT / "full_finetune_so101" / "so101_synthetic_groot_triple_config.py"
+)
+CAMERA_LAYOUT_VIDEO_KEYS = {
+    "wrist-only": ("wrist",),
+    "dual": ("top", "wrist"),
+    "triple": ("top", "left", "wrist"),
+}
 
 DEFAULT_LORA_TARGET_REGEX = (
     r"action_head\.model\..*(to_q|to_k|to_v|to_out\.0|proj_out_1|proj_out_2)$"
@@ -121,6 +129,8 @@ def _modality_config_path(camera_layout: str) -> Path:
         return DUAL_MODALITY_CONFIG_PATH
     if camera_layout == "wrist-only":
         return WRIST_ONLY_MODALITY_CONFIG_PATH
+    if camera_layout == "triple":
+        return TRIPLE_MODALITY_CONFIG_PATH
     raise ValueError(f"Unsupported camera layout: {camera_layout}")
 
 
@@ -166,14 +176,29 @@ def _json_object(value: str) -> dict[str, Any]:
     return parsed
 
 
-def _check_dataset_paths(dataset_paths: list[Path]) -> None:
+def _check_dataset_paths(dataset_paths: list[Path], camera_layout: str) -> None:
     missing: list[Path] = []
     for path in dataset_paths:
-        if not (path / "meta" / "info.json").exists():
+        if not (path / "meta" / "info.json").exists() or not (path / "meta" / "modality.json").exists():
             missing.append(path)
     if missing:
         joined = "\n  ".join(str(path) for path in missing)
-        raise FileNotFoundError(f"Prepared dataset meta/info.json not found:\n  {joined}")
+        raise FileNotFoundError(f"Prepared dataset meta/info.json or meta/modality.json not found:\n  {joined}")
+
+    expected_video_keys = CAMERA_LAYOUT_VIDEO_KEYS[camera_layout]
+    mismatches: list[str] = []
+    for path in dataset_paths:
+        with (path / "meta" / "modality.json").open("r") as f:
+            modality = json.load(f)
+        actual_video_keys = tuple(modality.get("video", {}))
+        if actual_video_keys != expected_video_keys:
+            mismatches.append(f"{path}: {list(actual_video_keys)}")
+    if mismatches:
+        joined = "\n  ".join(mismatches)
+        raise ValueError(
+            f"Prepared datasets do not match --camera-layout {camera_layout!r}; "
+            f"expected video keys {list(expected_video_keys)}:\n  {joined}"
+        )
 
 
 def _generate_stats(
@@ -374,7 +399,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--camera-layout",
-        choices=("dual", "wrist-only"),
+        choices=("wrist-only", "dual", "triple"),
         default="dual",
         help="Select the SO101 GR00T modality config and default prepared dataset suffix.",
     )
@@ -446,7 +471,7 @@ def main() -> None:
     args = parse_args()
     modality_config_path = _modality_config_path(args.camera_layout).resolve()
     dataset_paths = _split_path_values(args.dataset_path, args.dataset_root, args.camera_layout)
-    _check_dataset_paths(dataset_paths)
+    _check_dataset_paths(dataset_paths, args.camera_layout)
     settings = _strategy_settings(args)
 
     if args.experiment_name is None:

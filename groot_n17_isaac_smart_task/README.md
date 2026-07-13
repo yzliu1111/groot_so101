@@ -8,7 +8,7 @@
 | 阶段 | 目录 | 主要文件 |
 |---|---|---|
 | Zero-shot 推理 | `zero_shot_isaac_smart_task/` | `groot_bridge_server.py`、`run_smart_task_closed_loop.py`、`wire.py`、`franka_smart_task/` |
-| Full fine-tune | `full_finetune_so101/` | `train_so101_synthetic_groot.py`、`so101_synthetic_groot_config.py` |
+| Full fine-tune | `full_finetune_so101/` | `train_so101_synthetic_groot.py`、dual / wrist-only / triple modality configs |
 | Low-memory / LoRA / freeze | `lowmem_lora_freeze_so101/` | `train_so101_synthetic_groot_lowmem.py` |
 | Ubuntu 环境搭建 | `ubuntu_env_setup/` | `README_ZH.md` |
 

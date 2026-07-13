@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import argparse
+from functools import partial
 import math
 import os
 import sys
@@ -81,18 +82,27 @@ CAMERA_PROFILE_DEFAULTS = {
     "leisaac-current": {
         "exterior": "camera3",
         "top": "camera3",
+        "left": "camera1",
         "wrist": "camera2",
     },
     "leisaac2-legacy": {
         "exterior": "camera1",
         "top": "camera1",
+        "left": "camera2",
         "wrist": "camera3",
     },
     "franka-current": {
         "exterior": "camera1",
         "top": "camera1",
+        "left": "camera3",
         "wrist": "camera2",
     },
+}
+
+SO101_VIDEO_KEYS = {
+    "wrist-only": ("wrist",),
+    "dual": ("top", "wrist"),
+    "triple": ("top", "left", "wrist"),
 }
 
 TARGET_OBJECT_CANDIDATES = (
@@ -380,10 +390,9 @@ def get_policy_camera(policy_obs: dict[str, torch.Tensor], key: str, role: str) 
     """Return a selected policy camera tensor with a useful error message."""
 
     if key not in policy_obs:
-        camera_keys = sorted(name for name in policy_obs if name.startswith("camera"))
         raise KeyError(
-            f"{role} camera key {key!r} is not in policy obs; "
-            f"available camera keys are {camera_keys}"
+            f"{role} observation key {key!r} is not in policy obs; "
+            f"available policy observation keys are {sorted(policy_obs)}"
         )
     return policy_obs[key]
 
@@ -424,10 +433,55 @@ def resolve_camera_mapping(args: argparse.Namespace, env: Any) -> tuple[str, dic
     defaults = CAMERA_PROFILE_DEFAULTS[profile]
     mapping = {
         "exterior": args.exterior_camera_key or defaults["exterior"],
-        "top": args.top_camera_key or defaults["top"],
-        "wrist": args.wrist_camera_key or defaults["wrist"],
+        "top": args.front_observation_key or defaults["top"],
+        "left": args.left_observation_key or defaults["left"],
+        "wrist": args.wrist_observation_key or defaults["wrist"],
     }
     return profile, mapping
+
+
+def active_camera_mapping(
+    policy_schema: str,
+    camera_layout: str,
+    camera_mapping: dict[str, str],
+) -> dict[str, str]:
+    """Keep only the live observation keys consumed by the selected policy schema."""
+
+    roles = ("exterior", "wrist") if policy_schema == "oxe" else SO101_VIDEO_KEYS[camera_layout]
+    return {role: camera_mapping[role] for role in roles}
+
+
+def validate_camera_mapping(
+    policy_obs: dict[str, torch.Tensor],
+    camera_mapping: dict[str, str],
+) -> None:
+    """Validate all selected live observation keys immediately after env reset."""
+
+    for role, observation_key in camera_mapping.items():
+        get_policy_camera(policy_obs, observation_key, role)
+
+
+def validate_bridge_camera_layout(args: argparse.Namespace, ping: dict[str, Any]) -> None:
+    """Ensure the runner layout matches the modality actually served by the bridge."""
+
+    if args.policy_schema != "so101-new-embodiment":
+        return
+
+    bridge_layout = ping.get("camera_layout")
+    if bridge_layout is not None and bridge_layout != args.camera_layout:
+        raise ValueError(
+            "Runner and bridge camera layouts differ: "
+            f"runner={args.camera_layout!r} bridge={bridge_layout!r}"
+        )
+
+    actual_video_keys = tuple(ping.get("modality", {}).get("video", {}).get("modality_keys", ()))
+    expected_video_keys = SO101_VIDEO_KEYS[args.camera_layout]
+    if actual_video_keys != expected_video_keys:
+        raise ValueError(
+            "Runner camera layout does not match bridge video schema: "
+            f"layout={args.camera_layout!r} expected={list(expected_video_keys)} "
+            f"actual={list(actual_video_keys)}"
+        )
 
 
 def rigid_object_names(env: Any) -> list[str]:
@@ -732,16 +786,18 @@ def build_so101_new_embodiment_observation(
     instruction: str,
     robot: str,
     camera_mapping: dict[str, str],
+    camera_layout: str,
 ) -> dict[str, Any]:
     """Map LeIsaac SO101 observations to the trained NEW_EMBODIMENT schema."""
 
     if robot != "so101":
         raise ValueError("SO101 NEW_EMBODIMENT schema only supports --robot so101")
 
-    top = image_to_numpy(get_policy_camera(policy_obs, camera_mapping["top"], "top"))
-    wrist = image_to_numpy(get_policy_camera(policy_obs, camera_mapping["wrist"], "wrist"))
-    history.push("top", top)
-    history.push("wrist", wrist)
+    video: dict[str, np.ndarray] = {}
+    for role in SO101_VIDEO_KEYS[camera_layout]:
+        frame = image_to_numpy(get_policy_camera(policy_obs, camera_mapping[role], role))
+        history.push(role, frame)
+        video[role] = history.latest(role)
 
     joint_all = policy_obs["joint_pos"].detach().cpu().numpy()[0].astype(np.float32)
     single_arm = np.zeros((1, 1, 5), dtype=np.float32)
@@ -750,10 +806,7 @@ def build_so101_new_embodiment_observation(
     gripper = np.array([[[gripper_value]]], dtype=np.float32)
 
     return {
-        "video": {
-            "top": history.latest("top"),
-            "wrist": history.latest("wrist"),
-        },
+        "video": video,
         "state": {
             "single_arm": single_arm,
             "gripper": gripper,
@@ -1385,6 +1438,16 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--camera-layout",
+        choices=("wrist-only", "dual", "triple"),
+        default="dual",
+        help=(
+            "SO101 finetuned video schema: wrist-only=[wrist], "
+            "dual=[top,wrist], triple=[top,left,wrist]."
+        ),
+    )
+
+    parser.add_argument(
         "--policy-schema",
         choices=("oxe", "so101-new-embodiment"),
         default=None,
@@ -1400,9 +1463,35 @@ def parse_args() -> argparse.Namespace:
             "explicit per-role camera keys below override the profile."
         ),
     )
-    parser.add_argument("--exterior-camera-key", default=None, help="Policy camera key for OXE/DROID exterior_image_1_left.")
-    parser.add_argument("--top-camera-key", default=None, help="Policy camera key for SO101 NEW_EMBODIMENT video.top.")
-    parser.add_argument("--wrist-camera-key", default=None, help="Policy camera key for wrist video input.")
+    parser.add_argument(
+        "--exterior-observation-key",
+        "--exterior-camera-key",
+        dest="exterior_camera_key",
+        default=None,
+        help="Isaac obs['policy'] key for OXE/DROID exterior_image_1_left.",
+    )
+    parser.add_argument(
+        "--front-observation-key",
+        "--front-camera-key",
+        "--top-camera-key",
+        dest="front_observation_key",
+        default=None,
+        help="Isaac obs['policy'] key mapped to SO101 GR00T video.top.",
+    )
+    parser.add_argument(
+        "--left-observation-key",
+        "--left-camera-key",
+        dest="left_observation_key",
+        default=None,
+        help="Isaac obs['policy'] key mapped to SO101 GR00T video.left in triple mode.",
+    )
+    parser.add_argument(
+        "--wrist-observation-key",
+        "--wrist-camera-key",
+        dest="wrist_observation_key",
+        default=None,
+        help="Isaac obs['policy'] key mapped to the GR00T wrist video input.",
+    )
 
     # IsaacLab task id。None 表示按 --robot 自动选择默认 task。
     parser.add_argument("--task", default=None)
@@ -1616,6 +1705,8 @@ def parse_args() -> argparse.Namespace:
         args.policy_schema = "so101-new-embodiment"
     elif args.policy_schema is None:
         args.policy_schema = "oxe"
+    if args.deployment_mode != "so101-finetuned" and args.camera_layout != "dual":
+        raise ValueError("--camera-layout wrist-only/triple requires --deployment-mode so101-finetuned")
 
     if args.task is None:
         args.task = "Groot-Franka-SmartTask-v0" if args.robot == "franka" else "LeIsaac-SO101-SmartTask-v0"
@@ -1730,12 +1821,21 @@ def main() -> None:
         obs, _ = env.reset()
         policy_obs = obs["policy"]
         resolved_camera_profile, camera_mapping = resolve_camera_mapping(args, env)
+        camera_mapping = active_camera_mapping(args.policy_schema, args.camera_layout, camera_mapping)
+        validate_camera_mapping(policy_obs, camera_mapping)
         target_object_name = resolve_target_object_name(env, args.target_object_key)
         print(
-            f"[runner] camera profile={args.camera_profile} resolved={resolved_camera_profile} "
-            f"mapping={camera_mapping}",
+            f"[runner] camera layout={args.camera_layout} profile={args.camera_profile} "
+            f"resolved={resolved_camera_profile}",
             flush=True,
         )
+        oxe_video_keys = {
+            "exterior": "exterior_image_1_left",
+            "wrist": "wrist_image_left",
+        }
+        for role, observation_key in camera_mapping.items():
+            groot_key = oxe_video_keys[role] if args.policy_schema == "oxe" else role
+            print(f"[runner] Isaac obs['policy'][{observation_key!r}] -> GR00T video.{groot_key}", flush=True)
         print(f"[runner] target object={target_object_name}", flush=True)
         target_asset = env.scene[target_object_name]
         target_cfg = getattr(target_asset, "cfg", None)
@@ -1765,15 +1865,17 @@ def main() -> None:
             raise RuntimeError(ping)
 
         print(f"[runner] bridge modality: {ping.get('modality')}", flush=True)
+        validate_bridge_camera_layout(args, ping)
 
         print(f"[runner] initial joint_pos values={tensor_values(policy_obs['joint_pos'])}", flush=True)
         print_metrics(env, "initial", args.robot, target_object_name)
 
-        build_observation = (
-            build_so101_new_embodiment_observation
-            if args.policy_schema == "so101-new-embodiment"
-            else build_oxe_observation
-        )
+        build_observation = build_oxe_observation
+        if args.policy_schema == "so101-new-embodiment":
+            build_observation = partial(
+                build_so101_new_embodiment_observation,
+                camera_layout=args.camera_layout,
+            )
 
         # warmup：重复把当前 observation 放入 history，确保 history 至少有两帧。
         for _ in range(args.warmup_frames):

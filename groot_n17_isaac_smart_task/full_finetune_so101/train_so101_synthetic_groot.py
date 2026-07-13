@@ -50,6 +50,7 @@ DEFAULT_DATASETS = (
 )
 DUAL_MODALITY_CONFIG_PATH = SCRIPT_DIR / "so101_synthetic_groot_config.py"
 WRIST_ONLY_MODALITY_CONFIG_PATH = SCRIPT_DIR / "so101_synthetic_groot_wrist_only_config.py"
+TRIPLE_MODALITY_CONFIG_PATH = SCRIPT_DIR / "so101_synthetic_groot_triple_config.py"
 LEROBOT_SRC = REPO_ROOT / "lerobot" / "src"
 
 V21_DATA_PATH = "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet"
@@ -275,16 +276,35 @@ def _feature_subset(info: dict[str, Any], video_keys: list[str]) -> dict[str, An
 def _camera_layout_settings(
     camera_layout: str,
     top_camera_key: str,
+    left_camera_key: str,
     wrist_camera_key: str,
 ) -> tuple[dict[str, str], Path]:
     if camera_layout == "dual":
         if not top_camera_key or not wrist_camera_key:
             raise ValueError("dual camera layout requires both top/front and wrist camera keys")
+        if top_camera_key == wrist_camera_key:
+            raise ValueError("dual camera layout requires different top/front and wrist camera keys")
         return {"top": top_camera_key, "wrist": wrist_camera_key}, DUAL_MODALITY_CONFIG_PATH
     if camera_layout == "wrist-only":
         if not wrist_camera_key:
-            raise ValueError("wrist-only camera layout requires --wrist-camera-key")
+            raise ValueError("wrist-only camera layout requires --dataset-wrist-camera-key")
         return {"wrist": wrist_camera_key}, WRIST_ONLY_MODALITY_CONFIG_PATH
+    if camera_layout == "triple":
+        camera_keys = {
+            "top/front": top_camera_key,
+            "left": left_camera_key,
+            "wrist": wrist_camera_key,
+        }
+        missing_roles = [role for role, key in camera_keys.items() if not key]
+        if missing_roles:
+            raise ValueError(f"triple camera layout requires camera keys for: {missing_roles}")
+        if len(set(camera_keys.values())) != len(camera_keys):
+            raise ValueError(f"triple camera layout requires three different camera keys: {camera_keys}")
+        return {
+            "top": top_camera_key,
+            "left": left_camera_key,
+            "wrist": wrist_camera_key,
+        }, TRIPLE_MODALITY_CONFIG_PATH
     raise ValueError(f"Unsupported camera layout: {camera_layout}")
 
 
@@ -309,6 +329,23 @@ def _write_modality_json(output_path: Path, video_key_map: dict[str, str]) -> No
             },
         },
     )
+
+
+def _validate_prepared_camera_layout(dataset_path: Path, expected_video_keys: tuple[str, ...]) -> None:
+    """Ensure an existing prepared copy matches the selected training layout."""
+
+    modality_path = dataset_path / "meta" / "modality.json"
+    if not modality_path.exists():
+        raise FileNotFoundError(f"Prepared dataset modality file not found: {modality_path}")
+    with modality_path.open("r") as f:
+        modality = json.load(f)
+    actual_video_keys = tuple(modality.get("video", {}))
+    if actual_video_keys != expected_video_keys:
+        raise ValueError(
+            "Prepared dataset camera layout mismatch: "
+            f"dataset={dataset_path} expected_video_keys={list(expected_video_keys)} "
+            f"actual_video_keys={list(actual_video_keys)}"
+        )
 
 
 def _convert_data_files(source_path: Path, output_path: Path, records: list[dict[str, Any]]) -> None:
@@ -682,20 +719,34 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--groot-root", type=Path, default=DEFAULT_GROOT_ROOT)
     parser.add_argument("--base-model-path", default="nvidia/GR00T-N1.7-3B")
     parser.add_argument(
+        "--dataset-front-camera-key",
         "--top-camera-key",
         "--front-camera-key",
         dest="top_camera_key",
         default="observation.images.camera1",
-        help="Top/global camera feature key. --front-camera-key is kept as a deprecated alias.",
+        help="LeRobot dataset feature key for the front/top view.",
     )
-    parser.add_argument("--wrist-camera-key", default="observation.images.camera3")
+    parser.add_argument(
+        "--dataset-left-camera-key",
+        "--left-camera-key",
+        dest="left_camera_key",
+        default="observation.images.camera2",
+        help="LeRobot dataset feature key for the left-side view; used by --camera-layout triple.",
+    )
+    parser.add_argument(
+        "--dataset-wrist-camera-key",
+        "--wrist-camera-key",
+        dest="wrist_camera_key",
+        default="observation.images.camera3",
+        help="LeRobot dataset feature key for the wrist view.",
+    )
     parser.add_argument(
         "--camera-layout",
-        choices=("dual", "wrist-only"),
+        choices=("wrist-only", "dual", "triple"),
         default="dual",
         help=(
-            "dual maps top/front + wrist cameras; wrist-only trains with only "
-            "--wrist-camera-key and writes prepared datasets with a _wrist_only suffix."
+            "wrist-only maps only the wrist camera; dual maps front/top + wrist; "
+            "triple maps front/top + left + wrist. Non-dual prepared datasets get a layout suffix."
         ),
     )
     parser.add_argument(
@@ -729,9 +780,13 @@ def main() -> None:
     video_key_map, modality_config_path = _camera_layout_settings(
         args.camera_layout,
         args.top_camera_key,
+        args.left_camera_key,
         args.wrist_camera_key,
     )
     modality_config_path = modality_config_path.resolve()
+    print(f"[config] camera_layout: {args.camera_layout}")
+    for groot_key, dataset_key in video_key_map.items():
+        print(f"[config] dataset {dataset_key} -> GR00T video.{groot_key}")
     source_specs = _resolve_source_datasets(args)
 
     prepared_paths: list[Path] = []
@@ -748,6 +803,10 @@ def main() -> None:
                 max_episodes=args.max_episodes,
             )
         prepared_paths.append(prepared_path)
+
+    expected_video_keys = tuple(video_key_map)
+    for prepared_path in prepared_paths:
+        _validate_prepared_camera_layout(prepared_path, expected_video_keys)
 
     if not args.skip_stats:
         for prepared_path in prepared_paths:

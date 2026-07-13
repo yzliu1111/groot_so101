@@ -977,7 +977,8 @@ python experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task/run_sma
 
 ### 8.3 SO101 微调 checkpoint 的 LeIsaac 仿真推理
 
-终端 1：GR00T bridge，使用 GR00T venv。`--deployment-mode so101-finetuned` 会自动使用 `NEW_EMBODIMENT`，并加载本项目的 SO101 modality config。
+终端 1：GR00T bridge，使用 GR00T venv。`--deployment-mode so101-finetuned` 会自动使用
+`NEW_EMBODIMENT`；`--camera-layout` 决定加载 wrist-only、dual 或 triple modality config。
 
 权重文件可以只留在目标 Ubuntu 机器上，不需要同步回本机。下面的 bridge 暴露的是
 host/port 形式的本地 TCP API，默认 `127.0.0.1:5577`；如果你已有 API 地址，就把 Isaac runner
@@ -998,6 +999,7 @@ cd "$SMART_PROJECT"
 "$GROOT_ROOT/.venv/bin/python" \
   experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task/groot_bridge_server.py \
     --deployment-mode so101-finetuned \
+    --camera-layout dual \
     --model-path "$CHECKPOINT" \
     --host 127.0.0.1 \
     --port 5577 \
@@ -1027,6 +1029,9 @@ export BRIDGE_PORT="${BRIDGE_PORT:-5577}"
 
 python experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task/run_smart_task_closed_loop.py \
   --deployment-mode so101-finetuned \
+  --camera-layout dual \
+  --front-observation-key camera3 \
+  --wrist-observation-key camera2 \
   --robot so101 \
   --control-mode joint \
   --smart-target-asset cuboid \
@@ -1036,6 +1041,9 @@ python experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task/run_sma
   --max-policy-calls 1 \
   --instruction "Pick up the red 2x4 lego brick."
 ```
+
+上面是 dual 示例。wrist-only 只给 runner 传 `--wrist-observation-key`；triple 还要加
+`--left-observation-key camera1`。bridge 与 runner 的 `--camera-layout` 必须和训练 checkpoint 一致。
 
 ## 9. 坏环境处理
 
