@@ -28,6 +28,7 @@ import math
 import os
 import sys
 import time
+import traceback
 from collections import deque
 from datetime import datetime
 from pathlib import Path
@@ -1797,13 +1798,24 @@ def main() -> None:
         env_cfg.terminations.success = None
 
     # 创建 gymnasium env，并拿 unwrapped 环境方便访问 scene、sim、cfg 等属性。
-    # gym.make() 期间也可能因为 scene/asset 配置错误失败；这时必须主动关闭
-    # Isaac app，否则进程会停在 Omniverse 清理阶段占着 GPU。
+    # gym.make() 期间也可能因为 scene/asset 配置错误失败。必须在关闭
+    # SimulationApp 之前打印 traceback；Isaac/Kit 的完整 shutdown 会卸载日志
+    # 和运行框架，如果先 close()，真正的 Python 异常可能在终端里消失，只剩
+    # 下一个 shell prompt，看起来像“窗口无报错自动关闭”。
+    print(f"[runner] creating Isaac env via gym.make(task={args.task!r})", flush=True)
     try:
         env = gym.make(args.task, cfg=env_cfg).unwrapped
-    except Exception:
+    except Exception as exc:
+        print(
+            f"[runner] gym.make failed: {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+        traceback.print_exc(file=sys.stderr)
+        sys.stderr.flush()
         simulation_app.close()
         raise
+    print("[runner] Isaac env created successfully", flush=True)
 
     # 相机历史缓存，用于构造 GR00T 的两帧 video 输入。
     history = FrameHistory(horizon=max(args.warmup_frames, 2))
