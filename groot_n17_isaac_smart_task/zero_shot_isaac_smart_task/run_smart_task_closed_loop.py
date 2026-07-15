@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import argparse
 from functools import partial
-import math
 import os
 import sys
 import time
@@ -130,187 +129,21 @@ for package_path in reversed(LEISAAC_ISAACLAB_PACKAGES):
 
 # `request()` 是本实验自定义的 socket 请求函数：
 # Isaac runner 通过它向 GR00T bridge 发送 observation，并等待 action。
+from action_chunk import action_chunk_length, slice_action_step  # noqa: E402
+from action_timing import resolve_env_steps_per_policy_action  # noqa: E402
+from pose_math import compose_pose_delta, quat_wxyz_to_rot6d  # noqa: E402
+from so101_joint_units import (  # noqa: E402
+    SO101_JOINT_NAMES,
+    SO101_LEROBOT_MOTOR_LIMITS,
+    isaac_rad_to_lerobot_motor,
+    safe_absolute_motor_target_to_isaac_rad,
+    validate_runtime_joint_limits_match_converter,
+)
 from wire import request  # noqa: E402
 
 # AppLauncher 要在 sys.path 调整后再 import，这样 isaaclab/isaaclab_assets 会优先
 # 来自 copied LeIsaac dependencies，而不是机器上其它源码副本。
 from isaaclab.app import AppLauncher  # noqa: E402
-
-
-def quat_wxyz_to_rot6d(quat: np.ndarray) -> np.ndarray:
-    """把 Isaac/LeIsaac 的 wxyz 四元数转换成 GR00T 使用的 rot6d。
-
-    参数：
-    - `quat`：shape `(4,)`，顺序是 `(w, x, y, z)`。
-
-    返回：
-    - shape `(6,)`，表示旋转矩阵前两行 flatten 后的 6D rotation。
-
-    背景：
-    - LeIsaac observation 里的 `ee_frame_state` 是 `xyz + quat(wxyz)`。
-    - GR00T OXE/DROID schema 的 `eef_9d` 是 `xyz + rot6d`。
-    - 所以构造 GR00T state 时必须做这个转换。
-    """
-
-    w, x, y, z = quat
-
-    # 四元数需要先归一化，否则转出的旋转矩阵可能不是正交矩阵。
-    norm = math.sqrt(w * w + x * x + y * y + z * z)
-    if norm < 1e-8:
-        # 异常情况下用单位旋转兜底：矩阵前两行是 [1,0,0] 和 [0,1,0]。
-        return np.array([1, 0, 0, 0, 1, 0], dtype=np.float32)
-
-    w, x, y, z = w / norm, x / norm, y / norm, z / norm
-
-    # 标准 wxyz 四元数到 3x3 旋转矩阵的公式。
-    rot = np.array(
-        [
-            [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
-            [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
-            [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
-        ],
-        dtype=np.float32,
-    )
-
-    # GR00T repo 的 pose.py 里使用的是“旋转矩阵前两行 flatten”的 rot6d。
-    return rot[:2, :].reshape(-1)
-
-
-def quat_wxyz_to_matrix(quat: np.ndarray) -> np.ndarray:
-    """把 wxyz 四元数转换为 3x3 旋转矩阵。
-
-    这个函数用于 EEF 控制路线：GR00T 返回的 eef_9d 被当作“当前末端坐标系下
-    的相对位姿增量”，需要先把当前末端四元数转成矩阵，然后做矩阵乘法组合。
-    """
-
-    w, x, y, z = quat.astype(np.float64)
-    norm = math.sqrt(w * w + x * x + y * y + z * z)
-    if norm < 1e-8:
-        return np.eye(3, dtype=np.float32)
-
-    w, x, y, z = w / norm, x / norm, y / norm, z / norm
-    return np.array(
-        [
-            [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
-            [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
-            [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
-        ],
-        dtype=np.float32,
-    )
-
-
-def matrix_to_quat_wxyz(rot: np.ndarray) -> np.ndarray:
-    """把 3x3 旋转矩阵转换回 Isaac/LeIsaac 需要的 wxyz 四元数。
-
-    LeIsaac 的 `mimic_so101leader` IK action 格式是：
-        `[x, y, z, qw, qx, qy, qz, gripper]`
-
-    因此当我们把 GR00T 的 rot6d 组合成目标旋转矩阵后，还需要转成四元数。
-    """
-
-    trace = float(np.trace(rot))
-
-    # 下面是常见的 matrix -> quaternion 数值稳定写法：
-    # 根据矩阵 trace 和对角线最大项选择不同分支，避免接近 180 度旋转时除数太小。
-    if trace > 0.0:
-        s = math.sqrt(trace + 1.0) * 2.0
-        w = 0.25 * s
-        x = (rot[2, 1] - rot[1, 2]) / s
-        y = (rot[0, 2] - rot[2, 0]) / s
-        z = (rot[1, 0] - rot[0, 1]) / s
-    elif rot[0, 0] > rot[1, 1] and rot[0, 0] > rot[2, 2]:
-        s = math.sqrt(max(1.0 + rot[0, 0] - rot[1, 1] - rot[2, 2], 1e-8)) * 2.0
-        w = (rot[2, 1] - rot[1, 2]) / s
-        x = 0.25 * s
-        y = (rot[0, 1] + rot[1, 0]) / s
-        z = (rot[0, 2] + rot[2, 0]) / s
-    elif rot[1, 1] > rot[2, 2]:
-        s = math.sqrt(max(1.0 + rot[1, 1] - rot[0, 0] - rot[2, 2], 1e-8)) * 2.0
-        w = (rot[0, 2] - rot[2, 0]) / s
-        x = (rot[0, 1] + rot[1, 0]) / s
-        y = 0.25 * s
-        z = (rot[1, 2] + rot[2, 1]) / s
-    else:
-        s = math.sqrt(max(1.0 + rot[2, 2] - rot[0, 0] - rot[1, 1], 1e-8)) * 2.0
-        w = (rot[1, 0] - rot[0, 1]) / s
-        x = (rot[0, 2] + rot[2, 0]) / s
-        y = (rot[1, 2] + rot[2, 1]) / s
-        z = 0.25 * s
-
-    quat = np.array([w, x, y, z], dtype=np.float32)
-    norm = np.linalg.norm(quat)
-    if norm < 1e-8:
-        return np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
-    return quat / norm
-
-
-def rot6d_to_matrix(rot6d: np.ndarray) -> np.ndarray:
-    """把 GR00T 的 rot6d 转回 3x3 旋转矩阵。
-
-    参数：
-    - `rot6d`：shape `(6,)`，可看作两个 3D 行向量。
-
-    返回：
-    - shape `(3, 3)` 的旋转矩阵。
-
-    做法：
-    - 第一行归一化。
-    - 第二行减去在第一行方向上的投影，再归一化。
-    - 第三行用叉乘补出来。
-
-    这和 GR00T repo 里 pose.py 的思路一致。
-    """
-
-    rows = rot6d.astype(np.float64).reshape(2, 3)
-
-    row1 = rows[0]
-    row1_norm = np.linalg.norm(row1)
-    if row1_norm < 1e-8:
-        row1 = np.array([1.0, 0.0, 0.0], dtype=np.float64)
-    else:
-        row1 = row1 / row1_norm
-
-    row2 = rows[1] - np.dot(rows[1], row1) * row1
-    row2_norm = np.linalg.norm(row2)
-    if row2_norm < 1e-8:
-        row2 = np.array([0.0, 1.0, 0.0], dtype=np.float64)
-    else:
-        row2 = row2 / row2_norm
-
-    row3 = np.cross(row1, row2)
-    return np.vstack([row1, row2, row3]).astype(np.float32)
-
-
-def compose_pose_delta(base_pos: np.ndarray, base_quat: np.ndarray, delta_9d: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """把 GR00T 的 EEF 相对动作组合到当前末端位姿上。
-
-    参数：
-    - `base_pos`：当前末端位置，shape `(3,)`，在 robot frame 下。
-    - `base_quat`：当前末端旋转，shape `(4,)`，wxyz。
-    - `delta_9d`：GR00T 输出的一步 `eef_9d` action，shape `(9,)`。
-
-    返回：
-    - `target_pos`：目标末端位置，shape `(3,)`。
-    - `target_quat`：目标末端旋转，shape `(4,)`，wxyz。
-
-    重要说明：
-    - OXE/DROID config 里 `eef_9d` 被标成 relative EEF action。
-    - 这里采用的实验假设是：`delta_9d` 是相对于当前 EEF frame 的变换。
-    - 如果后续确认 GR00T processor 已经把它 decode 成 absolute action，
-      这一层组合就需要改掉；目前日志显示这条路线比 joint 路线更能释放动作。
-    """
-
-    base_rot = quat_wxyz_to_matrix(base_quat)
-    delta_pos = delta_9d[:3]
-    delta_rot = rot6d_to_matrix(delta_9d[3:9])
-
-    # 平移增量先从 EEF frame 转到 robot frame，再加到当前 robot-frame 位置上。
-    target_pos = base_pos + base_rot @ delta_pos
-
-    # 旋转增量通过矩阵乘法组合：T_target = T_base @ T_delta。
-    target_rot = base_rot @ delta_rot
-
-    return target_pos.astype(np.float32), matrix_to_quat_wxyz(target_rot)
 
 
 def eef_state_to_9d(ee_frame_state: torch.Tensor) -> np.ndarray:
@@ -482,6 +315,35 @@ def validate_bridge_camera_layout(args: argparse.Namespace, ping: dict[str, Any]
             "Runner camera layout does not match bridge video schema: "
             f"layout={args.camera_layout!r} expected={list(expected_video_keys)} "
             f"actual={list(actual_video_keys)}"
+        )
+
+    action_decoding = ping.get("action_decoding")
+    if not isinstance(action_decoding, dict):
+        raise ValueError(
+            "Bridge did not report GR00T action-decoding semantics. Restart the bridge with "
+            "this updated groot_bridge_server.py before executing SO101 actions."
+        )
+    expected_action_contract = {
+        "policy_api_output": "decoded_dataset_action",
+        "dataset_action_semantics": "absolute_joint_position_targets",
+        "dataset_action_units": "lerobot_motor_units",
+    }
+    contract_mismatch = {
+        key: (expected, action_decoding.get(key))
+        for key, expected in expected_action_contract.items()
+        if action_decoding.get(key) != expected
+    }
+    if contract_mismatch:
+        raise ValueError(
+            "Bridge does not confirm the SO101 runner's executable action contract. "
+            f"mismatch={contract_mismatch} bridge_report={action_decoding}"
+        )
+    if action_decoding.get("processor_use_relative_action") is not True:
+        print(
+            "[runner] warning: checkpoint processor_use_relative_action is not true. "
+            "This does not turn the Policy API output into a delta, but it differs from "
+            "the expected SO101 fine-tune recipe; verify the checkpoint/config pairing.",
+            flush=True,
         )
 
 
@@ -800,10 +662,11 @@ def build_so101_new_embodiment_observation(
         history.push(role, frame)
         video[role] = history.latest(role)
 
-    joint_all = policy_obs["joint_pos"].detach().cpu().numpy()[0].astype(np.float32)
+    joint_rad = policy_obs["joint_pos"].detach().cpu().numpy()[0].astype(np.float32)
+    joint_lerobot = isaac_rad_to_lerobot_motor(joint_rad)
     single_arm = np.zeros((1, 1, 5), dtype=np.float32)
-    single_arm[0, 0, : min(5, joint_all.shape[0])] = joint_all[:5]
-    gripper_value = float(joint_all[5]) if joint_all.shape[0] > 5 else 0.0
+    single_arm[0, 0, : min(5, joint_lerobot.shape[0])] = joint_lerobot[:5]
+    gripper_value = float(joint_lerobot[5]) if joint_lerobot.shape[0] > 5 else 0.0
     gripper = np.array([[[gripper_value]]], dtype=np.float32)
 
     return {
@@ -877,28 +740,25 @@ def so101_new_embodiment_action_to_leisaac_tensor(
     action: dict[str, np.ndarray],
     env_device: str,
     fallback_joint: torch.Tensor,
-    arm_delta_scale: float = 1.0,
-    max_arm_delta: float | None = None,
+    arm_target_scale: float = 1.0,
+    max_arm_step_rad: float | None = None,
     gripper_min: float | None = None,
     gripper_max: float | None = None,
+    runtime_joint_limits: torch.Tensor | np.ndarray | None = None,
 ) -> torch.Tensor:
-    """Convert trained SO101 NEW_EMBODIMENT actions to LeIsaac 6D joint targets."""
+    """Convert decoded absolute LeRobot actions to safe Isaac radian targets."""
 
-    current = fallback_joint.detach().cpu().numpy()[0].astype(np.float32)
-    command = current.copy()
+    current_rad = fallback_joint.detach().cpu().numpy()[0].astype(np.float32)
+    absolute_motor_target = isaac_rad_to_lerobot_motor(current_rad)
 
     if "single_arm" in action:
         arm = np.asarray(action["single_arm"], dtype=np.float32)
         if arm.ndim != 3:
             raise ValueError(f"expected single_arm shape (B,T,D), got {arm.shape}")
         usable = min(5, arm.shape[-1])
-        # The SO101 config marks single_arm as relative joint action, so convert
-        # it into the absolute joint target expected by LeIsaac JointPositionAction.
-        arm_delta = arm[0, 0, :usable] * float(arm_delta_scale)
-        if max_arm_delta is not None:
-            bound = abs(float(max_arm_delta))
-            arm_delta = np.clip(arm_delta, -bound, bound)
-        command[:usable] = current[:usable] + arm_delta
+        # Gr00tPolicy.decode_action() has already undone normalization and
+        # converted configured relative actions back to absolute dataset units.
+        absolute_motor_target[:usable] = arm[0, 0, :usable]
     else:
         print("[runner] warning: GR00T action lacks single_arm; holding arm joints", flush=True)
 
@@ -908,12 +768,44 @@ def so101_new_embodiment_action_to_leisaac_tensor(
             raise ValueError(f"expected gripper shape (B,T,D), got {gripper.shape}")
         gripper_value = float(gripper[0, 0, 0])
         if gripper_min is not None or gripper_max is not None:
-            lower = -np.inf if gripper_min is None else float(gripper_min)
-            upper = np.inf if gripper_max is None else float(gripper_max)
+            default_lower, default_upper = SO101_LEROBOT_MOTOR_LIMITS[5]
+            lower = float(default_lower) if gripper_min is None else float(gripper_min)
+            upper = float(default_upper) if gripper_max is None else float(gripper_max)
             gripper_value = float(np.clip(gripper_value, lower, upper))
-        command[5] = gripper_value
+        absolute_motor_target[5] = gripper_value
     else:
         print("[runner] warning: GR00T action lacks gripper; holding gripper", flush=True)
+
+    runtime_limits_np = None
+    if runtime_joint_limits is not None:
+        if isinstance(runtime_joint_limits, torch.Tensor):
+            runtime_limits_np = runtime_joint_limits.detach().cpu().numpy()
+        else:
+            runtime_limits_np = np.asarray(runtime_joint_limits, dtype=np.float32)
+
+    command, diagnostics = safe_absolute_motor_target_to_isaac_rad(
+        current_rad,
+        absolute_motor_target,
+        arm_target_scale=arm_target_scale,
+        max_arm_step_rad=max_arm_step_rad,
+        runtime_joint_limits_rad=runtime_limits_np,
+    )
+    if diagnostics["motor_limit_clipped"]:
+        print(
+            "[runner] SO101 safety clipped GR00T absolute motor target "
+            f"raw={diagnostics['raw_motor_target'].round(4).tolist()} "
+            f"clipped={diagnostics['clipped_motor_target'].round(4).tolist()}",
+            flush=True,
+        )
+    if diagnostics["arm_step_clipped"]:
+        print(
+            "[runner] SO101 safety limited per-policy-action arm radians "
+            f"requested={diagnostics['requested_arm_delta_rad'].round(4).tolist()} "
+            f"applied={diagnostics['applied_arm_delta_rad'].round(4).tolist()}",
+            flush=True,
+        )
+    if diagnostics["runtime_limit_clipped"]:
+        print("[runner] SO101 safety clipped command to Isaac runtime joint limits", flush=True)
 
     return torch.from_numpy(command[None, :]).to(env_device)
 
@@ -974,6 +866,73 @@ def eef_action_to_leisaac_tensor(
 
     command = np.concatenate([target_pos, target_quat, np.array([gripper], dtype=np.float32)])[None, :]
     return torch.from_numpy(command.astype(np.float32)).to(env_device)
+
+
+def action_step_to_leisaac_tensor(
+    args: argparse.Namespace,
+    action: dict[str, np.ndarray],
+    step_index: int,
+    env_device: str,
+    policy_obs: dict[str, torch.Tensor],
+    so101_runtime_joint_limits: torch.Tensor | None,
+) -> torch.Tensor:
+    """Slice and convert one policy action according to the selected route."""
+
+    if args.policy_schema == "so101-new-embodiment":
+        step_action = slice_action_step(action, step_index, ("single_arm", "gripper"))
+        return so101_new_embodiment_action_to_leisaac_tensor(
+            step_action,
+            env_device,
+            policy_obs["joint_pos"],
+            arm_target_scale=args.so101_arm_target_scale,
+            max_arm_step_rad=args.so101_max_arm_step_rad,
+            gripper_min=args.so101_gripper_min,
+            gripper_max=args.so101_gripper_max,
+            runtime_joint_limits=so101_runtime_joint_limits,
+        )
+
+    if args.control_mode == "eef":
+        step_action = slice_action_step(action, step_index, ("eef_9d", "gripper_position"))
+        return eef_action_to_leisaac_tensor(step_action, env_device, policy_obs, args.robot)
+
+    step_action = slice_action_step(action, step_index, ("joint_position", "gripper_position"))
+    return joint_action_to_leisaac_tensor(step_action, env_device, policy_obs["joint_pos"], args.robot)
+
+
+def log_first_leisaac_command(
+    args: argparse.Namespace,
+    command: torch.Tensor,
+    policy_obs: dict[str, torch.Tensor],
+) -> None:
+    """Log the first command in a chunk against its route-specific current value."""
+
+    command_np = command.detach().cpu().numpy()
+    joint_np = policy_obs["joint_pos"].detach().cpu().numpy()
+    if args.control_mode == "eef":
+        gripper_np = np.ones((joint_np.shape[0], 1), dtype=np.float32) if args.robot == "franka" else joint_np[:, 5:6]
+        current_np = np.concatenate(
+            [policy_obs["ee_frame_state"].detach().cpu().numpy()[:, :7], gripper_np],
+            axis=1,
+        )
+        units = "EEF xyz=m, quaternion=unitless, gripper=route-specific"
+    elif args.robot == "franka":
+        current_np = np.concatenate(
+            [joint_np[:, :7], np.ones((joint_np.shape[0], 1), dtype=np.float32)],
+            axis=1,
+        )
+        units = "arm joints/delta=rad, gripper=binary"
+    else:
+        current_np = joint_np
+        units = "joint values/delta=rad"
+
+    delta_np = command_np - current_np
+    print(
+        f"[runner] first LeIsaac command ({units}) "
+        f"shape={tuple(command_np.shape)} min={float(command_np.min()):.4f} "
+        f"max={float(command_np.max()):.4f} values={command_np[0].round(4).tolist()} "
+        f"delta={delta_np[0].round(4).tolist()}",
+        flush=True,
+    )
 
 
 def tensor_values(tensor: torch.Tensor) -> list[float]:
@@ -1565,39 +1524,67 @@ def parse_args() -> argparse.Namespace:
         help="joint uses GR00T joint_position as SO101 joints; eef uses GR00T eef_9d + gripper_position through LeIsaac IK.",
     )
     parser.add_argument(
+        "--so101-arm-target-scale",
         "--so101-arm-delta-scale",
+        dest="so101_arm_target_scale",
         type=float,
         default=1.0,
-        help="Scale finetuned SO101 relative arm deltas before adding them to current joints.",
+        help=(
+            "Interpolate from current Isaac radians toward the finetuned checkpoint's decoded "
+            "absolute arm target. 1.0 uses the full target. "
+            "--so101-arm-delta-scale is a deprecated compatibility alias."
+        ),
     )
     parser.add_argument(
+        "--so101-max-arm-step-rad",
         "--so101-max-arm-delta",
+        dest="so101_max_arm_step_rad",
         type=float,
-        default=None,
-        help="Optional absolute clamp for each finetuned SO101 arm joint delta before execution.",
+        default=0.08,
+        help=(
+            "Maximum change in Isaac radians for each arm joint per policy action. "
+            "The command may be held for multiple env steps. Defaults to the provisional "
+            "0.08-rad smoke-test guard; use 0 to disable. "
+            "--so101-max-arm-delta is a deprecated compatibility alias."
+        ),
     )
     parser.add_argument(
         "--so101-gripper-min",
         type=float,
         default=None,
-        help="Optional lower clamp for finetuned SO101 absolute gripper target.",
+        help="Optional lower clamp in LeRobot motor units for the finetuned absolute gripper target.",
     )
     parser.add_argument(
         "--so101-gripper-max",
         type=float,
         default=None,
-        help="Optional upper clamp for finetuned SO101 absolute gripper target.",
+        help="Optional upper clamp in LeRobot motor units for the finetuned absolute gripper target.",
     )
 
     # 请求 GR00T 的次数。每次请求会返回一个 action chunk。
-    parser.add_argument("--max-policy-calls", type=int, default=1)
+    parser.add_argument(
+        "--max-policy-calls",
+        type=int,
+        default=1,
+        help="Maximum number of action chunks to request from the GR00T bridge.",
+    )
 
     # 每个 action chunk 执行多少步。0 表示执行完整 chunk。
     parser.add_argument(
         "--action-horizon",
         type=int,
         default=0,
-        help="Number of action steps to execute from each GR00T chunk. 0 means execute the full returned chunk.",
+        help="Number of policy actions to execute from each GR00T chunk. 0 means execute the full returned chunk.",
+    )
+    parser.add_argument(
+        "--policy-action-hz",
+        type=float,
+        default=None,
+        help=(
+            "Time base of consecutive actions in the returned chunk. SO101 finetuned mode "
+            "defaults to the prepared dataset's 30 Hz; zero-shot modes default to one action "
+            "per env step to preserve their previous behavior."
+        ),
     )
 
     # 在第一次推理前先积累多少帧相机历史。
@@ -1628,7 +1615,10 @@ def parse_args() -> argparse.Namespace:
         "--render-sleep-s",
         type=float,
         default=0.01,
-        help="Sleep between simulated action steps so motion is visible in viewport mode.",
+        help=(
+            "Wall-clock sleep after each Isaac environment step so motion is visible in viewport mode; "
+            "this does not change simulated time."
+        ),
     )
 
     # Isaac Sim 是否 headless。`BooleanOptionalAction` 会自动支持
@@ -1708,6 +1698,48 @@ def parse_args() -> argparse.Namespace:
         args.policy_schema = "oxe"
     if args.deployment_mode != "so101-finetuned" and args.camera_layout != "dual":
         raise ValueError("--camera-layout wrist-only/triple requires --deployment-mode so101-finetuned")
+    if args.max_policy_calls < 1:
+        raise ValueError("--max-policy-calls must be at least 1")
+    if args.action_horizon < 0:
+        raise ValueError("--action-horizon must be 0 or a positive integer")
+    if not np.isfinite(args.so101_arm_target_scale) or not 0.0 <= args.so101_arm_target_scale <= 1.0:
+        raise ValueError("--so101-arm-target-scale must be finite and within [0, 1]")
+    if not np.isfinite(args.so101_max_arm_step_rad) or args.so101_max_arm_step_rad < 0.0:
+        raise ValueError("--so101-max-arm-step-rad must be finite and non-negative")
+    for flag, value in (
+        ("--so101-gripper-min", args.so101_gripper_min),
+        ("--so101-gripper-max", args.so101_gripper_max),
+    ):
+        if value is not None and not np.isfinite(value):
+            raise ValueError(f"{flag} must be finite when provided")
+    if (
+        args.so101_gripper_min is not None
+        and args.so101_gripper_max is not None
+        and args.so101_gripper_min > args.so101_gripper_max
+    ):
+        raise ValueError("--so101-gripper-min cannot exceed --so101-gripper-max")
+    if args.policy_action_hz is not None and (
+        not np.isfinite(args.policy_action_hz) or args.policy_action_hz <= 0.0
+    ):
+        raise ValueError("--policy-action-hz must be finite and positive")
+    if args.warmup_frames < 0:
+        raise ValueError("--warmup-frames must be non-negative")
+    if not np.isfinite(args.timeout_s) or args.timeout_s <= 0.0:
+        raise ValueError("--timeout-s must be finite and positive")
+    if not np.isfinite(args.render_sleep_s) or args.render_sleep_s < 0.0:
+        raise ValueError("--render-sleep-s must be finite and non-negative")
+    if not np.isfinite(args.keep_open_s) or args.keep_open_s < 0.0:
+        raise ValueError("--keep-open-s must be finite and non-negative")
+    if args.capture_width < 1 or args.capture_height < 1:
+        raise ValueError("--capture-width and --capture-height must be positive")
+    if not np.isfinite(args.capture_fps) or args.capture_fps <= 0.0:
+        raise ValueError("--capture-fps must be finite and positive")
+    if not np.isfinite(args.capture_bitrate_mbps) or args.capture_bitrate_mbps <= 0.0:
+        raise ValueError("--capture-bitrate-mbps must be finite and positive")
+    if args.capture_every_nth_frames < 1:
+        raise ValueError("--capture-every-nth-frames must be at least 1")
+    if not np.isfinite(args.capture_wait_timeout_s) or args.capture_wait_timeout_s <= 0.0:
+        raise ValueError("--capture-wait-timeout-s must be finite and positive")
 
     if args.task is None:
         args.task = "Groot-Franka-SmartTask-v0" if args.robot == "franka" else "LeIsaac-SO101-SmartTask-v0"
@@ -1736,15 +1768,29 @@ def keep_open(simulation_app: Any, env: Any, seconds: float) -> None:
         time.sleep(1.0 / 30.0)
 
 
-def action_chunk_len(action: dict[str, np.ndarray]) -> int:
-    """从 GR00T action dict 中推断 action chunk 的时间长度 T。"""
+def get_so101_runtime_joint_limits(env: Any, policy_schema: str) -> torch.Tensor | None:
+    """Validate the loaded SO101 joint order/ranges and return its soft limits."""
 
-    for key in ("joint_position", "eef_9d", "gripper_position", "single_arm", "gripper"):
-        if key in action:
-            arr = np.asarray(action[key])
-            if arr.ndim >= 2:
-                return int(arr.shape[1])
-    raise ValueError(f"cannot infer action chunk length from keys: {sorted(action.keys())}")
+    if policy_schema != "so101-new-embodiment":
+        return None
+
+    robot_data = env.scene["robot"].data
+    actual_joint_names = tuple(robot_data.joint_names[:6])
+    if actual_joint_names != SO101_JOINT_NAMES:
+        raise ValueError(
+            "SO101 joint order differs from the deployment converter: "
+            f"expected={list(SO101_JOINT_NAMES)} actual={list(actual_joint_names)}"
+        )
+
+    soft_limits = robot_data.soft_joint_pos_limits
+    if soft_limits.ndim != 3 or soft_limits.shape[1] < 6 or soft_limits.shape[2] != 2:
+        raise ValueError(
+            "Expected Isaac robot soft_joint_pos_limits shape (num_envs, >=6, 2), "
+            f"got {tuple(soft_limits.shape)}"
+        )
+    limits = soft_limits[0, :6].detach().clone()
+    validate_runtime_joint_limits_match_converter(limits.detach().cpu().numpy())
+    return limits
 
 
 def main() -> None:
@@ -1832,6 +1878,7 @@ def main() -> None:
         # 因为此时 sensor/view/prim 才完整实例化。
         obs, _ = env.reset()
         policy_obs = obs["policy"]
+        so101_runtime_joint_limits = get_so101_runtime_joint_limits(env, args.policy_schema)
         resolved_camera_profile, camera_mapping = resolve_camera_mapping(args, env)
         camera_mapping = active_camera_mapping(args.policy_schema, args.camera_layout, camera_mapping)
         validate_camera_mapping(policy_obs, camera_mapping)
@@ -1870,6 +1917,23 @@ def main() -> None:
             keep_open(simulation_app, env, args.keep_open_s)
             return
 
+        env_step_dt_s = float(env.step_dt)
+        policy_action_hz = args.policy_action_hz
+        if policy_action_hz is None:
+            policy_action_hz = 30.0 if args.policy_schema == "so101-new-embodiment" else 1.0 / env_step_dt_s
+        env_steps_per_policy_action, effective_policy_action_hz = resolve_env_steps_per_policy_action(
+            policy_action_hz,
+            env_step_dt_s,
+        )
+        print(
+            "[runner] action timing "
+            f"requested_policy_hz={policy_action_hz:.6g} "
+            f"env_step_dt_s={env_step_dt_s:.8g} env_step_hz={1.0 / env_step_dt_s:.6g} "
+            f"env_steps_per_policy_action={env_steps_per_policy_action} "
+            f"effective_policy_hz={effective_policy_action_hz:.6g}",
+            flush=True,
+        )
+
         # 先 ping bridge，确认 GR00T 进程已经启动，并打印 modality schema。
         print("[runner] ping bridge", flush=True)
         ping = request(args.bridge_host, args.bridge_port, {"endpoint": "ping"}, args.timeout_s)
@@ -1877,9 +1941,24 @@ def main() -> None:
             raise RuntimeError(ping)
 
         print(f"[runner] bridge modality: {ping.get('modality')}", flush=True)
+        print(f"[runner] bridge action decoding: {ping.get('action_decoding')}", flush=True)
         validate_bridge_camera_layout(args, ping)
 
         print(f"[runner] initial joint_pos values={tensor_values(policy_obs['joint_pos'])}", flush=True)
+        if so101_runtime_joint_limits is not None:
+            initial_joint_rad = policy_obs["joint_pos"].detach().cpu().numpy()[0].astype(np.float32)
+            initial_joint_motor = isaac_rad_to_lerobot_motor(initial_joint_rad)
+            print(
+                "[runner] SO101 state conversion "
+                f"Isaac radians={initial_joint_rad.round(4).tolist()} -> "
+                f"LeRobot motor units={initial_joint_motor.round(4).tolist()}",
+                flush=True,
+            )
+            print(
+                "[runner] SO101 Isaac runtime soft joint limits radians="
+                f"{so101_runtime_joint_limits.detach().cpu().numpy().round(4).tolist()}",
+                flush=True,
+            )
         print_metrics(env, "initial", args.robot, target_object_name)
 
         build_observation = build_oxe_observation
@@ -1921,6 +2000,11 @@ def main() -> None:
 
             action = reply["action"]
             print(f"[runner] action keys: {sorted(action.keys())}", flush=True)
+            if args.policy_schema == "so101-new-embodiment":
+                print(
+                    "[runner] SO101 action values below are decoded absolute LeRobot motor units",
+                    flush=True,
+                )
             print(f"[runner] action summary: {summarize_action(action)}", flush=True)
 
             if args.dry_run:
@@ -1928,116 +2012,80 @@ def main() -> None:
                 continue
 
             # 决定这个 chunk 执行多少步。
-            # 默认 action_horizon=0，表示完整执行 GR00T 返回的 40 步。
-            num_action_steps = action_chunk_len(action) if args.action_horizon <= 0 else args.action_horizon
+            # 默认 action_horizon=0，表示执行 GR00T 返回的完整 chunk；长度由 checkpoint schema 决定。
+            returned_chunk_len = action_chunk_length(action)
+            num_action_steps = (
+                returned_chunk_len if args.action_horizon <= 0 else min(args.action_horizon, returned_chunk_len)
+            )
+            if args.action_horizon > returned_chunk_len:
+                print(
+                    "[runner] requested action horizon exceeds returned chunk; "
+                    f"requested={args.action_horizon} returned={returned_chunk_len} "
+                    f"executing={num_action_steps}",
+                    flush=True,
+                )
             print(f"[runner] executing {num_action_steps} action steps from this chunk", flush=True)
 
             # 第一次真正执行动作前启动 viewport capture。这样不会把等待 GR00T
             # 推理的空窗录进去，也能根据第一段 action chunk 估算总帧数。
             if args.capture_video and capture_instance is None:
                 remaining_policy_calls = args.max_policy_calls - call_idx
-                estimated_total_frames = max(1, int(num_action_steps * remaining_policy_calls))
+                estimated_total_frames = max(
+                    1,
+                    int(num_action_steps * remaining_policy_calls * env_steps_per_policy_action),
+                )
                 capture_instance = start_viewport_video_capture(args, estimated_total_frames)
 
             # 内层循环：逐步执行 action chunk。
             for step_idx in range(num_action_steps):
-                if args.policy_schema == "so101-new-embodiment":
-                    step_action = {}
-                    if "single_arm" in action and action["single_arm"].shape[1] > step_idx:
-                        step_action["single_arm"] = action["single_arm"][:, step_idx : step_idx + 1, :]
-                    if "gripper" in action and action["gripper"].shape[1] > step_idx:
-                        step_action["gripper"] = action["gripper"][:, step_idx : step_idx + 1, :]
-                    if not step_action:
-                        step_action = action
-                    command = so101_new_embodiment_action_to_leisaac_tensor(
-                        step_action,
-                        env.device,
-                        policy_obs["joint_pos"],
-                        arm_delta_scale=args.so101_arm_delta_scale,
-                        max_arm_delta=args.so101_max_arm_delta,
-                        gripper_min=args.so101_gripper_min,
-                        gripper_max=args.so101_gripper_max,
-                    )
-                elif args.control_mode == "eef":
-                    # EEF 路线：取当前时间步的 eef_9d 和 gripper_position。
-                    step_action = {}
-                    if "eef_9d" in action and action["eef_9d"].shape[1] > step_idx:
-                        step_action["eef_9d"] = action["eef_9d"][:, step_idx : step_idx + 1, :]
-                    if "gripper_position" in action and action["gripper_position"].shape[1] > step_idx:
-                        step_action["gripper_position"] = action["gripper_position"][:, step_idx : step_idx + 1, :]
-                    command = eef_action_to_leisaac_tensor(step_action, env.device, policy_obs, args.robot)
-                else:
-                    # Joint 路线：取当前时间步的 joint_position。
-                    step_action = {}
-                    if "joint_position" in action and action["joint_position"].shape[1] > step_idx:
-                        step_action["joint_position"] = action["joint_position"][:, step_idx : step_idx + 1, :]
-                    if "gripper_position" in action and action["gripper_position"].shape[1] > step_idx:
-                        step_action["gripper_position"] = action["gripper_position"][:, step_idx : step_idx + 1, :]
-                    if not step_action:
-                        step_action = action
-                    command = joint_action_to_leisaac_tensor(step_action, env.device, policy_obs["joint_pos"], args.robot)
+                command = action_step_to_leisaac_tensor(
+                    args,
+                    action,
+                    step_idx,
+                    env.device,
+                    policy_obs,
+                    so101_runtime_joint_limits,
+                )
 
                 # 只在每个 chunk 的第一步打印 command，避免日志过大。
                 if step_idx == 0:
-                    cmd_np = command.detach().cpu().numpy()
-                    if args.control_mode == "eef":
-                        # EEF mode 下，当前值是 `[xyz, quat, gripper]`。
-                        joint_np = policy_obs["joint_pos"].detach().cpu().numpy()
-                        if args.robot == "franka":
-                            gripper_np = np.ones((joint_np.shape[0], 1), dtype=np.float32)
-                        else:
-                            gripper_np = joint_np[:, 5:6]
-                        cur_np = np.concatenate(
-                            [
-                                policy_obs["ee_frame_state"].detach().cpu().numpy()[:, :7],
-                                gripper_np,
-                            ],
-                            axis=1,
+                    log_first_leisaac_command(args, command, policy_obs)
+
+                # Zero-order hold: one policy action represents one policy period.
+                # For the 30 Hz SO101 data and 60 Hz env this sends the same target
+                # through two env.step() calls instead of time-compressing the chunk.
+                for _ in range(env_steps_per_policy_action):
+                    # LeIsaac 原本会根据 gripper 距离物体动态调整 effort limit。
+                    # 因为我们绕开了 LeIsaac 的 teleop loop，所以这里手动调用一次。
+                    if env.cfg.dynamic_reset_gripper_effort_limit:
+                        dynamic_reset_gripper_effort_limit_sim(env, teleop_device)
+
+                    # 真正把保持中的 action target 送进 IsaacLab env。
+                    # 返回值：obs, reward, terminated, timed_out, info。
+                    obs, _, terminated, timed_out, _ = env.step(command)
+                    policy_obs = obs["policy"]
+
+                    # 用每个 env step 的新 observation 更新相机历史。
+                    build_observation(policy_obs, history, args.instruction, args.robot, camera_mapping)
+
+                    if terminated[0] or timed_out[0]:
+                        print(
+                            f"[runner] episode ended: terminated={terminated[0]} timed_out={timed_out[0]}",
+                            flush=True,
                         )
-                    elif args.robot == "franka":
-                        joint_np = policy_obs["joint_pos"].detach().cpu().numpy()
-                        cur_np = np.concatenate(
-                            [joint_np[:, :7], np.ones((joint_np.shape[0], 1), dtype=np.float32)],
-                            axis=1,
-                        )
-                    else:
-                        # Joint mode 下，当前值就是 6D joint_pos。
-                        cur_np = policy_obs["joint_pos"].detach().cpu().numpy()
+                        if not args.ignore_terminations:
+                            stop_run = True
+                            break
 
-                    delta_np = cmd_np - cur_np
-                    print(
-                        "[runner] first LeIsaac command "
-                        f"shape={tuple(cmd_np.shape)} min={float(cmd_np.min()):.4f} max={float(cmd_np.max()):.4f} "
-                        f"values={cmd_np[0].round(4).tolist()} "
-                        f"delta={delta_np[0].round(4).tolist()}",
-                        flush=True,
-                    )
-
-                # LeIsaac 原本会根据 gripper 距离物体动态调整 effort limit。
-                # 因为我们绕开了 LeIsaac 的 teleop loop，所以这里手动调用一次。
-                if env.cfg.dynamic_reset_gripper_effort_limit:
-                    dynamic_reset_gripper_effort_limit_sim(env, teleop_device)
-
-                # 真正把 action 送进 IsaacLab env。
-                # 返回值：obs, reward, terminated, timed_out, info。
-                obs, _, terminated, timed_out, _ = env.step(command)
-                policy_obs = obs["policy"]
-
-                # 用新 observation 更新相机历史。
-                build_observation(policy_obs, history, args.instruction, args.robot, camera_mapping)
-
-                if terminated[0] or timed_out[0]:
-                    print(f"[runner] episode ended: terminated={terminated[0]} timed_out={timed_out[0]}", flush=True)
-                    if not args.ignore_terminations:
+                    if not simulation_app.is_running():
                         stop_run = True
                         break
 
-                if not simulation_app.is_running():
-                    stop_run = True
-                    break
+                    if args.render_sleep_s > 0:
+                        time.sleep(args.render_sleep_s)
 
-                if args.render_sleep_s > 0:
-                    time.sleep(args.render_sleep_s)
+                if stop_run:
+                    break
 
             print(f"[runner] latest joint_pos values={tensor_values(policy_obs['joint_pos'])}", flush=True)
             print_metrics(env, f"after policy call {call_idx + 1}", args.robot, target_object_name)

@@ -1,905 +1,54 @@
-# Zero-shot：把 GR00T 接到 LeIsaac SmartTask
+# GR00T bridge + LeIsaac SmartTask 部署指南
 
-读完这份文件，你应该能说清楚三件事：
+这份 README 只回答一件事：如何把 GR00T action 安全地送进 LeIsaac SmartTask。
 
-1. 为什么 IsaacLab 和 GR00T 要拆成两个进程。
-2. Observation 如何从 LeIsaac SmartTask 转成 GR00T OXE/DROID schema。
-3. 如何把 base GR00T 部署到 LeIsaac 已有 SmartTask 资产里做仿真推理。
+主线是 SO101 微调 checkpoint；`zero-shot-oxe` 和 Franka 只用于对照。真实 SO101
+硬件部署不在这里，当前 runner 驱动的是 Isaac 中的机器人。
 
-如果要在任意 Ubuntu 机器上先搭环境，看通用安装剧本：[ubuntu_env_setup/README_ZH.md](../ubuntu_env_setup/README_ZH.md)。
+## 1. 先选路线
 
-当前默认 GR00T 环境是 Python 3.12 checkout：`~/Isaac-GR00T-py312`。旧
-`~/Isaac-GR00T` Python 3.10 checkout 只作为回滚 / 对照环境。
-
-## 机器视角
-
-| 机器 | 推荐用途 | 需要放的资产 |
+| 目的 | bridge 参数 | runner 参数 |
 |---|---|---|
-| 本机 RTX 5060 Ti | 主要 zero-shot 调试机：Isaac viewport、camera debug、2x2 视频对照 | `smart_project`、`leisaac/`、`Isaac-GR00T-py312`、`conda isaaclab` |
-| 其他 Ubuntu GPU 机器 | 只要已经按通用安装剧本补齐 Isaac/LeIsaac runtime，也可以跑同一套命令；env 名不必叫 `leisaac` | `SMART_PROJECT`、`LEISAAC_ROOT`、`LEISAAC_ENV`、`GROOT_ROOT` |
+| 部署 SO101 微调权重 | `--deployment-mode so101-finetuned` | 同左，`--robot so101 --control-mode joint` |
+| base model 对照 | `--deployment-mode zero-shot-oxe` | 同左，SO101 或 Franka |
 
-本阶段的核心不是训练，而是问：base GR00T N1.7 在 LeIsaac SmartTask 场景里能不能产生有意义的动作流。
-
-本阶段只覆盖“LeIsaac 仿真资产中的推理”：
+第一次运行固定按下面的顺序：
 
 ```text
-LeIsaac SmartTask scene / SO101 USD / IsaacLab env
--> run_smart_task_closed_loop.py
--> socket bridge
--> GR00T base model
+相机检查 -> bridge dry-run -> 一个 policy action -> 再增加 horizon/calls
 ```
 
-它不是完整真实 SO101 真机部署。真实 SO101 需要另一个 hardware runner：从真实相机和真实关节读 observation，再把动作安全限幅后发给真实机器人。
+## 2. 每个新终端先恢复路径
 
-## 背景与原理
-
-原长文中与 zero-shot 相关的正文如下。这份文档解释 `experiments/groot_n17_isaac_smart_task` 这个实验目录做了什么、为什么这么做、如何复用 LeIsaac 里已有的 Isaac 场景，以及 Isaac 侧和 GR00T 侧是如何桥接起来的。
-
-## 1. 实验目标
-
-你的同事项目里已经有一套 LeIsaac SmartTask：
-
-- 场景资产在 `leisaac/assets/scenes/smart_scene`。
-- SO101 follower 机器人 USD 在 `leisaac/assets/robots`。
-- 任务注册名是 `LeIsaac-SO101-SmartTask-v0`。
-- 数据采集链路曾经使用真实 SOARM/SO101 demo arm 联动 Isaac 中的 SO101 follower，再把图像和机器人状态整理成 HDF5 / LeRobot 数据。
-
-但这次实验的目标不是继续验证 LeRobot / SmolVLA 路线，而是验证：
-
-> 在尽量绕开 LeRobot policy stack 的情况下，GR00T N1.7 base model 能不能在这个 Isaac 场景里做 zero-shot pick。
-
-换句话说，我们想回答的问题是：
-
-- GR00T N1.7 在没有针对 SO101 和这个乐高任务微调的情况下，会不会输出有意义动作？
-- 如果动作失败，失败是模型 zero-shot 能力边界，还是 LeRobot/LeIsaac 中间层造成的摩擦？
-- 如果绕开 LeRobot policy stack，直接把 Isaac observation 给 GR00T，再把 GR00T action 落到 Isaac 机器人上，结果会不会更真实地反映 N1.7 的潜力？
-
-## 2. 为什么没有直接改 LeIsaac policy client
-
-LeIsaac 的历史定位是把 Isaac 和 LeRobot 桥接起来：
-
-1. 用 USD 资产在 Isaac 中加载 SO101 机器人和 SmartTask 场景。
-2. 连接真实 SOARM/SO101 demo arm，让真实机械臂动作联动仿真中的 follower。
-3. 通过 teleop 演示完成 pick。
-4. 采集 Isaac 中的相机图像和机器人 state。
-5. 转换成 LeRobot 数据集格式，用于 LeRobot 生态里的模型训练/部署。
-
-这条链路对采集数据和使用 LeRobot 模型非常有价值，但对 GR00T N1.7 zero-shot 验证有两个问题：
-
-- 当前 LeRobot / LeIsaac 代码里没有原生、成熟的 N1.7 部署路径。
-- N1.7 的官方模型更接近 DROID/Franka/通用 EEF action schema，而不是 SO101 原生 6D joint schema。
-
-如果强行把 N1.7 塞进 LeRobot policy client，失败时很难判断：
-
-- 是 N1.7 zero-shot 本身不行？
-- 是 SO101 embodiment 不匹配？
-- 是 LeRobot/LeIsaac adapter 映射错了？
-- 是 action schema 被错误压缩了？
-
-所以这个实验目录采用了更干净的结构：
-
-- 复用 LeIsaac 已经搭好的 Isaac scene、robot、task。
-- 不改 LeIsaac 主工程的 policy client。
-- 不把 GR00T 依赖装进 IsaacLab 环境。
-- 不把 IsaacLab 依赖装进 GR00T venv。
-- 用一个很小的本地 socket bridge 连接两个隔离环境。
-
-## 3. 目录结构
-
-```text
-experiments/groot_n17_isaac_smart_task/
-├── README.md                              # 三阶段总索引，根目录唯一文档
-├── zero_shot_isaac_smart_task/            # 本阶段
-│   ├── README_ZH.md
-│   ├── LEISAAC_ACTION_ADAPTER_AUDIT_ZH.md
-│   ├── wire.py
-│   ├── groot_bridge_server.py
-│   ├── run_smart_task_closed_loop.py
-│   └── franka_smart_task/
-├── full_finetune_so101/
-│   ├── README_ZH.md
-│   ├── train_so101_synthetic_groot.py
-│   └── so101_synthetic_groot_config.py
-└── lowmem_lora_freeze_so101/
-    ├── README_ZH.md
-    └── train_so101_synthetic_groot_lowmem.py
-```
-
-本阶段核心文件含义：
-
-- `wire.py`：Isaac 进程和 GR00T 进程之间的通信协议。负责 socket、pickle、numpy array 序列化。
-- `groot_bridge_server.py`：运行在 GR00T venv 中，加载 `nvidia/GR00T-N1.7-3B`，对 Isaac 侧提供 `ping/get_action/reset/shutdown` 接口。
-- `run_smart_task_closed_loop.py`：运行在 `conda isaaclab` 中，启动 LeIsaac SmartTask 或本阶段注册的 Franka SmartTask，构造 GR00T observation，接收 action，并驱动 Isaac 中的机器人。
-- `franka_smart_task/__init__.py`：注册新的 gymnasium task id：`Groot-Franka-SmartTask-v0`。
-- `franka_smart_task/franka_smart_task_env_cfg.py`：定义 Franka 版本 SmartTask 的 IsaacLab env config。
-
-新命令直接使用本阶段子目录里的入口。
-
-## 4. 两个 Python 环境如何隔离
-
-本实验明确分成两个进程：
-
-### 4.1 GR00T 进程
-
-运行命令：
+目标机：
 
 ```bash
-export SMART_PROJECT="__FILL_SMART_PROJECT__"
-export GROOT_ROOT="__FILL_ISAAC_GROOT_ROOT__"
-
-cd "$SMART_PROJECT"
-"$GROOT_ROOT/.venv/bin/python" \
-  experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task/groot_bridge_server.py \
-  --deployment-mode zero-shot-oxe \
-  --model-path nvidia/GR00T-N1.7-3B \
-  --device cuda
+source /home/guest1/smart_project/experiments/groot_n17_isaac_smart_task/terminal_env.sh target
 ```
 
-这个进程只负责：
-
-- import GR00T。
-- 加载 GR00T N1.7 模型和 processor。
-- 接收 observation。
-- 调用 `policy.get_action()`。
-- 返回 action dict。
-
-它不 import IsaacLab，也不创建 Isaac scene。
-
-### 4.2 Isaac 进程
-
-运行命令示例：
+本机：
 
 ```bash
-export SMART_PROJECT="__FILL_SMART_PROJECT__"
-export LEISAAC_ROOT="${LEISAAC_ROOT:-$SMART_PROJECT/leisaac}"
-export LEISAAC_ASSETS_ROOT="$LEISAAC_ROOT/assets"
-: "${LEISAAC_ENV:?set LEISAAC_ENV first, e.g. isaaclab / leisaac / leisaac_clean}"
-
-source "$(conda info --base)/etc/profile.d/conda.sh"
-conda activate "$LEISAAC_ENV"
-export OMNI_KIT_ACCEPT_EULA=YES
-
-cd "$SMART_PROJECT"
-
-export PYTHONPATH="$SMART_PROJECT/experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task:$LEISAAC_ROOT/source/leisaac:${PYTHONPATH:-}"
-export PYTHONDONTWRITEBYTECODE=1
-export PYTHONNOUSERSITE=1
-
-python experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task/run_smart_task_closed_loop.py \
-  --deployment-mode zero-shot-oxe \
-  --control-mode eef \
-  --no-headless \
-  --render-sleep-s 0.08 \
-  --keep-open-s 60 \
-  --max-policy-calls 8 \
-  --instruction "Pick up the red 2x4 lego brick."
+source /home/yzliu/physical_ai/company_project/smart_project/experiments/groot_n17_isaac_smart_task/terminal_env.sh local
 ```
 
-这个进程只负责：
-
-- import IsaacLab / LeIsaac。
-- 创建 `LeIsaac-SO101-SmartTask-v0`。
-- 从 Isaac observation 中读取图像、关节状态、末端位姿。
-- 通过 socket 向 GR00T bridge 请求 action。
-- 把 action 转成 LeIsaac 可执行命令。
-- `env.step(command)` 驱动仿真机器人。
-
-它不 import GR00T。
-
-### 4.3 为什么 runner 会主动插入 LeIsaac / IsaacLab 源码路径
-
-当前 runner 优先读取 `LEISAAC_ROOT`。本机 canonical 是：
-
-```text
-$HOME/LeIsaac/dependencies/IsaacLab/source
-```
-
-5090 目标机当前是：
-
-```text
-$SMART_PROJECT/leisaac/dependencies/IsaacLab/source
-```
-
-所以在目标机上显式填：
+上面二选一。脚本只恢复路径变量，不激活 conda。首次使用或换机器后确认目录和 Python：
 
 ```bash
-export LEISAAC_ROOT="$SMART_PROJECT/leisaac"
+test -d "$SMART_PROJECT"
+test -x "$GROOT_ROOT/.venv/bin/python"
+"$GROOT_ROOT/.venv/bin/python" -c \
+  "import sys; print(sys.version); assert sys.version_info[:2] == (3, 12)"
 ```
 
-为了让实验尽量使用同一份 LeIsaac repo 里的 IsaacLab 子模块，`run_smart_task_closed_loop.py` 在 import IsaacLab 之前会把这些路径插到 `sys.path` 最前面：
+## 3. SO101 微调 checkpoint：终端 1 启动 bridge
 
-```text
-$LEISAAC_ROOT/dependencies/IsaacLab/source/isaaclab
-$LEISAAC_ROOT/dependencies/IsaacLab/source/isaaclab_assets
-$LEISAAC_ROOT/dependencies/IsaacLab/source/isaaclab_tasks
-$LEISAAC_ROOT/dependencies/IsaacLab/source/isaaclab_mimic
-```
-
-这一步的含义是：
-
-- 不需要把 IsaacLab source 路径写死在项目里。
-- 不改 conda env。
-- 不改 shell 全局配置。
-- 当前 runner 进程里优先 import workspace 内复制的 IsaacLab / IsaacLab Assets / IsaacLab Tasks。
-
-也就是说，隔离边界仍然是两个进程和两个虚拟环境；只是 Isaac runner 进程内部把公司项目自带源码放在更高优先级。
-
-## 5. 如何复用 LeIsaac 已有场景
-
-Isaac 侧代码没有手动打开 USD 文件，而是复用 LeIsaac 已经注册好的 task。
-
-关键代码在 `run_smart_task_closed_loop.py`：
-
-```python
-import leisaac
-env_cfg = parse_env_cfg(args.task, device=args.device, num_envs=1)
-env = gym.make(args.task, cfg=env_cfg).unwrapped
-```
-
-这里发生了几件事：
-
-1. `import leisaac` 会触发 LeIsaac package 的任务注册副作用。
-2. `args.task` 默认是 `LeIsaac-SO101-SmartTask-v0`。
-3. `parse_env_cfg()` 读取这个 task 对应的 IsaacLab env config。
-4. `gym.make()` 根据这个 config 创建 IsaacLab env。
-
-因此这个实验复用了 LeIsaac 中已有的：
-
-- SmartTask scene config。
-- SO101 follower robot config。
-- camera observation config。
-- red 2x4 lego brick object。
-- end-effector frame transformer。
-- action manager 配置机制。
-
-这也是为什么实验目录没有复制 USD 文件。USD 资产仍然来自 LeIsaac 主工程：
-
-- `leisaac/assets/scenes/smart_scene/scene.usd`
-- `leisaac/assets/robots/so101_follower.usd`
-
-## 5.1 Franka 版本 task 是怎么隔离出来的
-
-为了验证“GR00T N1.7 是否具备 zero-shot 能力”，SO101 版本实验有一个很大的干扰项：
-
-> GR00T N1.7 的 OXE/DROID action schema 更接近 7DoF Franka/DROID 类机器人，而 SO101 是更小、更弱、关节语义完全不同的演示/教育机械臂。
-
-所以新加的 Franka 路线不是为了替代 SO101 路线，而是为了做一个更公平的对照实验：
-
-- 如果 SO101 抓不到，但 Franka 能明显更接近目标，说明 embodiment mismatch 很可能是主要问题。
-- 如果 Franka 也完全没有朝物体去，说明问题更可能在 zero-shot 视觉/语言/任务理解本身。
-- 如果 Franka 能抓起来，那就能更强地证明 N1.7 base model 确实有比较强的 zero-shot pick 能力。
-
-### 5.1.1 task 注册方式
-
-新增文件：
-
-```text
-experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task/franka_smart_task/__init__.py
-```
-
-里面调用：
-
-```python
-gym.register(
-    id="Groot-Franka-SmartTask-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": "franka_smart_task.franka_smart_task_env_cfg:FrankaSmartTaskEnvCfg",
-    },
-)
-```
-
-这里没有修改 LeIsaac 主工程的注册表，而是利用 Python import 的副作用，在 experiments 目录里额外注册一个 task id。runner 里执行：
-
-```python
-import franka_smart_task
-```
-
-之后，`gym.make("Groot-Franka-SmartTask-v0", cfg=env_cfg)` 就可以创建 Franka 版本环境。
-
-### 5.1.2 复用哪些东西
-
-Franka task 仍然复用 LeIsaac 的 `SmartTaskSceneCfg` / observation schema，但
-`__post_init__()` 不再直接走 `SmartTaskEnvCfg.__post_init__()`。原因是
-`SmartTaskEnvCfg.__post_init__()` 里包含 SO101 的 robot init 假设；Franka 版现在
-显式调用更底层的 `SingleArmTaskEnvCfg.__post_init__()`，然后只复刻 SmartTask 需要的
-场景资产解析和 lego 随机化。
-
-所以 Franka 路线继续复用：
-
-- SmartScene USD。
-- 红色 2x4 lego brick。
-- 外部相机 observation key。
-- wrist camera observation key。
-- `camera1/camera3/joint_pos/ee_frame_state` 这套 policy observation 结构。
-- reward / termination / scene entity 命名的大部分约定。
-- IsaacLab ManagerBasedRLEnv 创建方式。
-
-但机器人相关的 init pose、wrist camera、EEF frame、gripper action 和 action manager
-都按 Franka embodiment 重新定义。它不是另起炉灶写一个新仿真项目，而是：
-
-```text
-SmartScene / lego / observation key：复用 LeIsaac
-SO101 外部相机物理机位：复用 LeIsaac
-Franka 外部主视角物理机位：覆盖为 Franka overview camera
-robot / EEF / wrist / gripper / action：按 Franka 语义定义
-```
-
-### 5.1.3 替换哪些东西
-
-Franka task 主要替换四类配置：
-
-1. 机器人资产：
-
-```python
-robot = FRANKA_PANDA_HIGH_PD_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
-```
-
-这里的 `FRANKA_PANDA_HIGH_PD_CFG` 来自你复制进来的 IsaacLab Assets：
-
-```text
-leisaac/dependencies/IsaacLab/source/isaaclab_assets/isaaclab_assets/robots/franka.py
-```
-
-`prim_path="{ENV_REGEX_NS}/Robot"` 保持了 LeIsaac 里 `SceneEntityCfg("robot")` 的命名习惯。也就是说，下游 observation/action/termination 仍然可以通过 scene entity 名字 `"robot"` 找到机器人。
-
-Franka 的 root 初始朝向被设置为绕世界 Z 轴逆时针 90 度：
-
-```python
-self.scene.robot.init_state.rot = (0.70710678, 0.0, 0.0, 0.70710678)
-```
-
-这个四元数的含义是 `yaw=+90deg`。这样做的目的不是改变 Franka 官方 ready pose
-的关节形状，而是把整台 Panda 在 SmartScene 中转向，使 ready pose 下的夹爪朝向
-更自然地对准 lego 所在的任务方向。
-
-2. 末端坐标系：
-
-Franka 没有 SO101 的 follower link 命名，所以 `ee_frame` 改成跟踪 `panda_hand`，并额外保留两个 target frame：
-
-- `end_effector`：用于 `ee_frame_state`，给 GR00T 构造 `state.eef_9d`。
-- `grasp_center`：用于诊断指标和 LeIsaac 原始 `object_grasped` 里对 `target_pos_w[:, 1, :]` 的访问约定。
-
-3. wrist 相机和 top/global 外部相机：
-
-runner 不再硬编码 `camera1/camera3`，而是按 `--camera-profile auto` 解析 role：
-
-```text
-SO101 当前 leisaac:      top/exterior=camera3, wrist=camera2
-SO101 leisaac2 / 旧数据: top/exterior=camera1, wrist=camera3
-Franka 对照 task:        top/exterior=camera1, wrist=camera2
-```
-
-这里要分清两件事：
-
-- 历史 prepared SO101 微调数据中，`camera1` 被整理成 `video.top`，`camera3` 被整理成
-  `video.wrist`。这是训练数据的 schema。
-- 当前同事新版 `leisaac/` 的 live SmartTask 中，`camera1` 是 left，`camera2` 是 robot-mounted
-  wrist，`camera3` 是 front/top。因此把 finetuned checkpoint 部署回新版 live 场景时，
-  runner 会把 `video.top` 接到 live `camera3`，把 `video.wrist` 接到 live `camera2`。
-- Franka 路线中 `camera1` 覆盖为新的 `Scene/franka_overview_camera`，`camera2` 覆盖为
-  `Robot/panda_hand/wrist_camera`。Franka 只是 zero-shot 对照，不是当前主线。
-
-这里有一个重要结论：如果 Franka ready pose 的整体朝向和 lego 所在方向不一致，应该优先旋转
-Franka root，而不是把 wrist 相机单独旋成“看目标”的相机；后者会破坏真实 wrist camera 的语义。
-当前版本已经把 Franka root 逆时针旋转 90 度。wrist camera 仍然挂在 `panda_hand` 下，所以它会
-随着机器人末端自然旋转，不需要额外修改 hand-relative offset。初始目标定位仍主要交给主外部相机
-`camera1`，wrist 相机主要服务于靠近目标和闭合夹爪阶段。
-
-Franka 版还显式去掉了 SO101 模板里遗留的 robot-mounted `front` sensor，避免 Isaac stage 中
-多出一个与当前 GR00T 输入无关的机器人前置相机。
-
-4. action 配置：
-
-Franka 版本支持两种 action mode：
-
-```text
-franka_ik    = 7D EEF pose target + 1D binary gripper
-franka_joint = 7D arm joint target + 1D binary gripper
-```
-
-runner 根据参数自动选择：
-
-```text
---robot franka --control-mode eef   -> franka_ik
---robot franka --control-mode joint -> franka_joint
-```
-
-这让 Franka 路线和 SO101 路线共享同一个 bridge / observation 构造 / action chunk 执行逻辑，但 action manager 是各自独立的。
-
-### 5.1.4 Franka 为什么更适合这个 zero-shot 对照
-
-GR00T bridge 使用的 embodiment tag 是：
-
-```text
-OXE_DROID_RELATIVE_EEF_RELATIVE_JOINT
-```
-
-它的 action/state 里有：
-
-```text
-state.joint_position: 7D
-action.joint_position: 7D
-action.eef_9d: 9D
-action.gripper_position: 1D
-```
-
-SO101 的 arm + gripper 只有 6 维，而且第 6 维是 gripper，不是标准 7DoF arm joint。把 7D DROID/Franka action 硬压到 SO101 上，语义一定会损失。
-
-Franka Panda 则天然是：
-
-```text
-7D arm joints + parallel gripper
-```
-
-所以它可以更直接地承接 GR00T 的 `joint_position` 和 `eef_9d + gripper_position` 输出。这样如果失败，至少可以少一个“机器人形态差太多”的解释。
-
-### 5.1.5 Franka cfg 当前采用的原则
-
-Franka route 当前的原则是：
-
-- 不再把 SO101 的 robot init、历史 camera/sensor 配置、wrist offset 直接套到 Franka 上。
-- 使用 copied IsaacLab 里的 `FRANKA_PANDA_HIGH_PD_CFG`。
-- 使用 copied IsaacLab Franka stack task 的 ready joint pose 作为桌面任务起点。
-- Franka root 绕世界 Z 轴逆时针旋转 90 度，让 ready pose 下的夹爪方向更贴近 SmartScene
-  中 lego 的任务方向。
-- wrist camera 使用 Franka wrist/gripper 视角语义，不强行初始看 lego。
-- `camera1` 这个 observation key 承担 top/global 目标观测；SO101 使用原 SmartScene
-  固定相机，Franka 使用专属的 `franka_overview_camera`。
-- reset 后启用 `rerender_on_reset=True`，避免相机 observation 仍是旧缓存帧。
-
-这也意味着 Franka 路线验证的是“更接近 GR00T OXE/DROID embodiment 的机器人，在同一个
-SmartScene 任务里是否更自然”，而不是“把 SO101 的所有 cfg 名字换成 Franka”。
-
-## 6. Observation 如何从 LeIsaac 转成 GR00T
-
-GR00T N1.7 base model 使用的是 OXE/DROID embodiment：
-
-```text
-OXE_DROID_RELATIVE_EEF_RELATIVE_JOINT
-```
-
-bridge 启动后会打印 modality，大致是：
-
-```text
-video:
-  exterior_image_1_left
-  wrist_image_left
-
-state:
-  eef_9d
-  gripper_position
-  joint_position
-
-action:
-  eef_9d
-  gripper_position
-  joint_position
-
-language:
-  annotation.language.language_instruction
-```
-
-Isaac 侧的 `build_oxe_observation()` 把 LeIsaac observation 映射成这个 schema。
-
-### 6.1 图像映射
-
-runner 按相机语义 role 映射，不把固定 camera 编号当成语义：
-
-```text
-zero-shot OXE:
-  role exterior -> GR00T video.exterior_image_1_left
-  role wrist    -> GR00T video.wrist_image_left
-
-SO101 finetuned NEW_EMBODIMENT:
-  wrist-only -> GR00T video.wrist
-  dual       -> GR00T video.top + video.wrist
-  triple     -> GR00T video.top + video.left + video.wrist
-```
-
-这里有三套不同名字，不能混用：
-
-```text
-训练数据 feature: observation.images.camera1 / camera2 / camera3
-GR00T 稳定语义:    video.top / video.left / video.wrist
-Isaac live key:    camera3 / camera1 / camera2
-```
-
-当前同事 LeIsaac 的默认 live 映射是：
-
-```text
-camera3 -> video.top   (front/top)
-camera1 -> video.left  (left)
-camera2 -> video.wrist (wrist)
-```
-
-部署参数只写 `obs["policy"]` 里的短 key：
+新 bridge 终端先恢复路径。目标机直接执行；本机使用下面注释中的替代行：
 
 ```bash
---front-observation-key camera3 \
---left-observation-key camera1 \
---wrist-observation-key camera2
-```
+source /home/guest1/smart_project/experiments/groot_n17_isaac_smart_task/terminal_env.sh target
+# source /home/yzliu/physical_ai/company_project/smart_project/experiments/groot_n17_isaac_smart_task/terminal_env.sh local
 
-旧参数 `--top-camera-key` / `--front-camera-key` / `--left-camera-key` /
-`--wrist-camera-key` 保留为兼容别名。runner reset 后会逐行打印
-`Isaac obs['policy'][...] -> GR00T video...`，并在请求模型前检查 key 是否存在。
-
-调试相机时可以运行：
-
-```bash
-export SMART_PROJECT="__FILL_SMART_PROJECT__"
-export LEISAAC_ROOT="${LEISAAC_ROOT:-$SMART_PROJECT/leisaac}"
-export LEISAAC_ASSETS_ROOT="$LEISAAC_ROOT/assets"
-: "${LEISAAC_ENV:?set LEISAAC_ENV first, e.g. isaaclab / leisaac / leisaac_clean}"
-
-source "$(conda info --base)/etc/profile.d/conda.sh"
-conda activate "$LEISAAC_ENV"
-export OMNI_KIT_ACCEPT_EULA=YES
-
-cd "$SMART_PROJECT"
-
-export PYTHONPATH="$SMART_PROJECT/experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task:$LEISAAC_ROOT/source/leisaac:${PYTHONPATH:-}"
-export PYTHONDONTWRITEBYTECODE=1
-export PYTHONNOUSERSITE=1
-
-python experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task/run_smart_task_closed_loop.py \
-  --deployment-mode so101-finetuned \
-  --robot so101 \
-  --control-mode joint \
-  --headless \
-  --debug-cameras-only
-```
-
-这个模式不会连接 GR00T bridge，只会 reset Isaac env，一次性打印：
-
-- policy 中 `camera1/camera2/camera3` 的 shape、像素范围、均值和方差。
-- InteractiveScene 中实际注册了哪些 sensors。
-- USD stage 中实际有哪些 camera prim。
-- wrist camera 和 gripper/body 的世界坐标关系。
-- 当前三路 policy 图像 PNG，默认保存在 `runs/camera_debug/`。
-
-GR00T OXE/DROID config 的 video delta indices 是 `[-15, 0]`，意思是模型希望看到一个历史帧和一个当前帧。实验里用 `FrameHistory` 保存相机历史，然后取最旧帧和最新帧，组成：
-
-```text
-shape = (1, 2, H, W, 3)
-```
-
-含义：
-
-- `1`：batch size。
-- `2`：两帧图像。
-- `H, W, 3`：RGB 图像。
-
-### 6.2 EEF 状态映射
-
-LeIsaac 给的末端状态是：
-
-```text
-ee_frame_state = [x, y, z, qw, qx, qy, qz]
-```
-
-GR00T 需要的是：
-
-```text
-eef_9d = [x, y, z, rot6d...]
-```
-
-所以代码会把四元数 `quat(wxyz)` 转成旋转矩阵前两行 flatten 后的 `rot6d`。
-
-### 6.3 Joint 状态映射
-
-SO101 的 joint state 是 6 维：
-
-```text
-[shoulder_pan, shoulder_lift, elbow_flex, wrist_flex, wrist_roll, gripper]
-```
-
-OXE/DROID 的 `joint_position` 是 7 维。实验里做了一个非常粗的 padding：
-
-```text
-SO101 6D -> DROID 7D
-[j0, j1, j2, j3, j4, j5, 0]
-```
-
-这只是为了让 schema 对上，不代表语义完全正确。
-
-Franka 的 arm 正好是 7DoF，所以：
-
-```text
-Franka panda_joint1..7 -> DROID 7D joint_position
-```
-
-这比 SO101 padding 合理得多，但仍然要注意：GR00T 输出的是 DROID/OXE 训练语义下的
-relative joint action，不等于“任何 7DoF 机器人都能直接完美执行”。
-
-### 6.4 Gripper 状态映射
-
-SO101 第 6 个 joint 是 gripper，所以：
-
-```text
-state.gripper_position = joint_pos[5]
-```
-
-shape 写成 `(1, 1, 1)`，符合 GR00T 的 batch/time/dim 约定。
-
-Franka 则有两个 finger joint，当前实验取两个 finger joint 的平均开口作为：
-
-```text
-state.gripper_position = mean(panda_finger_joint1, panda_finger_joint2)
-```
-
-### 6.5 Language 映射
-
-语言指令传成：
-
-```python
-{
-  "annotation.language.language_instruction": [[instruction]]
-}
-```
-
-这里的双层 list 表示：
-
-- batch size = 1。
-- language timestep = 1。
-
-## 7. GR00T bridge 如何工作
-
-`groot_bridge_server.py` 中的核心是：
-
-```python
-policy = Gr00tPolicy(
-    embodiment_tag=embodiment_tag,
-    model_path=args.model_path,
-    device=args.device,
-    strict=not args.no_strict,
-)
-```
-
-这个 policy 会：
-
-1. 加载 GR00T 模型权重。
-2. 加载 processor。
-3. 校验输入 observation 是否符合 modality schema。
-4. 把 observation 编码成模型输入。
-5. 调用模型生成 action。
-6. decode action 到物理数值空间。
-
-Isaac 侧每次请求：
-
-```python
-reply = request(
-    args.bridge_host,
-    args.bridge_port,
-    {"endpoint": "get_action", "observation": groot_obs},
-    args.timeout_s,
-)
-```
-
-bridge 侧收到后执行：
-
-```python
-action, info = policy.get_action(request["observation"], request.get("options"))
-```
-
-然后把 action 返回 Isaac 侧。
-
-## 8. 通信协议为什么用 socket + pickle
-
-实验没有用 ROS、ZMQ、HTTP 或 gRPC，而是用了最小的 TCP socket + 标准库 pickle。
-
-原因是：
-
-- 不给任何环境安装新依赖。
-- 不引入额外服务框架。
-- 只需要本机进程间通信。
-- observation/action 主要是 numpy array，pickle 可以直接传输这些本地 Python 对象。
-
-`wire.py` 中的协议是：
-
-```text
-8 字节 header：payload 长度
-N 字节 payload：pickle 编码后的 dict
-```
-
-bridge 默认只监听 `127.0.0.1`，这条 pickle 协议只用于本机可信进程之间通信；不要把它开放给不可信网络。
-
-## 9. Action 如何从 GR00T 转回 LeIsaac
-
-这是这个实验最关键的部分。目前支持两条路线。
-
-### 9.1 Joint 路线
-
-运行参数：
-
-```bash
---control-mode joint
-```
-
-Isaac action mode：
-
-```text
-SO101  -> so101leader
-Franka -> franka_joint
-```
-
-GR00T 输出：
-
-```text
-action.joint_position: shape = (1, 40, 7)
-```
-
-实验处理：
-
-```text
-SO101:  取前 6 维 -> LeIsaac SO101 6D joint command
-Franka: 7D relative joint action + current joint state -> Franka 7D joint target
-```
-
-问题：
-
-- GR00T 的 joint_position 是 DROID/Franka 类机器人语义。
-- SO101 是完全不同的 5DoF arm + gripper。
-- SO101 直接取前 6 维会非常粗糙，容易动作小、不朝任务目标去。
-- Franka joint route 形态更匹配，但仍受 GR00T joint action 语义和当前场景分布影响。
-
-实际日志也显示，joint 路线里模型并非完全没 action，但执行到 SO101 上后动作幅度和语义都不理想。
-
-### 9.2 EEF 路线
-
-运行参数：
-
-```bash
---control-mode eef
-```
-
-Isaac action mode：
-
-```text
-SO101  -> mimic_so101leader
-Franka -> franka_ik
-```
-
-这两个模式都使用 Differential IK，action 格式是：
-
-```text
-[x, y, z, qw, qx, qy, qz, gripper]
-```
-
-GR00T 输出：
-
-```text
-action.eef_9d: shape = (1, 40, 9)
-action.gripper_position: shape = (1, 40, 1)
-```
-
-实验处理：
-
-1. 读取当前末端位姿：
-
-```text
-current_eef = [x, y, z, qw, qx, qy, qz]
-```
-
-2. 把 GR00T 的 `eef_9d` 当作相对 EEF delta：
-
-```text
-delta = [dx, dy, dz, rot6d...]
-```
-
-3. 组合当前 pose 和 delta：
-
-```text
-target_pose = current_pose @ delta_pose
-```
-
-4. 拼上 gripper：
-
-```text
-command = [target_x, target_y, target_z, target_qw, target_qx, target_qy, target_qz, target_gripper]
-```
-
-5. 调用：
-
-```python
-env.step(command)
-```
-
-对 Franka 来说，最后一维 gripper 不是 SO101 的连续 gripper joint target，而是
-`BinaryJointPositionActionCfg` 的开/合命令：正数表示 open，负数表示 close。
-
-这条路线更接近跨机器人迁移，因为末端位姿比原始关节更接近机器人无关的动作表达。
-
-实际观察中，EEF 路线明显比 joint 路线动作更大，说明 GR00T 输出的 EEF action 确实更有信号。
-
-## 10. 当前实验观察和结论
-
-目前观察到：
-
-- joint 路线动作很小或语义不明显。
-- EEF 路线动作明显更大。
-- 但在当前 SO101 + SmartTask + OXE/DROID zero-shot setup 下，没有可靠抓起红色 2x4 lego。
-- Franka 路线已经隔离出来，并且不再照搬 SO101 的 robot/camera/wrist cfg。
-- Franka 的 top/global 外部相机 `camera1` 已改成
-  Franka 专属的 `franka_overview_camera`；它能看到 Panda 全局姿态、桌面和目标物。
-- wrist 相机保持末端/夹爪视角语义，不再强行旋向 lego。
-
-这说明：
-
-1. GR00T N1.7 并不是完全没有输出动作。
-2. 之前“看起来没动作”的主要原因，是 joint action schema 落到 SO101 上非常别扭。
-3. EEF/IK 路线更能释放 GR00T 的动作意图。
-4. Franka 路线更适合判断 N1.7 在 OXE/DROID 风格 embodiment 下的真实表现。
-5. 但 zero-shot 到这个 SmartScene/lego pick 任务是否能成功，仍需要继续用 Franka EEF/IK 长一点的闭环视频来观察。
-
-更准确的结论应该是：
-
-> N1.7 base model 在这个 LeIsaac SmartTask 场景中有非空、较强的末端动作意图；EEF 控制路线比 joint 硬映射合理得多。但在没有针对 SO101 embodiment 和该任务微调的情况下，当前 setup 没有实现可靠 zero-shot pick。
-
-对 Franka 路线更准确的说法是：
-
-> Franka task 已经变成更干净的 embodiment 对照：场景仍是同一个 SmartScene，但 robot/EEF/wrist/gripper/action 都按 Franka 语义处理。接下来 Franka 的失败或成功，更能说明 GR00T N1.7 在相对接近 OXE/DROID embodiment 的设置下是否具备 zero-shot pick 能力。
-
-## 11. 为什么这不是“模型完全不行”的证明
-
-当前失败仍然混合了多个因素：
-
-- GR00T base model 的预训练 embodiment 更偏 DROID/Franka/通用 EEF，不是 SO101。
-- SO101 自由度少，IK 能力受限。
-- SO101 gripper 的尺度和 DROID/Franka gripper 语义未必一致。
-- 这个 SmartTask 场景和红色 lego pick 的视觉/几何分布未必在 base model 舒适区。
-- 当前 EEF relative/absolute 解读仍然是实验假设，需要更多日志验证。
-- Franka 版本虽然减少了 SO101 morphology mismatch，并把主外部相机改成了适合 Panda
-  的 overview view，但 SmartScene 的物体布局和夹爪初始朝向仍然不是 GR00T 官方任务配置。
-
-所以当前结果更适合被理解为：
-
-> 原生 N1.7 路线已经跑通，动作通路也有信号；但要得到真正 pick 成功，可能需要 embodiment 对齐、少量微调、或者换更接近官方支持的 Franka/DROID 类机器人场景。
-
-## 12. 下一步建议
-
-建议后续按优先级做：
-
-1. 优先部署 SO101 `NEW_EMBODIMENT` 微调 checkpoint，先 `--debug-cameras-only` 确认 live `top/wrist`
-   映射，再 `--dry-run` 确认 bridge 返回 `single_arm/gripper`。
-2. dry-run 通过后，开 viewport 短闭环并录制视频；必要时用 `--so101-arm-delta-scale` 和
-   `--so101-max-arm-delta` 压小动作，先看方向是否合理。
-3. zero-shot SO101 / Franka 只作为对照：它们用于判断 base model 和 embodiment mismatch，不再是当前主线。
-4. 如果 finetuned SO101 仍失败，下一步看 open-loop action、相机视角一致性、gripper 尺度和训练数据覆盖。
-5. 真机部署前再补真实 SO101/SOARM 数据或做 HG-DAgger 类修正数据采集。
-
-## 复现命令
-
-每个终端先填这些变量：
-
-```bash
-export SMART_PROJECT="__FILL_SMART_PROJECT__"
-export GROOT_ROOT="__FILL_ISAAC_GROOT_ROOT__"
-export LEISAAC_ROOT="${LEISAAC_ROOT:-$SMART_PROJECT/leisaac}"
-export LEISAAC_ASSETS_ROOT="$LEISAAC_ROOT/assets"
-export LEISAAC_ENV="__FILL_ISAAC_RUNTIME_ENV__"
-```
-
-### 主线：SO101 微调 checkpoint 部署
-
-部署时不用把大 checkpoint 拿回本机。checkpoint 放在目标 Ubuntu 机器本地即可；GR00T bridge
-在同一台机器上加载权重，Isaac runner 只通过 bridge 的 host/port 请求动作。
-
-当前 `groot_bridge_server.py` 暴露的是本地 TCP API，不是 HTTP REST URL。默认监听
-`127.0.0.1:5577`：
-
-- bridge 和 Isaac runner 在同一台目标机：保持默认，不需要传 `--bridge-host`。
-- bridge 已经以某个 API 地址/端口跑起来：runner 用 `--bridge-host <host> --bridge-port <port>`。
-- 如果手头记录的是 `http://host:port/...` 这种 URL，当前 runner 不能直接填完整 URL；
-  只取里面的 `host` 和 `port`，除非另行实现 HTTP adapter。
-- 如果跨机器访问，优先用 SSH tunnel 把远端 `127.0.0.1:5577` 映射到本机，而不是把 pickle
-  协议直接开放到不可信网络。
-
-终端 1：启动 GR00T bridge，加载训练后的 checkpoint。
-
-```bash
 export CHECKPOINT="__FILL_FINETUNED_CHECKPOINT_DIR__"
 
 conda deactivate 2>/dev/null || true
@@ -916,54 +65,34 @@ cd "$SMART_PROJECT"
     --device cuda
 ```
 
-终端 2A：先只看 live LeIsaac 场景里的相机、目标物和 policy observation。
+看到 modality、camera layout 和 `action_decoding` 后再开终端 2。bridge 使用本地
+pickle socket，默认只监听 `127.0.0.1`；不要直接暴露到不可信网络。
+
+## 4. 终端 2 准备 Isaac runner
+
+runner 终端是独立的新终端，也要先恢复路径。目标机直接执行；本机使用注释中的替代行：
 
 ```bash
+source /home/guest1/smart_project/experiments/groot_n17_isaac_smart_task/terminal_env.sh target
+# source /home/yzliu/physical_ai/company_project/smart_project/experiments/groot_n17_isaac_smart_task/terminal_env.sh local
+
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate "$LEISAAC_ENV"
+export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}"
 
-export OMNI_KIT_ACCEPT_EULA=YES
-export LEISAAC_ASSETS_ROOT="$LEISAAC_ROOT/assets"
 cd "$SMART_PROJECT"
-
 export PYTHONPATH="$SMART_PROJECT/experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task:$LEISAAC_ROOT/source/leisaac:${PYTHONPATH:-}"
 export PYTHONDONTWRITEBYTECODE=1
 export PYTHONNOUSERSITE=1
-
-python experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task/run_smart_task_closed_loop.py \
-  --deployment-mode so101-finetuned \
-  --camera-layout dual \
-  --front-observation-key camera3 \
-  --wrist-observation-key camera2 \
-  --robot so101 \
-  --control-mode joint \
-  --headless \
-  --debug-cameras-only \
-  --instruction "Pick up the red 2x4 lego brick."
-```
-
-终端 2B：相机确认后做 dry-run，只请求一次 GR00T，不执行机器人动作。
-
-```bash
 export BRIDGE_HOST="${BRIDGE_HOST:-127.0.0.1}"
 export BRIDGE_PORT="${BRIDGE_PORT:-5577}"
-
-python experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task/run_smart_task_closed_loop.py \
-  --deployment-mode so101-finetuned \
-  --camera-layout dual \
-  --front-observation-key camera3 \
-  --wrist-observation-key camera2 \
-  --robot so101 \
-  --control-mode joint \
-  --bridge-host "$BRIDGE_HOST" \
-  --bridge-port "$BRIDGE_PORT" \
-  --headless \
-  --dry-run \
-  --max-policy-calls 1 \
-  --instruction "Pick up the red 2x4 lego brick."
 ```
 
-终端 2C：dry-run 能看到 `action.single_arm/action.gripper` 后，再开 viewport 可视化并录制。
+不要在这个 conda env 里安装 LeRobot，也不要在这个终端运行 GR00T 训练。
+
+### 4.1 只检查相机和目标物
+
+这一步不连接 bridge：
 
 ```bash
 python experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task/run_smart_task_closed_loop.py \
@@ -973,189 +102,199 @@ python experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task/run_sma
   --wrist-observation-key camera2 \
   --robot so101 \
   --control-mode joint \
+  --smart-target-asset cuboid \
+  --debug-cameras-only \
+  --headless
+```
+
+确认日志包含：
+
+```text
+camera3 -> GR00T video.top
+camera2 -> GR00T video.wrist
+target object state prim_path=... root_pos_w=...
+```
+
+### 4.2 请求一次 action，但不执行
+
+```bash
+python experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task/run_smart_task_closed_loop.py \
+  --deployment-mode so101-finetuned \
+  --camera-layout dual \
+  --front-observation-key camera3 \
+  --wrist-observation-key camera2 \
+  --robot so101 \
+  --control-mode joint \
+  --smart-target-asset cuboid \
+  --bridge-host "$BRIDGE_HOST" \
+  --bridge-port "$BRIDGE_PORT" \
+  --dry-run \
+  --max-policy-calls 1
+```
+
+必须看到 `action.single_arm`、`action.gripper` 和解码后的绝对 LeRobot motor-unit
+契约；契约不一致时 runner 会拒绝继续。
+
+### 4.3 第一次只执行一个 policy action
+
+```bash
+python experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task/run_smart_task_closed_loop.py \
+  --deployment-mode so101-finetuned \
+  --camera-layout dual \
+  --front-observation-key camera3 \
+  --wrist-observation-key camera2 \
+  --robot so101 \
+  --control-mode joint \
+  --smart-target-asset cuboid \
   --bridge-host "$BRIDGE_HOST" \
   --bridge-port "$BRIDGE_PORT" \
   --no-headless \
-  --render-sleep-s 0.08 \
-  --keep-open-s 60 \
-  --max-policy-calls 8 \
-  --capture-video \
-  --capture-name so101_finetuned_checkpoint_probe \
-  --instruction "Pick up the red 2x4 lego brick."
+  --max-policy-calls 1 \
+  --action-horizon 1 \
+  --policy-action-hz 30 \
+  --so101-arm-target-scale 0.3 \
+  --so101-max-arm-step-rad 0.05
 ```
 
-上面是 dual 示例。checkpoint 使用哪种训练布局，bridge 和 runner 就必须同时使用同一种布局：
+先看运动方向和日志里的单位转换。方向正确后，保持安全参数不变，依次增加：
 
 ```text
-wrist-only:
-  bridge --camera-layout wrist-only
-  runner --camera-layout wrist-only --wrist-observation-key camera2
-
-dual:
-  bridge --camera-layout dual
-  runner --camera-layout dual --front-observation-key camera3 --wrist-observation-key camera2
-
-triple:
-  bridge --camera-layout triple
-  runner --camera-layout triple --front-observation-key camera3 \
-         --left-observation-key camera1 --wrist-observation-key camera2
+action-horizon:   1 -> 2 -> 4 -> 完整 chunk
+max-policy-calls: 1 -> 2 -> 4
 ```
 
-bridge 会报告实际 modality；runner 会检查它是否分别等于 `[wrist]`、`[top,wrist]` 或
-`[top,left,wrist]`。两边布局不一致时，在第一次模型请求前直接退出。
+## 5. 三种相机布局
 
-如果动作幅度太大或方向需要先保守观察，可以先加：
+bridge 和 runner 的 `--camera-layout` 必须与训练 checkpoint 一致。
 
-```bash
---so101-arm-delta-scale 0.3 --so101-max-arm-delta 0.08
+| layout | bridge | runner live mapping |
+|---|---|---|
+| `wrist-only` | `--camera-layout wrist-only` | `--wrist-observation-key camera2` |
+| `dual` | `--camera-layout dual` | `camera3 -> top`，`camera2 -> wrist` |
+| `triple` | `--camera-layout triple` | `camera3 -> top`，`camera1 -> left`，`camera2 -> wrist` |
+
+prepared 数据里的历史 key 与 live key 不是同一概念：
+
+```text
+训练语义：video.top / video.left / video.wrist
+当前 live：camera3 / camera1 / camera2
 ```
 
-### 对照：zero-shot base model
+## 6. 动作单位和四个安全参数
 
-终端 1：启动 GR00T bridge。
+SO101 微调部署链路是：
+
+```text
+Isaac radians
+-> LeRobot motor units 作为 GR00T state
+-> GR00T + decode_action
+-> decoded absolute motor target
+-> motor limits
+-> radians
+-> 每个 policy action 的 radian 限幅
+-> Isaac runtime joint limits
+-> env.step()
+```
+
+不要把 `single_arm` 当 radian，也不要执行
+`current_radians + returned_action`。processor 内部可以使用 relative 表示，但
+`Gr00tPolicy.get_action()` 对外返回的是解码后的数据集空间绝对目标。
+
+| 参数 | 含义 |
+|---|---|
+| `--max-policy-calls` | 最多请求多少个 action chunk |
+| `--action-horizon` | 每个 chunk 执行多少个 policy action；`0` 表示完整 chunk |
+| `--so101-arm-target-scale` | 当前姿态朝绝对目标移动的比例，范围 `[0,1]` |
+| `--so101-max-arm-step-rad` | 每个 policy action 的最大关节变化，单位 radian |
+
+旧参数 `--so101-arm-delta-scale` 和 `--so101-max-arm-delta` 只保留兼容，不要再写进新命令。
+
+当前 SO101 数据是 30 Hz，SmartTask env 是 60 Hz，所以 runner 会把每个 policy target
+保持两个 `env.step()`。`0.05 rad` 是第一次仿真方向检查值，不是硬件速度规格；正式阈值应由
+已验证的安全速度乘以 `1 / policy_action_hz` 推导。
+
+准备读或修改这条链路时，看
+[SmartTask 代码阅读约定](../TECHNICAL_CONTRACTS_ZH.md)；实际运行不要求先读完技术手册。
+
+## 7. LEGO USD 补丁
+
+同事的 LEGO USD 缺内部 layer。runner 默认使用：
 
 ```bash
-cd "$SMART_PROJECT"
+--smart-target-asset cuboid
+```
+
+它只在当前 runner 进程中创建红色 2x4 尺寸 cuboid，不修改 `leisaac/`。拿到完整 USD 后改为：
+
+```bash
+--smart-target-asset /absolute/path/to/complete_lego.usd
+```
+
+如果要完全依赖 scene parser，显式使用 `--smart-target-asset scene`。
+
+## 8. Zero-shot 对照
+
+新 bridge 终端先恢复路径，然后改为 zero-shot。目标机直接执行；本机使用注释中的替代行：
+
+```bash
+source /home/guest1/smart_project/experiments/groot_n17_isaac_smart_task/terminal_env.sh target
+# source /home/yzliu/physical_ai/company_project/smart_project/experiments/groot_n17_isaac_smart_task/terminal_env.sh local
+
 "$GROOT_ROOT/.venv/bin/python" \
   experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task/groot_bridge_server.py \
-  --deployment-mode zero-shot-oxe \
-  --model-path nvidia/GR00T-N1.7-3B \
-  --device cuda
+    --deployment-mode zero-shot-oxe \
+    --model-path nvidia/GR00T-N1.7-3B \
+    --device cuda
 ```
 
-终端 2A：启动原始 SO101 SmartTask viewport，并走 joint-space baseline。
-
-```bash
-source "$(conda info --base)/etc/profile.d/conda.sh"
-conda activate "$LEISAAC_ENV"
-
-export OMNI_KIT_ACCEPT_EULA=YES
-cd "$SMART_PROJECT"
-
-export PYTHONPATH="$SMART_PROJECT/experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task:$LEISAAC_ROOT/source/leisaac:${PYTHONPATH:-}"
-export PYTHONDONTWRITEBYTECODE=1
-export PYTHONNOUSERSITE=1
-
-python experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task/run_smart_task_closed_loop.py \
-  --deployment-mode zero-shot-oxe \
-  --robot so101 \
-  --control-mode joint \
-  --no-headless \
-  --render-sleep-s 0.08 \
-  --keep-open-s 60 \
-  --max-policy-calls 8 \
-  --capture-video \
-  --capture-name so101_joint_probe \
-  --instruction "Pick up the red 2x4 lego brick."
-```
-
-终端 2B：启动原始 SO101 SmartTask viewport，并走 EEF/IK 控制路线。
-
-```bash
-source "$(conda info --base)/etc/profile.d/conda.sh"
-conda activate "$LEISAAC_ENV"
-
-export OMNI_KIT_ACCEPT_EULA=YES
-cd "$SMART_PROJECT"
-
-export PYTHONPATH="$SMART_PROJECT/experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task:$LEISAAC_ROOT/source/leisaac:${PYTHONPATH:-}"
-export PYTHONDONTWRITEBYTECODE=1
-export PYTHONNOUSERSITE=1
-
-python experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task/run_smart_task_closed_loop.py \
-  --deployment-mode zero-shot-oxe \
-  --robot so101 \
-  --control-mode eef \
-  --no-headless \
-  --render-sleep-s 0.08 \
-  --keep-open-s 60 \
-  --max-policy-calls 8 \
-  --capture-video \
-  --capture-name so101_eef_probe \
-  --instruction "Pick up the red 2x4 lego brick."
-```
-
-终端 2C：启动 Franka SmartTask viewport，并走 joint-space baseline。
-
-```bash
-source "$(conda info --base)/etc/profile.d/conda.sh"
-conda activate "$LEISAAC_ENV"
-
-export OMNI_KIT_ACCEPT_EULA=YES
-cd "$SMART_PROJECT"
-
-export PYTHONPATH="$SMART_PROJECT/experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task:$LEISAAC_ROOT/source/leisaac:${PYTHONPATH:-}"
-export PYTHONDONTWRITEBYTECODE=1
-export PYTHONNOUSERSITE=1
-
-python experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task/run_smart_task_closed_loop.py \
-  --deployment-mode zero-shot-oxe \
-  --robot franka \
-  --control-mode joint \
-  --no-headless \
-  --render-sleep-s 0.08 \
-  --keep-open-s 60 \
-  --max-policy-calls 8 \
-  --capture-video \
-  --capture-name franka_joint_probe \
-  --instruction "Pick up the red 2x4 lego brick."
-```
-
-终端 2D：启动 Franka SmartTask viewport，并走 EEF/IK 控制路线。
-
-```bash
-source "$(conda info --base)/etc/profile.d/conda.sh"
-conda activate "$LEISAAC_ENV"
-
-export OMNI_KIT_ACCEPT_EULA=YES
-cd "$SMART_PROJECT"
-
-export PYTHONPATH="$SMART_PROJECT/experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task:$LEISAAC_ROOT/source/leisaac:${PYTHONPATH:-}"
-export PYTHONDONTWRITEBYTECODE=1
-export PYTHONNOUSERSITE=1
-
-python experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task/run_smart_task_closed_loop.py \
-  --deployment-mode zero-shot-oxe \
-  --robot franka \
-  --control-mode eef \
-  --no-headless \
-  --render-sleep-s 0.08 \
-  --keep-open-s 60 \
-  --max-policy-calls 8 \
-  --capture-video \
-  --capture-name franka_eef_probe \
-  --instruction "Pick up the red 2x4 lego brick."
-```
-
-这四条命令会得到一个完整的 2x2 对照：
+终端 2 使用：
 
 ```text
-SO101  + joint
-SO101  + EEF/IK
-Franka + joint
-Franka + EEF/IK
+SO101 joint:  --deployment-mode zero-shot-oxe --robot so101 --control-mode joint
+SO101 EEF:    --deployment-mode zero-shot-oxe --robot so101 --control-mode eef
+Franka joint: --deployment-mode zero-shot-oxe --robot franka --control-mode joint
+Franka EEF:   --deployment-mode zero-shot-oxe --robot franka --control-mode eef
 ```
 
-录制实现方式：
+这些是 embodiment 对照，不是 SO101 微调部署主线。
 
-- runner 调用 Isaac Sim 自带的 `omni.kit.capture.viewport`。
-- mp4 编码依赖同环境已有的 `omni.videoencoding`。
-- 默认只录“主动控制阶段”，不录最后 `--keep-open-s` 的静止观察阶段。
-- 默认输出目录是 `experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task/runs/captures/`。
-- 默认视频参数是 `960x540 / 15fps / 2Mbps`，目的是让文件不要太大。
+## 9. 常见失败：停在哪一层
 
-如果文件仍然太大，可以调低：
+| 现象 | 先检查 |
+|---|---|
+| bridge import/checkpoint 失败 | GR00T Python 3.12 venv、checkpoint 路径 |
+| camera key 不存在 | `--debug-cameras-only` 和 layout/live mapping |
+| 看不到 LEGO | `--smart-target-asset cuboid`、日志里的 `root_pos_w` |
+| action contract mismatch | bridge 与 runner 是否来自同一版代码 |
+| joint limit mismatch | 是否加载了另一套 SO101 USD；不要继续执行 |
+| 动作方向错误 | 立即停在 one-step，不要增加 horizon |
+| 30/60 Hz 不整除 | 修正 `--policy-action-hz`，不要绕过报错 |
+
+## 10. 代码边界与测试
+
+```text
+groot_bridge_server.py       GR00T 进程
+run_smart_task_closed_loop.py Isaac/LeIsaac 主流程
+wire.py                      本地 socket 协议
+action_chunk.py              action shape/时间维校验与切片
+action_timing.py             policy/env 频率对齐
+pose_math.py                 quaternion/rot6d/EEF 数学
+so101_joint_units.py         motor units/radians/limits
+tests/                       不启动 SimulationApp 的回归测试
+```
+
+运行测试：
 
 ```bash
---capture-bitrate-mbps 1.0
---capture-width 768
---capture-height 432
---capture-every-nth-frames 2
+source /home/guest1/smart_project/experiments/groot_n17_isaac_smart_task/terminal_env.sh target
+# source /home/yzliu/physical_ai/company_project/smart_project/experiments/groot_n17_isaac_smart_task/terminal_env.sh local
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate "$LEISAAC_ENV"
+cd "$SMART_PROJECT"
+PYTHONDONTWRITEBYTECODE=1 python -m unittest discover \
+  -s experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task/tests -v
 ```
 
-这四条 Isaac 命令共用同一个 GR00T bridge。差别只在：
-
-- SO101 joint：验证“DROID/Franka 风格 7D joint action 硬落到 SO101 joint space”的 baseline。
-- SO101 EEF：验证“原 LeIsaac 机器人 + EEF/IK action 落地”。
-- Franka joint：验证“7D joint action 在 Franka 上是否比 SO101 更自然”。
-- Franka EEF：验证“更接近 GR00T 官方 embodiment 的机器人 + EEF/IK action 落地”。
+环境搭建看 [ubuntu_env_setup/README_ZH.md](../ubuntu_env_setup/README_ZH.md)，数据准备看
+[full_finetune_so101/README_ZH.md](../full_finetune_so101/README_ZH.md)，低显存训练看
+[lowmem_lora_freeze_so101/README_ZH.md](../lowmem_lora_freeze_so101/README_ZH.md)。

@@ -1,0 +1,136 @@
+# SmartTask 代码阅读约定
+
+这是一份代码地图，不是操作手册。运行命令看各阶段 README；准备修改 bridge、runner、
+相机布局或 action 语义时，先确认下面这些跨文件约定。
+
+## 1. 推荐阅读顺序
+
+1. [训练 modality config](full_finetune_so101/so101_synthetic_groot_config.py)
+2. [GR00T bridge](zero_shot_isaac_smart_task/groot_bridge_server.py)
+3. [Isaac runner](zero_shot_isaac_smart_task/run_smart_task_closed_loop.py) 的 `main()`
+4. [action chunk](zero_shot_isaac_smart_task/action_chunk.py)、
+   [时间对齐](zero_shot_isaac_smart_task/action_timing.py)、
+   [SO101 单位](zero_shot_isaac_smart_task/so101_joint_units.py) 和
+   [位姿数学](zero_shot_isaac_smart_task/pose_math.py)
+5. [纯 Python 回归测试](zero_shot_isaac_smart_task/tests/)
+
+先看 config，确定 checkpoint 的输入输出 schema；再沿 bridge 到 runner 看运行时数据流。
+四个小模块是从 runner 拆出的可独立测试边界，不需要启动 SimulationApp。
+
+## 2. 进程和环境边界
+
+| 工作 | 进程 / 环境 | 不应导入 |
+|---|---|---|
+| v3 数据准备 | conda `lerobot` | Isaac / GR00T |
+| stats、训练、bridge | `$GROOT_ROOT/.venv`，Python 3.12 | Isaac / LeIsaac |
+| Isaac runner | conda `leisaac` 或已验证的 IsaacLab env | GR00T / LeRobot |
+
+bridge 与 runner 通过 `wire.py` 的本地 TCP pickle 协议通信。默认只监听
+`127.0.0.1:5577`；它不是面向不可信网络的服务协议。
+
+## 3. 相机约定：角色稳定，live key 可以变化
+
+checkpoint schema 使用语义角色：
+
+```text
+video.top / video.left / video.wrist
+```
+
+当前 SmartTask live observation 默认映射：
+
+```text
+camera3 -> top
+camera1 -> left
+camera2 -> wrist
+```
+
+prepared dataset 的 `camera1/camera2/camera3` 与 live key 不能按名字直接等同。新增 layout
+时必须同时更新训练 config、bridge modality 校验、runner live mapping 和测试。bridge 与
+runner 在执行动作前会比较 layout 和 modality，不一致就停止。
+
+## 4. SO101 action 约定
+
+SO101 微调路线的公开数据契约是：
+
+```text
+Isaac joint radians
+-> LeRobot motor units，作为 GR00T state
+-> Gr00tPolicy.get_action()
+-> decode_action 后的绝对 LeRobot motor target
+-> Isaac joint radians
+-> env.step()
+```
+
+关键点：processor 的 `use_relative_action` 可以表示内部训练变换，但不能据此把
+`get_action()` 的返回值重新解释成 delta。部署侧禁止执行：
+
+```python
+current_radians + returned_action
+```
+
+`so101_joint_units.py` 的实际保护顺序是：
+
+```text
+拒绝错误 shape / NaN / infinity
+-> clip 到 LeRobot motor limits
+-> 绝对 motor target 转 radians
+-> arm_target_scale 从当前姿态向目标插值（只作用于前 5 个 arm joints）
+-> max_arm_step_rad 限制一次 policy action 的 arm radian 变化
+-> clip 到 Isaac runtime soft joint limits
+```
+
+runner 还会核对当前 USD 的 6 个 joint 名称、顺序和范围。更换 SO101 USD、关节顺序、
+符号或范围时，必须同步修改 converter 和测试，不能绕过校验。
+
+## 5. action chunk 和时间约定
+
+GR00T action 数组统一为 `(B, T, D)`。`action_chunk.py` 负责：
+
+- 所有已知 action key 的 `T` 必须一致；
+- 时间维不能为空；
+- 数值必须有限；
+- runner 每次只切出一个 `(B, 1, D)` policy action。
+
+两个容易混淆的参数：
+
+```text
+action_horizon   一个返回 chunk 最多执行多少个 policy action
+max_policy_calls 整个 run 最多向 bridge 请求多少个 chunk
+```
+
+policy 时间基准与 Isaac step 分开。当前数据 30 Hz、env 60 Hz，所以同一个 policy target
+保持两个 `env.step()`。`action_timing.py` 只接受整数倍；非整数比例会报错，而不是静默取整。
+
+`max_arm_step_rad` 是每个 policy action 的位移保护，不是机器人硬件速度规格。正式阈值应由
+验证过的安全速度和 `policy_action_hz` 推导。
+
+## 6. 路线边界
+
+- `so101-finetuned + joint`：当前主线，执行绝对 SO101 motor target。
+- `zero-shot-oxe`：embodiment 对照，不代表存在通用高维 action 到 SO101 的 adapter。
+- `eef`：把相对 EEF-frame `xyz + rot6d` 与当前末端位姿组合，再交给 IK action cfg。
+- Franka：用于更接近 OXE/DROID embodiment 的对照，不等于 SO101 checkpoint 部署。
+
+关于 LeIsaac 为什么没有通用 embodiment adapter 的检索证据，见
+[LEISAAC_ACTION_ADAPTER_AUDIT_ZH.md](zero_shot_isaac_smart_task/LEISAAC_ACTION_ADAPTER_AUDIT_ZH.md)；
+它是审计记录，不是必读流程。
+
+## 7. SmartTask 资产补丁
+
+同事的 LEGO USD 缺内部 layer。默认 `--smart-target-asset cuboid` 只在 experiments runner
+进程里创建替代物，不修改 `leisaac/`。拿到完整 USD 后可以传绝对路径；在确认 layer 完整前
+不要删除 fallback。
+
+## 8. 修改完成的最低检查
+
+```text
+训练 config 与 camera layout 对齐
+bridge ping 报告 modality + action_decoding
+runner camera-only 通过
+纯 Python tests 通过
+dry-run 通过
+最后才执行 one policy action
+```
+
+新增 action schema、时间重采样或机器人资产时，应先把规则写进独立小模块和测试，再接回
+runner；不要把新分支直接堆进 `main()`。

@@ -148,6 +148,42 @@ def _summarize_modality(policy: Any) -> dict[str, Any]:
     return summary
 
 
+def _summarize_action_decoding(policy: Any, deployment_mode: str) -> dict[str, Any]:
+    """Separate GR00T's internal representation from its public action contract.
+
+    ``Gr00tPolicy.get_action()`` returns values after ``processor.decode_action``.
+    Those values are in the raw dataset action space.  For this project's SO101
+    datasets, the raw action contract is an absolute joint-position target in
+    LeRobot motor units.  ``use_relative_action`` only says whether the processor
+    uses a relative arm representation internally; it is not the public API's
+    delta/absolute switch.
+    """
+
+    core_policy = policy
+    while not hasattr(core_policy, "processor") and hasattr(core_policy, "policy"):
+        core_policy = core_policy.policy
+
+    processor = getattr(core_policy, "processor", None)
+    use_relative_action = getattr(processor, "use_relative_action", None)
+    if use_relative_action is not None:
+        use_relative_action = bool(use_relative_action)
+
+    summary = {
+        "processor_use_relative_action": use_relative_action,
+        "policy_api_output": "decoded_dataset_action",
+        "dataset_action_semantics": "embodiment_specific",
+        "dataset_action_units": "embodiment_specific",
+    }
+    if deployment_mode == "so101-finetuned":
+        summary.update(
+            {
+                "dataset_action_semantics": "absolute_joint_position_targets",
+                "dataset_action_units": "lerobot_motor_units",
+            }
+        )
+    return summary
+
+
 def _validate_so101_camera_layout(args: argparse.Namespace, modality: dict[str, Any]) -> None:
     """Fail before serving when the checkpoint schema and requested layout differ."""
 
@@ -183,10 +219,12 @@ def serve(args: argparse.Namespace) -> None:
     print("[bridge] loading GR00T policy...", flush=True)
     policy = _load_policy(args)
     modality = _summarize_modality(policy)
+    action_decoding = _summarize_action_decoding(policy, args.deployment_mode)
     _validate_so101_camera_layout(args, modality)
     print("[bridge] policy loaded", flush=True)
     print(f"[bridge] camera layout: {args.camera_layout}", flush=True)
     print(f"[bridge] modality: {modality}", flush=True)
+    print(f"[bridge] action decoding: {action_decoding}", flush=True)
 
     # `AF_INET` 表示 IPv4；`SOCK_STREAM` 表示 TCP。
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
@@ -219,6 +257,7 @@ def serve(args: argparse.Namespace) -> None:
                                 "ok": True,
                                 "camera_layout": args.camera_layout,
                                 "modality": modality,
+                                "action_decoding": action_decoding,
                             },
                         )
 
