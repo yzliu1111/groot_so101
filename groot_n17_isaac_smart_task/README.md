@@ -13,7 +13,7 @@
 | 阶段 | 目录 | 主要文件 |
 |---|---|---|
 | Bridge + Isaac 部署 | `zero_shot_isaac_smart_task/` | camera check、dry-run、one-step、zero-shot 对照 |
-| Full fine-tune | `full_finetune_so101/` | `train_so101_synthetic_groot.py`、dual / wrist-only / triple modality configs |
+| Full fine-tune | `full_finetune_so101/` | 训练入口、AWS Ubuntu 迁移说明、参数参考、modality configs |
 | Low-memory / LoRA / freeze | `lowmem_lora_freeze_so101/` | `train_so101_synthetic_groot_lowmem.py` |
 | Ubuntu 环境搭建 | `ubuntu_env_setup/` | `README_ZH.md` |
 
@@ -34,6 +34,7 @@ source /home/yzliu/physical_ai/company_project/smart_project/experiments/groot_n
 ```text
 新机器 / runtime 不通 -> ubuntu_env_setup/README_ZH.md
 准备数据 / full FT     -> full_finetune_so101/README_ZH.md
+AWS 只跑 full FT       -> full_finetune_so101/AWS_UBUNTU_FULL_FINETUNE_ZH.md
 full FT OOM            -> lowmem_lora_freeze_so101/README_ZH.md
 部署 checkpoint        -> zero_shot_isaac_smart_task/README_ZH.md
 ```

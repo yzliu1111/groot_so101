@@ -3,6 +3,11 @@
 这份 README 用于把 LeRobot v3 数据非破坏性地准备成 GR00T v2.1 数据，然后调用官方
 `launch_finetune.py`。本机适合数据准备和 smoke；正式训练优先放到大显存机器。
 
+AWS Ubuntu 只跑本路线时，直接看
+[AWS_UBUNTU_FULL_FINETUNE_ZH.md](AWS_UBUNTU_FULL_FINETUNE_ZH.md)；batch、gradient
+accumulation、max steps 与 loss 平台期的选择见
+[TRAINING_PARAMETER_REFERENCE_ZH.md](TRAINING_PARAMETER_REFERENCE_ZH.md)。
+
 ## 1. 两个环境，不要混用
 
 ```text
@@ -77,6 +82,7 @@ $SMART_PROJECT/dataset/so101_lego_pick_0609_1722_mimic
 cd "$SMART_PROJECT"
 conda run -n lerobot python \
   experiments/groot_n17_isaac_smart_task/full_finetune_so101/train_so101_synthetic_groot.py \
+    --allow-multiple-datasets \
     --camera-layout dual \
     --instruction "Pick up the red 2x4 lego brick." \
     --force-prepare \
@@ -95,6 +101,7 @@ wrist-only：
 ```bash
 conda run -n lerobot python \
   experiments/groot_n17_isaac_smart_task/full_finetune_so101/train_so101_synthetic_groot.py \
+    --allow-multiple-datasets \
     --camera-layout wrist-only \
     --dataset-wrist-camera-key observation.images.camera3 \
     --force-prepare \
@@ -107,6 +114,7 @@ triple：
 ```bash
 conda run -n lerobot python \
   experiments/groot_n17_isaac_smart_task/full_finetune_so101/train_so101_synthetic_groot.py \
+    --allow-multiple-datasets \
     --camera-layout triple \
     --dataset-front-camera-key observation.images.camera1 \
     --dataset-left-camera-key observation.images.camera2 \
@@ -121,10 +129,13 @@ conda run -n lerobot python \
 
 ```bash
 --source-root "$SMART_PROJECT/dataset/custom" \
+--allow-multiple-datasets \
 --prepared-root "$SMART_PROJECT/outputs/groot_so101_synthetic_datasets/custom"
 ```
 
-同一次递归转换中的数据集必须使用一致的 camera feature key。
+选择多个数据集时，脚本要求显式传入 `--allow-multiple-datasets`。这表示你已经核对过它们使用
+一致的 camera feature key、6D 关节顺序和 action/state 坐标系；脚本能验证 shape 和关节名，
+但无法仅从 LeRobot metadata 分辨 degree 与 motor unit。
 
 ### 阶段 A 成功标志
 
@@ -158,6 +169,7 @@ cd "$SMART_PROJECT"
 ```bash
 "$GROOT_ROOT/.venv/bin/python" \
   experiments/groot_n17_isaac_smart_task/full_finetune_so101/train_so101_synthetic_groot.py \
+    --allow-multiple-datasets \
     --camera-layout dual \
     --skip-prepare \
     --skip-stats \
@@ -187,6 +199,7 @@ cd "$SMART_PROJECT"
 ```bash
 "$GROOT_ROOT/.venv/bin/python" \
   experiments/groot_n17_isaac_smart_task/full_finetune_so101/train_so101_synthetic_groot.py \
+    --allow-multiple-datasets \
     --camera-layout dual \
     --skip-prepare \
     --max-steps 1 \
@@ -215,6 +228,7 @@ cd "$SMART_PROJECT"
 ```bash
 "$GROOT_ROOT/.venv/bin/python" \
   experiments/groot_n17_isaac_smart_task/full_finetune_so101/train_so101_synthetic_groot.py \
+    --allow-multiple-datasets \
     --camera-layout dual \
     --skip-prepare \
     --max-steps 2000 \
@@ -227,9 +241,10 @@ cd "$SMART_PROJECT"
 
 ## 8. 动作语义：部署前必须知道
 
-prepared 数据的 `action` 是绝对 LeRobot motor target。训练 config 对 arm 使用 relative
-representation，只是 processor 内部表示；`Gr00tPolicy.get_action()` 会在返回前
-`decode_action()`，所以部署侧收到的仍是绝对数据集空间目标。
+prepared 数据的 `action` 保留源数据的绝对坐标，不做单位换算：已核对的真机数据是 degree，
+sim 数据是 LeRobot motor unit。训练 config 对 arm 使用 relative representation，只是
+processor 内部表示；`Gr00tPolicy.get_action()` 会在返回前 `decode_action()`，所以部署侧收到的
+仍是绝对的原数据集坐标。不要把 “LeRobot 数据格式” 误解为 action 必然采用 motor unit。
 
 部署命令和单位换算见
 [zero_shot_isaac_smart_task/README_ZH.md](../zero_shot_isaac_smart_task/README_ZH.md)。

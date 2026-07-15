@@ -30,6 +30,7 @@ import json
 import math
 import os
 from pathlib import Path
+import shlex
 import shutil
 import subprocess
 import sys
@@ -55,6 +56,18 @@ LEROBOT_SRC = REPO_ROOT / "lerobot" / "src"
 
 V21_DATA_PATH = "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet"
 V21_VIDEO_PATH = "videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4"
+SO101_JOINT_NAMES = [
+    "shoulder_pan.pos",
+    "shoulder_lift.pos",
+    "elbow_flex.pos",
+    "wrist_flex.pos",
+    "wrist_roll.pos",
+    "gripper.pos",
+]
+LOW_DIM_MODALITY = {
+    "single_arm": {"start": 0, "end": 5},
+    "gripper": {"start": 5, "end": 6},
+}
 
 
 def _is_lerobot_v3_dataset(path: Path) -> bool:
@@ -82,7 +95,7 @@ def _discover_lerobot_v3_datasets(root: Path) -> list[Path]:
         return [root]
 
     datasets: list[Path] = []
-    for dirpath, _, filenames in os.walk(root, followlinks=True):
+    for dirpath, _, filenames in os.walk(root, followlinks=False):
         path = Path(dirpath)
         if path.name == "meta" and "info.json" in filenames:
             dataset_path = path.parent
@@ -144,6 +157,7 @@ def _resolve_source_datasets(args: argparse.Namespace) -> list[tuple[Path, Path]
         seen_sources.add(resolved_source_path)
         if not _is_lerobot_v3_dataset(source_path):
             raise ValueError(f"Expected a LeRobot v3 dataset with meta/info.json: {source_path}")
+        _validate_so101_schema(_load_info(resolved_source_path), context=resolved_source_path)
         prepared_relative_path = _prepared_relative_path(source_path, root, args.camera_layout)
         resolved.append((resolved_source_path, prepared_relative_path))
 
@@ -189,6 +203,35 @@ def _load_info(dataset_path: Path) -> dict[str, Any]:
         return json.load(f)
 
 
+def _validate_so101_schema(info: dict[str, Any], *, context: Path) -> None:
+    """Reject datasets whose low-dimensional columns do not match this experiment."""
+
+    features = info.get("features")
+    if not isinstance(features, dict):
+        raise ValueError(f"Dataset has no feature mapping in meta/info.json: {context}")
+
+    for feature_key in ("observation.state", "action"):
+        feature = features.get(feature_key)
+        if not isinstance(feature, dict):
+            raise ValueError(f"Required feature {feature_key!r} is missing: {context}")
+        if feature.get("shape") != [6]:
+            raise ValueError(
+                f"Expected {feature_key} shape [6], got {feature.get('shape')!r}: {context}"
+            )
+        if feature.get("names") != SO101_JOINT_NAMES:
+            raise ValueError(
+                f"Unexpected {feature_key} joint order in {context}: "
+                f"expected={SO101_JOINT_NAMES!r} actual={feature.get('names')!r}"
+            )
+        dtype = feature.get("dtype")
+        if not isinstance(dtype, str) or not dtype.startswith("float"):
+            raise ValueError(f"Expected floating-point {feature_key}, got {dtype!r}: {context}")
+
+    fps = info.get("fps")
+    if not isinstance(fps, (int, float)) or not math.isfinite(fps) or fps <= 0:
+        raise ValueError(f"Expected a positive finite dataset fps, got {fps!r}: {context}")
+
+
 def _load_groot_lerobot_converter(groot_root: Path) -> Any:
     """Load Isaac-GR00T's official LeRobot v3 -> v2 conversion helpers."""
 
@@ -232,9 +275,13 @@ def _load_tasks(dataset_path: Path, instruction_override: str | None) -> list[di
     table = pq.read_table(dataset_path / "meta" / "tasks.parquet")
     rows = table.to_pylist()
     tasks: list[dict[str, Any]] = []
+    seen_task_indices: set[int] = set()
 
     for row in rows:
         task_index = int(row["task_index"])
+        if task_index in seen_task_indices:
+            raise ValueError(f"Duplicate task_index {task_index} in {dataset_path}")
+        seen_task_indices.add(task_index)
         if instruction_override:
             task = instruction_override
         elif "task" in row:
@@ -246,6 +293,8 @@ def _load_tasks(dataset_path: Path, instruction_override: str | None) -> list[di
             if not string_values:
                 raise ValueError(f"Could not infer task text from row: {row}")
             task = string_values[0]
+        if not task.strip():
+            raise ValueError(f"Empty task text for task_index {task_index} in {dataset_path}")
         tasks.append({"task_index": task_index, "task": task})
 
     return sorted(tasks, key=lambda item: item["task_index"])
@@ -254,9 +303,39 @@ def _load_tasks(dataset_path: Path, instruction_override: str | None) -> list[di
 def _safe_remove_prepared_dir(path: Path, source_path: Path) -> None:
     path = path.resolve()
     source_path = source_path.resolve()
-    if path == source_path or source_path in path.parents:
-        raise ValueError(f"Refusing to remove source dataset path: {path}")
+    if path == source_path or source_path in path.parents or path in source_path.parents:
+        raise ValueError(
+            "Refusing to remove a prepared path that is equal to, inside, or contains "
+            f"the source dataset: prepared={path} source={source_path}"
+        )
     shutil.rmtree(path)
+
+
+def _validate_prepared_output_path(path: Path, prepared_root: Path) -> None:
+    """Prevent a prepared path or nested symlink from escaping its output root."""
+
+    prepared_root = prepared_root.resolve()
+    lexical_path = Path(os.path.abspath(path))
+    try:
+        relative_path = lexical_path.relative_to(prepared_root)
+    except ValueError as exc:
+        raise ValueError(
+            f"Prepared output is outside --prepared-root: path={path} root={prepared_root}"
+        ) from exc
+    if not relative_path.parts:
+        raise ValueError(f"Refusing to use --prepared-root itself as a dataset output: {path}")
+
+    current = prepared_root
+    for part in relative_path.parts:
+        current = current / part
+        if current.is_symlink():
+            raise ValueError(f"Prepared output path contains a symlink: {current}")
+
+    resolved_path = lexical_path.resolve()
+    if prepared_root not in resolved_path.parents:
+        raise ValueError(
+            f"Prepared output resolves outside --prepared-root: path={path} root={prepared_root}"
+        )
 
 
 def _feature_subset(info: dict[str, Any], video_keys: list[str]) -> dict[str, Any]:
@@ -308,43 +387,147 @@ def _camera_layout_settings(
     raise ValueError(f"Unsupported camera layout: {camera_layout}")
 
 
-def _write_modality_json(output_path: Path, video_key_map: dict[str, str]) -> None:
-    _write_json(
-        output_path / "meta" / "modality.json",
-        {
-            "state": {
-                "single_arm": {"start": 0, "end": 5},
-                "gripper": {"start": 5, "end": 6},
-            },
-            "action": {
-                "single_arm": {"start": 0, "end": 5},
-                "gripper": {"start": 5, "end": 6},
-            },
-            "video": {
-                config_key: {"original_key": original_key}
-                for config_key, original_key in video_key_map.items()
-            },
-            "annotation": {
-                "human.task_description": {"original_key": "task_index"},
-            },
+def _expected_modality_payload(video_key_map: dict[str, str]) -> dict[str, Any]:
+    return {
+        "state": LOW_DIM_MODALITY,
+        "action": LOW_DIM_MODALITY,
+        "video": {
+            config_key: {"original_key": original_key}
+            for config_key, original_key in video_key_map.items()
         },
-    )
+        "annotation": {
+            "human.task_description": {"original_key": "task_index"},
+        },
+    }
 
 
-def _validate_prepared_camera_layout(dataset_path: Path, expected_video_keys: tuple[str, ...]) -> None:
-    """Ensure an existing prepared copy matches the selected training layout."""
+def _write_modality_json(output_path: Path, video_key_map: dict[str, str]) -> None:
+    _write_json(output_path / "meta" / "modality.json", _expected_modality_payload(video_key_map))
 
+
+def _load_jsonl(path: Path) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    with path.open("r") as f:
+        for line_number, line in enumerate(f, start=1):
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"Invalid JSON in {path}:{line_number}: {exc}") from exc
+            if not isinstance(row, dict):
+                raise ValueError(f"Expected a JSON object in {path}:{line_number}")
+            rows.append(row)
+    return rows
+
+
+def _validate_prepared_dataset(dataset_path: Path, video_key_map: dict[str, str]) -> None:
+    """Validate prepared metadata and every episode artifact before stats/training."""
+
+    dataset_path = dataset_path.resolve()
+    info_path = dataset_path / "meta" / "info.json"
     modality_path = dataset_path / "meta" / "modality.json"
-    if not modality_path.exists():
-        raise FileNotFoundError(f"Prepared dataset modality file not found: {modality_path}")
+    tasks_path = dataset_path / "meta" / "tasks.jsonl"
+    episodes_path = dataset_path / "meta" / "episodes.jsonl"
+    for required_path in (info_path, modality_path, tasks_path, episodes_path):
+        if not required_path.is_file():
+            raise FileNotFoundError(f"Prepared dataset file not found: {required_path}")
+
+    info = _load_info(dataset_path)
+    if info.get("codebase_version") != "v2.1":
+        raise ValueError(
+            f"Expected prepared LeRobot v2.1 data, got {info.get('codebase_version')!r}: "
+            f"{dataset_path}"
+        )
+    _validate_so101_schema(info, context=dataset_path)
+
+    features = info["features"]
+    for video_key in video_key_map.values():
+        feature = features.get(video_key)
+        if not isinstance(feature, dict) or feature.get("dtype") != "video":
+            raise ValueError(
+                f"Selected camera feature {video_key!r} is missing or is not video: {dataset_path}"
+            )
+
     with modality_path.open("r") as f:
         modality = json.load(f)
-    actual_video_keys = tuple(modality.get("video", {}))
-    if actual_video_keys != expected_video_keys:
+    expected_modality = _expected_modality_payload(video_key_map)
+    if modality != expected_modality:
         raise ValueError(
-            "Prepared dataset camera layout mismatch: "
-            f"dataset={dataset_path} expected_video_keys={list(expected_video_keys)} "
-            f"actual_video_keys={list(actual_video_keys)}"
+            "Prepared dataset modality does not exactly match the selected SO101 layout: "
+            f"dataset={dataset_path} expected={expected_modality!r} actual={modality!r}. "
+            "Use a different --prepared-root or rebuild it with --force-prepare."
+        )
+
+    tasks = _load_jsonl(tasks_path)
+    if not tasks:
+        raise ValueError(f"Prepared dataset has no tasks: {tasks_path}")
+    if info.get("total_tasks") != len(tasks):
+        raise ValueError(
+            f"Prepared total_tasks mismatch in {info_path}: "
+            f"info={info.get('total_tasks')!r} tasks={len(tasks)}"
+        )
+    episodes = _load_jsonl(episodes_path)
+    if not episodes:
+        raise ValueError(f"Prepared dataset has no episodes: {episodes_path}")
+
+    episode_indices: set[int] = set()
+    total_frames = 0
+    chunks_size = int(info.get("chunks_size", 1000))
+    if chunks_size <= 0:
+        raise ValueError(f"Prepared dataset chunks_size must be positive: {dataset_path}")
+
+    for episode in episodes:
+        try:
+            episode_index = int(episode["episode_index"])
+            episode_length = int(episode["length"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid episode metadata in {episodes_path}: {episode!r}") from exc
+        if episode_index < 0 or episode_length <= 0:
+            raise ValueError(f"Invalid episode index/length in {episodes_path}: {episode!r}")
+        if episode_index in episode_indices:
+            raise ValueError(f"Duplicate episode_index {episode_index} in {episodes_path}")
+        episode_indices.add(episode_index)
+        total_frames += episode_length
+
+        episode_chunk = episode_index // chunks_size
+        data_path = dataset_path / V21_DATA_PATH.format(
+            episode_chunk=episode_chunk,
+            episode_index=episode_index,
+        )
+        if not data_path.is_file() or data_path.stat().st_size == 0:
+            raise FileNotFoundError(f"Prepared episode parquet is missing or empty: {data_path}")
+        parquet_rows = pq.ParquetFile(data_path).metadata.num_rows
+        if parquet_rows != episode_length:
+            raise ValueError(
+                f"Prepared episode row count mismatch: {data_path} "
+                f"metadata_length={episode_length} parquet_rows={parquet_rows}"
+            )
+
+        for video_key in dict.fromkeys(video_key_map.values()):
+            video_path = dataset_path / V21_VIDEO_PATH.format(
+                episode_chunk=episode_chunk,
+                video_key=video_key,
+                episode_index=episode_index,
+            )
+            if not video_path.is_file() or video_path.stat().st_size == 0:
+                raise FileNotFoundError(f"Prepared episode video is missing or empty: {video_path}")
+
+    if info.get("total_episodes") != len(episodes):
+        raise ValueError(
+            f"Prepared total_episodes mismatch in {info_path}: "
+            f"info={info.get('total_episodes')!r} episodes={len(episodes)}"
+        )
+    if info.get("total_frames") != total_frames:
+        raise ValueError(
+            f"Prepared total_frames mismatch in {info_path}: "
+            f"info={info.get('total_frames')!r} episodes_sum={total_frames}"
+        )
+    expected_total_videos = len(episodes) * len(set(video_key_map.values()))
+    if info.get("total_videos") != expected_total_videos:
+        raise ValueError(
+            f"Prepared total_videos mismatch in {info_path}: "
+            f"info={info.get('total_videos')!r} expected={expected_total_videos}"
         )
 
 
@@ -356,15 +539,29 @@ def _convert_data_files(source_path: Path, output_path: Path, records: list[dict
 
     for (chunk_index, file_index), group_records in grouped.items():
         source_file = source_path / f"data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet"
+        if not source_file.is_file():
+            raise FileNotFoundError(f"Expected source parquet file not found: {source_file}")
         table = pq.read_table(source_file)
         group_records = sorted(group_records, key=lambda item: int(item["dataset_from_index"]))
-        file_offset = int(group_records[0]["dataset_from_index"])
+        if table.num_rows == 0:
+            raise ValueError(f"Source parquet file is empty: {source_file}")
+        if "index" in table.column_names:
+            file_offset = int(table.column("index")[0].as_py())
+        else:
+            file_offset = int(group_records[0]["dataset_from_index"])
 
         for record in group_records:
             episode_index = int(record["episode_index"])
             start = int(record["dataset_from_index"]) - file_offset
             stop = int(record["dataset_to_index"]) - file_offset
-            episode_table = table.slice(start, stop - start)
+            length = stop - start
+            if start < 0 or length <= 0 or stop > table.num_rows:
+                raise ValueError(
+                    "Invalid episode parquet slice: "
+                    f"source={source_file} episode_index={episode_index} "
+                    f"start={start} stop={stop} rows={table.num_rows}"
+                )
+            episode_table = table.slice(start, length)
             out_chunk = episode_index // 1000
             out_file = output_path / V21_DATA_PATH.format(
                 episode_chunk=out_chunk,
@@ -380,8 +577,14 @@ def _split_video(
     start_s: float,
     end_s: float,
 ) -> None:
+    if not source_file.is_file():
+        raise FileNotFoundError(f"Expected source video file not found: {source_file}")
+    if not math.isfinite(start_s) or not math.isfinite(end_s) or start_s < 0 or start_s >= end_s:
+        raise ValueError(
+            f"Invalid video segment timestamps: source={source_file} start={start_s} end={end_s}"
+        )
     output_file.parent.mkdir(parents=True, exist_ok=True)
-    duration_s = max(end_s - start_s, 1e-6)
+    duration_s = end_s - start_s
     cmd = [
         "ffmpeg",
         "-hide_banner",
@@ -400,7 +603,25 @@ def _split_video(
         "-y",
         str(output_file),
     ]
-    subprocess.run(cmd, check=True)
+    try:
+        subprocess.run(
+            cmd,
+            check=True,
+            timeout=300,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError("ffmpeg is required for LeRobot v3 video conversion") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"ffmpeg timed out while splitting {source_file} -> {output_file}"
+        ) from exc
+    except subprocess.CalledProcessError as exc:
+        details = exc.stderr.strip() if exc.stderr else "no ffmpeg stderr"
+        raise RuntimeError(
+            f"ffmpeg failed while splitting {source_file} -> {output_file}: {details}"
+        ) from exc
 
 
 def _convert_video_files(
@@ -559,6 +780,7 @@ def prepare_dataset(
     info = _load_info(source_path)
     if info.get("codebase_version") != "v3.0":
         raise ValueError(f"Expected LeRobot v3.0 dataset, got {info.get('codebase_version')}")
+    _validate_so101_schema(info, context=source_path)
 
     records = converter.load_episode_records(source_path)
     if max_episodes is not None:
@@ -601,7 +823,7 @@ def prepare_dataset(
 
 
 def _run(cmd: list[str], *, cwd: Path, dry_run: bool) -> None:
-    printable = " ".join(cmd)
+    printable = shlex.join(cmd)
     print(f"[run] cd {cwd} && {printable}")
     if not dry_run:
         subprocess.run(cmd, cwd=cwd, check=True)
@@ -707,6 +929,14 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--allow-multiple-datasets",
+        action="store_true",
+        help=(
+            "Acknowledge that every discovered dataset uses the same action/state coordinate "
+            "system. Required when more than one v3 dataset is selected."
+        ),
+    )
+    parser.add_argument(
         "--prepared-root",
         type=Path,
         default=REPO_ROOT / "outputs" / "groot_so101_synthetic_datasets",
@@ -775,8 +1005,50 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _validate_args(args: argparse.Namespace) -> None:
+    positive_integer_fields = (
+        "num_gpus",
+        "global_batch_size",
+        "gradient_accumulation_steps",
+        "max_steps",
+        "save_steps",
+        "save_total_limit",
+    )
+    for field in positive_integer_fields:
+        value = getattr(args, field)
+        if value <= 0:
+            raise ValueError(f"--{field.replace('_', '-')} must be positive, got {value}")
+    if args.dataloader_num_workers < 0:
+        raise ValueError(
+            "--dataloader-num-workers must be zero or positive, "
+            f"got {args.dataloader_num_workers}"
+        )
+    if not math.isfinite(args.learning_rate) or args.learning_rate <= 0:
+        raise ValueError(f"--learning-rate must be positive and finite, got {args.learning_rate}")
+    if args.max_episodes is not None and args.max_episodes <= 0:
+        raise ValueError(f"--max-episodes must be positive, got {args.max_episodes}")
+    if args.instruction is not None and not args.instruction.strip():
+        raise ValueError("--instruction cannot be empty or whitespace")
+    if args.global_batch_size % args.num_gpus != 0:
+        raise ValueError(
+            "--global-batch-size must be divisible by --num-gpus, "
+            f"got global_batch_size={args.global_batch_size} num_gpus={args.num_gpus}"
+        )
+    if args.force_prepare and args.skip_prepare:
+        raise ValueError("--force-prepare and --skip-prepare cannot be used together")
+    if args.skip_prepare and args.max_episodes is not None:
+        raise ValueError("--max-episodes has no effect with --skip-prepare")
+    if args.skip_prepare and args.instruction is not None:
+        raise ValueError("--instruction has no effect with --skip-prepare")
+    if args.dry_run and not args.skip_prepare:
+        raise ValueError(
+            "--dry-run does not simulate conversion; add --skip-prepare so it cannot write data"
+        )
+
+
 def main() -> None:
     args = parse_args()
+    _validate_args(args)
     video_key_map, modality_config_path = _camera_layout_settings(
         args.camera_layout,
         args.top_camera_key,
@@ -788,10 +1060,20 @@ def main() -> None:
     for groot_key, dataset_key in video_key_map.items():
         print(f"[config] dataset {dataset_key} -> GR00T video.{groot_key}")
     source_specs = _resolve_source_datasets(args)
+    if len(source_specs) > 1 and not args.allow_multiple_datasets:
+        selected = "\n".join(f"  - {source_path}" for source_path, _ in source_specs)
+        raise ValueError(
+            "Multiple source datasets were selected. The wrapper cannot infer whether their "
+            "action/state values are degrees, LeRobot motor units, or another coordinate system. "
+            "Verify that all selected datasets use the same coordinate system, then rerun with "
+            f"--allow-multiple-datasets. Selected datasets:\n{selected}"
+        )
 
     prepared_paths: list[Path] = []
+    prepared_root = args.prepared_root.resolve()
     for source_path, prepared_relative_path in source_specs:
-        prepared_path = args.prepared_root.resolve() / prepared_relative_path
+        prepared_path = prepared_root / prepared_relative_path
+        _validate_prepared_output_path(prepared_path, prepared_root)
         if not args.skip_prepare:
             prepare_dataset(
                 source_path,
@@ -804,9 +1086,8 @@ def main() -> None:
             )
         prepared_paths.append(prepared_path)
 
-    expected_video_keys = tuple(video_key_map)
     for prepared_path in prepared_paths:
-        _validate_prepared_camera_layout(prepared_path, expected_video_keys)
+        _validate_prepared_dataset(prepared_path, video_key_map)
 
     if not args.skip_stats:
         for prepared_path in prepared_paths:
