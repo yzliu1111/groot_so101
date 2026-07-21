@@ -20,10 +20,18 @@ from so101_joint_units import (  # noqa: E402
     isaac_rad_to_so101_dataset,
     lerobot_motor_to_isaac_rad,
     safe_absolute_dataset_target_to_isaac_rad,
-    safe_absolute_motor_target_to_isaac_rad,
     so101_dataset_to_isaac_rad,
     validate_runtime_joint_limits_match_converter,
 )
+
+
+def _safe_motor_target(current, target, **kwargs):
+    return safe_absolute_dataset_target_to_isaac_rad(
+        current,
+        target,
+        arm_units=SO101_ARM_UNITS_LEROBOT_MOTOR,
+        **kwargs,
+    )
 
 
 class So101JointUnitsTest(unittest.TestCase):
@@ -99,26 +107,6 @@ class So101JointUnitsTest(unittest.TestCase):
         self.assertLessEqual(float(np.max(np.abs(command[:5] - current[:5]))), 0.080001)
         self.assertTrue(np.all(np.isfinite(command)))
 
-    def test_generic_motor_route_matches_compatibility_wrapper(self) -> None:
-        current = np.asarray([0.2, -0.7, 0.8, 1.1, -1.2, 0.35], dtype=np.float32)
-        target = np.asarray([20.0, -20.0, 30.0, 50.0, 40.0, 80.0], dtype=np.float32)
-        generic, generic_diagnostics = safe_absolute_dataset_target_to_isaac_rad(
-            current,
-            target,
-            arm_units=SO101_ARM_UNITS_LEROBOT_MOTOR,
-            max_arm_step_rad=None,
-        )
-        compatibility, compatibility_diagnostics = safe_absolute_motor_target_to_isaac_rad(
-            current,
-            target,
-            max_arm_step_rad=None,
-        )
-        np.testing.assert_allclose(generic, compatibility, atol=2e-6)
-        self.assertEqual(
-            generic_diagnostics["dataset_limit_clipped"],
-            compatibility_diagnostics["motor_limit_clipped"],
-        )
-
     def test_unknown_checkpoint_arm_units_are_rejected(self) -> None:
         with self.assertRaisesRegex(ValueError, "arm_units must be one of"):
             isaac_rad_to_so101_dataset(np.zeros(6, dtype=np.float32), "radians")
@@ -135,7 +123,7 @@ class So101JointUnitsTest(unittest.TestCase):
     def test_absolute_motor_target_is_not_added_as_radians(self) -> None:
         current = np.zeros(6, dtype=np.float32)
         motor_target = np.asarray([20.0, -20.0, 30.0, 50.0, 40.0, 80.0], dtype=np.float32)
-        command, diagnostics = safe_absolute_motor_target_to_isaac_rad(
+        command, diagnostics = _safe_motor_target(
             current,
             motor_target,
             max_arm_step_rad=None,
@@ -143,16 +131,16 @@ class So101JointUnitsTest(unittest.TestCase):
         expected = lerobot_motor_to_isaac_rad(motor_target)
         np.testing.assert_allclose(command, expected, atol=2e-6)
         self.assertLess(float(np.max(np.abs(command))), 3.0)
-        self.assertFalse(diagnostics["motor_limit_clipped"])
+        self.assertFalse(diagnostics["dataset_limit_clipped"])
 
     def test_extreme_output_is_motor_and_step_clipped(self) -> None:
         current = np.zeros(6, dtype=np.float32)
-        command, diagnostics = safe_absolute_motor_target_to_isaac_rad(
+        command, diagnostics = _safe_motor_target(
             current,
             np.asarray([1000.0, -1000.0, 500.0, 300.0, -400.0, 1000.0], dtype=np.float32),
             max_arm_step_rad=0.08,
         )
-        self.assertTrue(diagnostics["motor_limit_clipped"])
+        self.assertTrue(diagnostics["dataset_limit_clipped"])
         self.assertTrue(diagnostics["arm_step_clipped"])
         self.assertLessEqual(float(np.max(np.abs(command[:5] - current[:5]))), 0.080001)
         self.assertTrue(np.all(np.isfinite(command)))
@@ -160,7 +148,7 @@ class So101JointUnitsTest(unittest.TestCase):
     def test_runtime_limits_are_final_guard(self) -> None:
         current = np.zeros(6, dtype=np.float32)
         runtime_limits = np.asarray([[-0.05, 0.05]] * 6, dtype=np.float32)
-        command, diagnostics = safe_absolute_motor_target_to_isaac_rad(
+        command, diagnostics = _safe_motor_target(
             current,
             np.asarray([100.0] * 6, dtype=np.float32),
             max_arm_step_rad=None,
@@ -171,14 +159,14 @@ class So101JointUnitsTest(unittest.TestCase):
 
     def test_nonfinite_model_output_is_rejected(self) -> None:
         with self.assertRaisesRegex(ValueError, "NaN or infinity"):
-            safe_absolute_motor_target_to_isaac_rad(
+            _safe_motor_target(
                 np.zeros(6, dtype=np.float32),
                 np.asarray([0.0, 0.0, np.nan, 0.0, 0.0, 0.0], dtype=np.float32),
             )
 
     def test_target_interpolation_scale_cannot_overshoot(self) -> None:
         with self.assertRaisesRegex(ValueError, r"within \[0, 1\]"):
-            safe_absolute_motor_target_to_isaac_rad(
+            _safe_motor_target(
                 np.zeros(6, dtype=np.float32),
                 np.zeros(6, dtype=np.float32),
                 arm_target_scale=1.1,
@@ -186,7 +174,7 @@ class So101JointUnitsTest(unittest.TestCase):
 
     def test_nonfinite_step_limit_is_rejected(self) -> None:
         with self.assertRaisesRegex(ValueError, "must be finite"):
-            safe_absolute_motor_target_to_isaac_rad(
+            _safe_motor_target(
                 np.zeros(6, dtype=np.float32),
                 np.zeros(6, dtype=np.float32),
                 max_arm_step_rad=np.nan,
@@ -194,7 +182,7 @@ class So101JointUnitsTest(unittest.TestCase):
 
     def test_negative_step_limit_is_rejected(self) -> None:
         with self.assertRaisesRegex(ValueError, "non-negative"):
-            safe_absolute_motor_target_to_isaac_rad(
+            _safe_motor_target(
                 np.zeros(6, dtype=np.float32),
                 np.zeros(6, dtype=np.float32),
                 max_arm_step_rad=-0.01,

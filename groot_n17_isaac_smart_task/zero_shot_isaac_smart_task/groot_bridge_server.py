@@ -57,12 +57,6 @@ if str(SCRIPT_DIR) not in sys.path:
 
 # noqa: E402 表示忽略“import 不在文件顶部”的 lint 警告。
 # 我们必须先改 sys.path，才能稳定 import 本地 wire.py。
-from so101_joint_units import (  # noqa: E402
-    SO101_ARM_UNITS_LEROBOT_MOTOR,
-    SO101_CHECKPOINT_ARM_UNIT_CHOICES,
-    SO101_GRIPPER_UNITS,
-    so101_action_units_contract,
-)
 from wire import recv_message, send_message  # noqa: E402
 
 
@@ -154,20 +148,15 @@ def _summarize_modality(policy: Any) -> dict[str, Any]:
     return summary
 
 
-def _summarize_action_decoding(
-    policy: Any,
-    deployment_mode: str,
-    checkpoint_arm_units: str = SO101_ARM_UNITS_LEROBOT_MOTOR,
-) -> dict[str, Any]:
+def _summarize_action_decoding(policy: Any, deployment_mode: str) -> dict[str, Any]:
     """Separate GR00T's internal representation from its public action contract.
 
     ``Gr00tPolicy.get_action()`` returns values after ``processor.decode_action``.
-    Those values are in the raw dataset action space.  The operator must declare
-    whether a fine-tuned SO101 checkpoint used synthetic LeRobot motor units or
-    real-robot degrees for its first five arm joints.  The gripper remains in the
-    LeRobot ``[0, 100]`` range for both.  ``use_relative_action`` only describes
-    the processor's internal representation; it is not the public API's
-    delta/absolute switch.
+    Those values are in the checkpoint's raw dataset coordinates.  The bridge
+    does not infer physical units from checkpoint metadata; the Isaac runner
+    selects the conversion at the point where it is actually applied.
+    ``use_relative_action`` only describes the processor's internal
+    representation; it is not the public API's delta/absolute switch.
     """
 
     core_policy = policy
@@ -189,10 +178,7 @@ def _summarize_action_decoding(
         summary.update(
             {
                 "dataset_action_semantics": "absolute_joint_position_targets",
-                "dataset_action_units": so101_action_units_contract(checkpoint_arm_units),
-                "dataset_arm_joint_units": checkpoint_arm_units,
-                "dataset_state_arm_joint_units": checkpoint_arm_units,
-                "dataset_gripper_units": SO101_GRIPPER_UNITS,
+                "dataset_action_units": "checkpoint_dataset_coordinates",
             }
         )
     return summary
@@ -233,11 +219,7 @@ def serve(args: argparse.Namespace) -> None:
     print("[bridge] loading GR00T policy...", flush=True)
     policy = _load_policy(args)
     modality = _summarize_modality(policy)
-    action_decoding = _summarize_action_decoding(
-        policy,
-        args.deployment_mode,
-        args.so101_checkpoint_arm_units,
-    )
+    action_decoding = _summarize_action_decoding(policy, args.deployment_mode)
     _validate_so101_camera_layout(args, modality)
     print("[bridge] policy loaded", flush=True)
     print(f"[bridge] camera layout: {args.camera_layout}", flush=True)
@@ -341,18 +323,6 @@ def parse_args() -> argparse.Namespace:
         ),
     )
 
-    parser.add_argument(
-        "--so101-checkpoint-joint-units",
-        dest="so101_checkpoint_arm_units",
-        choices=SO101_CHECKPOINT_ARM_UNIT_CHOICES,
-        default=SO101_ARM_UNITS_LEROBOT_MOTOR,
-        help=(
-            "Dataset-space units used by the SO101 checkpoint's first five state/action joints. "
-            "Use lerobot_motor_units for LeIsaac/sim data or degrees for real-robot data. "
-            "The gripper always remains in the LeRobot [0,100] range."
-        ),
-    )
-
     # GR00T 模型路径。可以是 HuggingFace repo id，也可以是本地 checkpoint 目录。
     parser.add_argument("--model-path", default=DEFAULT_BASE_MODEL_PATH)
 
@@ -402,10 +372,6 @@ def parse_args() -> argparse.Namespace:
             args.modality_config_path = str(SO101_MODALITY_CONFIGS[args.camera_layout])
     elif args.camera_layout != "dual":
         parser.error("--camera-layout wrist-only/triple requires --deployment-mode so101-finetuned")
-    elif args.so101_checkpoint_arm_units != SO101_ARM_UNITS_LEROBOT_MOTOR:
-        parser.error(
-            "--so101-checkpoint-joint-units degrees requires --deployment-mode so101-finetuned"
-        )
 
     return args
 

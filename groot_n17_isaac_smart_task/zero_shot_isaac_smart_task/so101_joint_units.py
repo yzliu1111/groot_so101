@@ -38,8 +38,6 @@ SO101_CHECKPOINT_ARM_UNIT_CHOICES = (
     SO101_ARM_UNITS_LEROBOT_MOTOR,
     SO101_ARM_UNITS_DEGREES,
 )
-SO101_GRIPPER_UNITS = "lerobot_range_0_100"
-SO101_DEGREE_ACTION_UNITS = "arm_degrees_gripper_range_0_100"
 
 # Mirrors leisaac.assets.robots.lerobot.SO101_FOLLOWER_USD_JOINT_LIMLITS.
 # Values are degrees; Isaac itself exposes the corresponding positions in radians.
@@ -112,15 +110,6 @@ def _validate_arm_units(arm_units: str) -> str:
     return arm_units
 
 
-def so101_action_units_contract(arm_units: str) -> str:
-    """Return the public action-unit label used by bridge/runner handshakes."""
-
-    arm_units = _validate_arm_units(arm_units)
-    if arm_units == SO101_ARM_UNITS_LEROBOT_MOTOR:
-        return SO101_ARM_UNITS_LEROBOT_MOTOR
-    return SO101_DEGREE_ACTION_UNITS
-
-
 def isaac_rad_to_so101_dataset(joint_rad: Any, arm_units: str) -> np.ndarray:
     """Convert Isaac radians to the checkpoint's 6D dataset-space state.
 
@@ -156,7 +145,7 @@ def so101_dataset_to_isaac_rad(dataset_target: Any, arm_units: str) -> np.ndarra
     return joint_rad.astype(np.float32)
 
 
-def so101_dataset_limits(arm_units: str) -> np.ndarray:
+def _so101_dataset_limits(arm_units: str) -> np.ndarray:
     """Return dataset-space limits for five arm joints plus the gripper."""
 
     arm_units = _validate_arm_units(arm_units)
@@ -214,7 +203,7 @@ def safe_absolute_dataset_target_to_isaac_rad(
     current = _joint_array(current_joint_rad, "current_joint_rad").reshape(6)
     raw_dataset = _joint_array(absolute_dataset_target, "absolute_dataset_target").reshape(6)
 
-    dataset_limits = so101_dataset_limits(arm_units)
+    dataset_limits = _so101_dataset_limits(arm_units)
     clipped_dataset = np.clip(
         raw_dataset,
         dataset_limits[:, 0],
@@ -267,31 +256,3 @@ def safe_absolute_dataset_target_to_isaac_rad(
         "applied_arm_delta_rad": applied_arm_delta,
     }
     return command.astype(np.float32), diagnostics
-
-
-def safe_absolute_motor_target_to_isaac_rad(
-    current_joint_rad: Any,
-    absolute_motor_target: Any,
-    *,
-    arm_target_scale: float = 1.0,
-    max_arm_step_rad: float | None = 0.08,
-    runtime_joint_limits_rad: Any | None = None,
-) -> tuple[np.ndarray, dict[str, Any]]:
-    """Backward-compatible wrapper for the synthetic motor-unit route."""
-
-    command, diagnostics = safe_absolute_dataset_target_to_isaac_rad(
-        current_joint_rad,
-        absolute_motor_target,
-        arm_units=SO101_ARM_UNITS_LEROBOT_MOTOR,
-        arm_target_scale=arm_target_scale,
-        max_arm_step_rad=max_arm_step_rad,
-        runtime_joint_limits_rad=runtime_joint_limits_rad,
-    )
-    diagnostics.update(
-        {
-            "motor_limit_clipped": diagnostics["dataset_limit_clipped"],
-            "raw_motor_target": diagnostics["raw_dataset_target"],
-            "clipped_motor_target": diagnostics["clipped_dataset_target"],
-        }
-    )
-    return command, diagnostics

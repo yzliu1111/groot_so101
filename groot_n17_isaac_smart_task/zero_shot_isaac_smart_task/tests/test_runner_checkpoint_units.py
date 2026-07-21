@@ -42,12 +42,7 @@ def _load_runner_without_isaac_app():
 runner = _load_runner_without_isaac_app()
 
 
-def _degree_ping(arm_units: str = "degrees") -> dict:
-    action_units = (
-        "arm_degrees_gripper_range_0_100"
-        if arm_units == "degrees"
-        else "lerobot_motor_units"
-    )
+def _finetuned_ping() -> dict:
     return {
         "camera_layout": "dual",
         "modality": {"video": {"modality_keys": ["top", "wrist"]}},
@@ -55,10 +50,7 @@ def _degree_ping(arm_units: str = "degrees") -> dict:
             "processor_use_relative_action": True,
             "policy_api_output": "decoded_dataset_action",
             "dataset_action_semantics": "absolute_joint_position_targets",
-            "dataset_action_units": action_units,
-            "dataset_arm_joint_units": arm_units,
-            "dataset_state_arm_joint_units": arm_units,
-            "dataset_gripper_units": "lerobot_range_0_100",
+            "dataset_action_units": "checkpoint_dataset_coordinates",
         },
     }
 
@@ -94,22 +86,22 @@ class RunnerCheckpointUnitsTest(unittest.TestCase):
         ):
             runner.parse_args()
 
-    def test_runner_accepts_matching_degree_bridge_contract(self) -> None:
+    def test_bridge_contract_is_unit_agnostic(self) -> None:
         args = SimpleNamespace(
             policy_schema="so101-new-embodiment",
             camera_layout="dual",
-            so101_checkpoint_arm_units="degrees",
         )
-        runner.validate_bridge_camera_layout(args, _degree_ping())
+        runner.validate_bridge_camera_layout(args, _finetuned_ping())
 
-    def test_runner_rejects_motor_bridge_for_degree_checkpoint(self) -> None:
+    def test_runner_rejects_bridge_that_relabels_dataset_coordinates(self) -> None:
+        ping = _finetuned_ping()
+        ping["action_decoding"]["dataset_action_units"] = "radians"
         args = SimpleNamespace(
             policy_schema="so101-new-embodiment",
             camera_layout="dual",
-            so101_checkpoint_arm_units="degrees",
         )
         with self.assertRaisesRegex(ValueError, "executable action contract"):
-            runner.validate_bridge_camera_layout(args, _degree_ping("lerobot_motor_units"))
+            runner.validate_bridge_camera_layout(args, ping)
 
     def test_degree_observation_wiring_converts_arm_but_not_gripper_as_degrees(self) -> None:
         joint_rad = torch.tensor(

@@ -50,32 +50,14 @@ runner 在执行动作前会比较 layout 和 modality，不一致就停止。
 
 ## 4. SO101 action 约定
 
-SO101 微调路线有两个显式数据坐标契约。sim 数据 checkpoint：
+| checkpoint 来源 | 前五维 arm state/action | 第六维 gripper |
+|---|---|---|
+| LeIsaac sim | LeRobot motor units | LeRobot `[0,100]` |
+| 真机 `use_degrees=True` | degrees | LeRobot `[0,100]` |
 
-```text
-Isaac joint radians
--> LeRobot motor units，作为 GR00T state
--> Gr00tPolicy.get_action()
--> decode_action 后的绝对 LeRobot motor target
--> Isaac joint radians
--> env.step()
-```
-
-真机数据 checkpoint：
-
-```text
-前五维 arm：Isaac radians -> degrees，作为 GR00T state
-第六维 gripper：Isaac radians -> LeRobot [0,100] range
--> Gr00tPolicy.get_action()
--> decode_action 后的绝对 arm degrees + gripper [0,100]
--> 前五维 degree -> radians；gripper继续走 range -> radians 映射
--> env.step()
-```
-
-部署命令应在 bridge 和 runner 两边显式传入相同的
-`--so101-checkpoint-joint-units {lerobot_motor_units,degrees}`；默认 motor 只用于兼容旧 sim
-命令。这个声明来自训练数据来源，不是 runner 从 checkpoint 自动推断；本次检查的
-`real_1.zip` / `sim_2.zip` LeRobot meta 没有单位字段。
+bridge 只保证 `get_action()` 已 decode 回 checkpoint 数据集的绝对坐标；单位选择只存在于
+runner 的 `--so101-checkpoint-joint-units {lerobot_motor_units,degrees}`。默认 motor 兼容旧
+sim 命令；真机 checkpoint 必须显式传 `degrees`。runner 不会从 checkpoint/meta 自动推断。
 
 关键点：processor 的 `use_relative_action` 可以表示内部训练变换，但不能据此把
 `get_action()` 的返回值重新解释成 delta。部署侧禁止执行：
@@ -143,7 +125,7 @@ policy 时间基准与 Isaac step 分开。当前数据 30 Hz、env 60 Hz，所�
 ```text
 训练 config 与 camera layout 对齐
 bridge ping 报告 modality + action_decoding
-bridge/runner 的 checkpoint joint units 一致
+runner units 与 checkpoint 的训练数据来源一致
 runner camera-only 通过
 纯 Python tests 通过
 dry-run 通过

@@ -149,8 +149,7 @@ cd "$SMART_PROJECT"
     --experiment-name so101_projector_only_bs1_acc16
 ```
 
-projector-only 输出是普通 sim-data checkpoint，可交给 `groot_bridge_server.py --model-path`；
-部署时同时显式传入 `--so101-checkpoint-joint-units lerobot_motor_units`。
+projector-only 输出是普通 checkpoint，可直接交给 `groot_bridge_server.py --model-path`。
 
 ## 5. Diffusion LoRA
 

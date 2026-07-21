@@ -135,12 +135,10 @@ from pose_math import compose_pose_delta, quat_wxyz_to_rot6d  # noqa: E402
 from so101_joint_units import (  # noqa: E402
     SO101_ARM_UNITS_LEROBOT_MOTOR,
     SO101_CHECKPOINT_ARM_UNIT_CHOICES,
-    SO101_GRIPPER_UNITS,
     SO101_JOINT_NAMES,
     SO101_LEROBOT_MOTOR_LIMITS,
     isaac_rad_to_so101_dataset,
     safe_absolute_dataset_target_to_isaac_rad,
-    so101_action_units_contract,
     validate_runtime_joint_limits_match_converter,
 )
 from wire import request  # noqa: E402
@@ -330,10 +328,7 @@ def validate_bridge_camera_layout(args: argparse.Namespace, ping: dict[str, Any]
     expected_action_contract = {
         "policy_api_output": "decoded_dataset_action",
         "dataset_action_semantics": "absolute_joint_position_targets",
-        "dataset_action_units": so101_action_units_contract(args.so101_checkpoint_arm_units),
-        "dataset_arm_joint_units": args.so101_checkpoint_arm_units,
-        "dataset_state_arm_joint_units": args.so101_checkpoint_arm_units,
-        "dataset_gripper_units": SO101_GRIPPER_UNITS,
+        "dataset_action_units": "checkpoint_dataset_coordinates",
     }
     contract_mismatch = {
         key: (expected, action_decoding.get(key))
@@ -1986,8 +1981,7 @@ def main() -> None:
                 "[runner] SO101 state conversion "
                 f"Isaac radians={initial_joint_rad.round(4).tolist()} -> "
                 f"dataset values={initial_joint_dataset.round(4).tolist()} "
-                f"arm_units={args.so101_checkpoint_arm_units} "
-                f"gripper_units={SO101_GRIPPER_UNITS}",
+                f"arm_units={args.so101_checkpoint_arm_units}",
                 flush=True,
             )
             print(
@@ -2040,8 +2034,7 @@ def main() -> None:
             if args.policy_schema == "so101-new-embodiment":
                 print(
                     "[runner] SO101 action values below are decoded absolute dataset targets "
-                    f"arm_units={args.so101_checkpoint_arm_units} "
-                    f"gripper_units={SO101_GRIPPER_UNITS}",
+                    f"arm_units={args.so101_checkpoint_arm_units}",
                     flush=True,
                 )
             print(f"[runner] action summary: {summarize_action(action)}", flush=True)

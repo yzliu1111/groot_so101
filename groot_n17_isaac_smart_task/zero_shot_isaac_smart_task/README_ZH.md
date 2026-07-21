@@ -9,8 +9,8 @@
 
 | 目的 | bridge 参数 | runner 参数 |
 |---|---|---|
-| sim 数据微调权重 | `--deployment-mode so101-finetuned --so101-checkpoint-joint-units lerobot_motor_units` | 同左，`--robot so101 --control-mode joint` |
-| 真机数据微调权重 | `--deployment-mode so101-finetuned --so101-checkpoint-joint-units degrees` | 同左，`--robot so101 --control-mode joint` |
+| sim 数据微调权重 | `--deployment-mode so101-finetuned` | 同左，`--so101-checkpoint-joint-units lerobot_motor_units --robot so101 --control-mode joint` |
+| 真机数据微调权重 | `--deployment-mode so101-finetuned` | 同左，`--so101-checkpoint-joint-units degrees --robot so101 --control-mode joint` |
 | base model 对照 | `--deployment-mode zero-shot-oxe` | 同左，SO101 或 Franka |
 
 第一次运行固定按下面的顺序：
@@ -51,8 +51,6 @@ source /home/guest1/smart_project/experiments/groot_n17_isaac_smart_task/termina
 # source /home/yzliu/physical_ai/company_project/smart_project/experiments/groot_n17_isaac_smart_task/terminal_env.sh local
 
 export CHECKPOINT="__FILL_FINETUNED_CHECKPOINT_DIR__"
-# sim 数据 checkpoint 使用 lerobot_motor_units；真机数据 checkpoint 改为 degrees。
-export SO101_CHECKPOINT_JOINT_UNITS="lerobot_motor_units"
 
 conda deactivate 2>/dev/null || true
 unset PYTHONPATH PYTHONHOME PYTHONNOUSERSITE PYTHONDONTWRITEBYTECODE ISAAC_PATH ISAACLAB_PATH
@@ -61,7 +59,6 @@ cd "$SMART_PROJECT"
 "$GROOT_ROOT/.venv/bin/python" \
   experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task/groot_bridge_server.py \
     --deployment-mode so101-finetuned \
-    --so101-checkpoint-joint-units "$SO101_CHECKPOINT_JOINT_UNITS" \
     --camera-layout dual \
     --model-path "$CHECKPOINT" \
     --host 127.0.0.1 \
@@ -69,11 +66,9 @@ cd "$SMART_PROJECT"
     --device cuda
 ```
 
-这个参数控制前五个 arm joint 的 state/action 坐标；gripper 两条路线都保持 `[0,100]`。
-runner 不会从 checkpoint 自动推断它；本次检查的 `real_1.zip` / `sim_2.zip` LeRobot meta
-也没有 unit 字段，因此必须按训练数据来源显式声明。看到 modality、camera layout 和
-`action_decoding` 后再开终端 2。bridge 使用本地
-pickle socket，默认只监听 `127.0.0.1`；不要直接暴露到不可信网络。
+bridge 只负责 decode 回 checkpoint 数据集坐标，不做单位换算。看到 modality、camera
+layout 和 `action_decoding` 后再开终端 2。bridge 使用本地 pickle socket，默认只监听
+`127.0.0.1`；不要直接暴露到不可信网络。
 
 ## 4. 终端 2 准备 Isaac runner
 
@@ -93,7 +88,7 @@ export PYTHONDONTWRITEBYTECODE=1
 export PYTHONNOUSERSITE=1
 export BRIDGE_HOST="${BRIDGE_HOST:-127.0.0.1}"
 export BRIDGE_PORT="${BRIDGE_PORT:-5577}"
-# 必须与 bridge 相同；真机数据 checkpoint 改为 degrees。
+# sim checkpoint 用 lerobot_motor_units；真机 checkpoint 用 degrees。
 export SO101_CHECKPOINT_JOINT_UNITS="lerobot_motor_units"
 ```
 
@@ -143,8 +138,9 @@ python experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task/run_sma
   --max-policy-calls 1
 ```
 
-必须看到 `action.single_arm`、`action.gripper`，并确认日志里的
-`dataset_arm_joint_units` 与所选 checkpoint 一致；bridge/runner 声明不一致时会拒绝继续。
+必须看到 `action.single_arm`、`action.gripper`，以及 bridge 报告
+`dataset_action_units=checkpoint_dataset_coordinates`；runner 日志里的 `arm_units` 必须与
+训练数据来源一致。
 
 ### 4.3 第一次只执行一个 policy action
 
@@ -194,42 +190,17 @@ prepared 数据里的历史 key 与 live key 不是同一概念：
 
 ## 6. checkpoint 单位和四个安全参数
 
-sim 数据 checkpoint 的链路是：
+| checkpoint 来源 | 前五个 arm state/action | gripper |
+|---|---|---|
+| LeIsaac sim | LeRobot motor units | LeRobot `[0,100]` |
+| 真机 `use_degrees=True` | degrees | LeRobot `[0,100]` |
 
-```text
-Isaac radians
--> LeRobot motor units 作为 GR00T state
--> GR00T + decode_action
--> decoded absolute motor target
--> motor limits
--> radians
--> 每个 policy action 的 radian 限幅
--> Isaac runtime joint limits
--> env.step()
-```
-
-真机数据 checkpoint 的链路是：
-
-```text
-arm[:5]: Isaac radians -> degrees 作为 GR00T state
-gripper:  Isaac radians -> LeRobot [0,100] range
--> GR00T + decode_action
--> decoded absolute arm degrees + gripper [0,100]
--> arm degree limits + gripper range limits
--> arm degree -> radians；gripper继续走原 range -> radians 映射
--> 每个 policy action 的 radian 限幅
--> Isaac runtime joint limits
--> env.step()
-```
-
-不要把 `single_arm` 当 radian，也不要执行
-`current_radians + returned_action`。processor 内部可以使用 relative 表示，但
-`Gr00tPolicy.get_action()` 对外返回的是解码后的数据集空间绝对目标。
-
-`real_1.zip` 与 `sim_2.zip` 的 meta 确认两边 joint 顺序一致，stats 数值范围也与既定的
-“real 前五维 degree / sim 前五维 motor unit”来源契约相符。但数值范围不能唯一证明单位，
-两份 meta 也没有 unit 或 calibration 字段。第六维始终使用 LeRobot `[0,100]` range 是本项目
-的数据契约；两边 gripper stats 约为 `[0,48]` 与该契约相符，不能据此把第六维改成角度。
+`--so101-checkpoint-joint-units` 只在 runner 中选择前五维转换。runner 不会从 checkpoint
+自动推断；当前 LeRobot meta 也没有 unit 字段。`get_action()` 返回 decode 后的数据集空间
+绝对目标，所以不要把 `single_arm` 当 radians，也不要执行
+`current_radians + returned_action`。统一安全链路是：数据集限位 → 转 radians → 单步限幅 →
+Isaac runtime limits → `env.step()`。更完整的代码契约见
+[TECHNICAL_CONTRACTS_ZH.md](../TECHNICAL_CONTRACTS_ZH.md)。
 
 | 参数 | 含义 |
 |---|---|
@@ -297,7 +268,7 @@ Franka EEF:   --deployment-mode zero-shot-oxe --robot franka --control-mode eef
 | bridge import/checkpoint 失败 | GR00T Python 3.12 venv、checkpoint 路径 |
 | camera key 不存在 | `--debug-cameras-only` 和 layout/live mapping |
 | 看不到 LEGO | `--smart-target-asset cuboid`、日志里的 `root_pos_w` |
-| action contract mismatch | bridge 与 runner 是否来自同一版代码、是否使用相同 `--so101-checkpoint-joint-units` |
+| action contract mismatch | bridge 与 runner 是否来自同一版代码，bridge 是否报告 decoded dataset action |
 | joint limit mismatch | 是否加载了另一套 SO101 USD；不要继续执行 |
 | 动作方向错误 | 立即停在 one-step，不要增加 horizon |
 | 30/60 Hz 不整除 | 修正 `--policy-action-hz`，不要绕过报错 |
