@@ -1,0 +1,179 @@
+from __future__ import annotations
+
+import importlib.util
+from pathlib import Path
+from types import ModuleType, SimpleNamespace
+import sys
+import unittest
+from unittest.mock import patch
+
+import numpy as np
+import torch
+
+
+SCRIPT_DIR = Path(__file__).resolve().parents[1]
+RUNNER_PATH = SCRIPT_DIR / "run_smart_task_closed_loop.py"
+
+
+def _load_runner_without_isaac_app():
+    """Import runner logic without bootstrapping Omniverse/SimulationApp."""
+
+    fake_isaaclab = ModuleType("isaaclab")
+    fake_isaaclab.__path__ = []  # type: ignore[attr-defined]
+    fake_app = ModuleType("isaaclab.app")
+    fake_app.AppLauncher = object  # type: ignore[attr-defined]
+
+    spec = importlib.util.spec_from_file_location("runner_checkpoint_units_test_module", RUNNER_PATH)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"could not load runner from {RUNNER_PATH}")
+    module = importlib.util.module_from_spec(spec)
+    with patch.dict(
+        sys.modules,
+        {
+            "isaaclab": fake_isaaclab,
+            "isaaclab.app": fake_app,
+            spec.name: module,
+        },
+    ):
+        spec.loader.exec_module(module)
+    return module
+
+
+runner = _load_runner_without_isaac_app()
+
+
+def _degree_ping(arm_units: str = "degrees") -> dict:
+    action_units = (
+        "arm_degrees_gripper_range_0_100"
+        if arm_units == "degrees"
+        else "lerobot_motor_units"
+    )
+    return {
+        "camera_layout": "dual",
+        "modality": {"video": {"modality_keys": ["top", "wrist"]}},
+        "action_decoding": {
+            "processor_use_relative_action": True,
+            "policy_api_output": "decoded_dataset_action",
+            "dataset_action_semantics": "absolute_joint_position_targets",
+            "dataset_action_units": action_units,
+            "dataset_arm_joint_units": arm_units,
+            "dataset_state_arm_joint_units": arm_units,
+            "dataset_gripper_units": "lerobot_range_0_100",
+        },
+    }
+
+
+class RunnerCheckpointUnitsTest(unittest.TestCase):
+    def test_cli_defaults_to_sim_motor_units(self) -> None:
+        with patch.object(sys, "argv", ["run_smart_task_closed_loop.py"]):
+            args = runner.parse_args()
+        self.assertEqual(args.so101_checkpoint_arm_units, "lerobot_motor_units")
+
+    def test_cli_accepts_degree_finetuned_checkpoint(self) -> None:
+        argv = [
+            "run_smart_task_closed_loop.py",
+            "--deployment-mode",
+            "so101-finetuned",
+            "--so101-checkpoint-joint-units",
+            "degrees",
+        ]
+        with patch.object(sys, "argv", argv):
+            args = runner.parse_args()
+        self.assertEqual(args.so101_checkpoint_arm_units, "degrees")
+        self.assertEqual(args.policy_schema, "so101-new-embodiment")
+
+    def test_cli_rejects_degree_units_for_zero_shot(self) -> None:
+        argv = [
+            "run_smart_task_closed_loop.py",
+            "--so101-checkpoint-joint-units",
+            "degrees",
+        ]
+        with patch.object(sys, "argv", argv), self.assertRaisesRegex(
+            ValueError,
+            "requires --deployment-mode so101-finetuned",
+        ):
+            runner.parse_args()
+
+    def test_runner_accepts_matching_degree_bridge_contract(self) -> None:
+        args = SimpleNamespace(
+            policy_schema="so101-new-embodiment",
+            camera_layout="dual",
+            so101_checkpoint_arm_units="degrees",
+        )
+        runner.validate_bridge_camera_layout(args, _degree_ping())
+
+    def test_runner_rejects_motor_bridge_for_degree_checkpoint(self) -> None:
+        args = SimpleNamespace(
+            policy_schema="so101-new-embodiment",
+            camera_layout="dual",
+            so101_checkpoint_arm_units="degrees",
+        )
+        with self.assertRaisesRegex(ValueError, "executable action contract"):
+            runner.validate_bridge_camera_layout(args, _degree_ping("lerobot_motor_units"))
+
+    def test_degree_observation_wiring_converts_arm_but_not_gripper_as_degrees(self) -> None:
+        joint_rad = torch.tensor(
+            [[0.1, -0.2, 0.3, 0.4, -0.5, np.deg2rad(45.0)]],
+            dtype=torch.float32,
+        )
+        policy_obs = {
+            "joint_pos": joint_rad,
+            "camera3": torch.zeros((1, 2, 2, 3), dtype=torch.uint8),
+            "camera2": torch.zeros((1, 2, 2, 3), dtype=torch.uint8),
+        }
+
+        observation = runner.build_so101_new_embodiment_observation(
+            policy_obs,
+            runner.FrameHistory(horizon=2),
+            "pick the block",
+            "so101",
+            {"top": "camera3", "wrist": "camera2"},
+            "dual",
+            checkpoint_arm_units="degrees",
+        )
+
+        np.testing.assert_allclose(
+            observation["state"]["single_arm"][0, 0],
+            np.rad2deg(joint_rad.numpy()[0, :5]),
+            atol=2e-5,
+        )
+        # The SO101 gripper maps -10..100 USD degrees to the dataset's 0..100
+        # range, so 45 degrees is 50 dataset units.  It is not reported as 45.
+        self.assertAlmostEqual(float(observation["state"]["gripper"][0, 0, 0]), 50.0, places=5)
+
+    def test_degree_action_wiring_converts_arm_and_range_mapped_gripper(self) -> None:
+        fallback_joint = torch.zeros((1, 6), dtype=torch.float32)
+        action = {
+            "single_arm": np.asarray([[[10.0, -20.0, 30.0, 40.0, -50.0]]], dtype=np.float32),
+            "gripper": np.asarray([[[50.0]]], dtype=np.float32),
+        }
+
+        command = runner.so101_new_embodiment_action_to_leisaac_tensor(
+            action,
+            "cpu",
+            fallback_joint,
+            max_arm_step_rad=None,
+            checkpoint_arm_units="degrees",
+        ).numpy()[0]
+
+        np.testing.assert_allclose(command[:5], np.deg2rad(action["single_arm"][0, 0]), atol=2e-6)
+        self.assertAlmostEqual(float(command[5]), float(np.deg2rad(45.0)), places=6)
+
+    def test_degree_action_without_arm_holds_current_arm(self) -> None:
+        fallback_joint = torch.tensor(
+            [[0.1, -0.2, 0.3, 0.4, -0.5, 0.25]],
+            dtype=torch.float32,
+        )
+
+        command = runner.so101_new_embodiment_action_to_leisaac_tensor(
+            {"gripper": np.asarray([[[50.0]]], dtype=np.float32)},
+            "cpu",
+            fallback_joint,
+            max_arm_step_rad=None,
+            checkpoint_arm_units="degrees",
+        ).numpy()[0]
+
+        np.testing.assert_allclose(command[:5], fallback_joint.numpy()[0, :5], atol=2e-6)
+
+if __name__ == "__main__":
+    unittest.main()

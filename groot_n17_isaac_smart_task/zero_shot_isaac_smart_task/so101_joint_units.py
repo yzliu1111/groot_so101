@@ -1,13 +1,16 @@
-"""SO101 joint-coordinate conversion and command safety helpers.
+"""SO101 dataset-coordinate conversion and command safety helpers.
 
-LeIsaac simulates SO101 joints in radians and records the corresponding dataset
-state/action through its explicit USD-range <-> LeRobot motor-range mapping.
-GR00T checkpoints trained on those datasets therefore consume and return that
-dataset motor-coordinate representation.
+LeIsaac simulates SO101 joints in radians.  The checkpoints used by this
+experiment have two explicit dataset-space contracts for the first five arm
+joints:
 
-This is the simulator/data-coordinate mapping used by LeIsaac.  It is distinct
-from a physical robot's encoder calibration JSON, and it does not assume that
-an episode reset pose, LeRobot ``u=0``, and USD/URDF ``q=0`` are the same pose.
+- synthetic LeIsaac data: LeRobot motor-range coordinates;
+- real-robot data: joint degrees.
+
+Both datasets keep the gripper in the same LeRobot-style ``[0, 100]`` range.
+The selected arm-unit contract therefore controls both the state sent to GR00T
+and the decoded absolute action returned to Isaac; it never changes the
+gripper's range mapping.
 
 Keep this module independent from Isaac/LeIsaac imports so the critical unit
 math can be tested without starting SimulationApp.
@@ -28,6 +31,15 @@ SO101_JOINT_NAMES = (
     "wrist_roll",
     "gripper",
 )
+
+SO101_ARM_UNITS_LEROBOT_MOTOR = "lerobot_motor_units"
+SO101_ARM_UNITS_DEGREES = "degrees"
+SO101_CHECKPOINT_ARM_UNIT_CHOICES = (
+    SO101_ARM_UNITS_LEROBOT_MOTOR,
+    SO101_ARM_UNITS_DEGREES,
+)
+SO101_GRIPPER_UNITS = "lerobot_range_0_100"
+SO101_DEGREE_ACTION_UNITS = "arm_degrees_gripper_range_0_100"
 
 # Mirrors leisaac.assets.robots.lerobot.SO101_FOLLOWER_USD_JOINT_LIMLITS.
 # Values are degrees; Isaac itself exposes the corresponding positions in radians.
@@ -92,6 +104,68 @@ def lerobot_motor_to_isaac_rad(motor_target: Any) -> np.ndarray:
     return np.deg2rad(joint_deg).astype(np.float32)
 
 
+def _validate_arm_units(arm_units: str) -> str:
+    if arm_units not in SO101_CHECKPOINT_ARM_UNIT_CHOICES:
+        raise ValueError(
+            f"arm_units must be one of {SO101_CHECKPOINT_ARM_UNIT_CHOICES}, got {arm_units!r}"
+        )
+    return arm_units
+
+
+def so101_action_units_contract(arm_units: str) -> str:
+    """Return the public action-unit label used by bridge/runner handshakes."""
+
+    arm_units = _validate_arm_units(arm_units)
+    if arm_units == SO101_ARM_UNITS_LEROBOT_MOTOR:
+        return SO101_ARM_UNITS_LEROBOT_MOTOR
+    return SO101_DEGREE_ACTION_UNITS
+
+
+def isaac_rad_to_so101_dataset(joint_rad: Any, arm_units: str) -> np.ndarray:
+    """Convert Isaac radians to the checkpoint's 6D dataset-space state.
+
+    Only the first five arm joints switch representation.  The gripper always
+    uses the existing LeRobot ``[0, 100]`` range mapping.
+    """
+
+    arm_units = _validate_arm_units(arm_units)
+    joint_rad_array = _joint_array(joint_rad, "joint_rad")
+    if arm_units == SO101_ARM_UNITS_LEROBOT_MOTOR:
+        return isaac_rad_to_lerobot_motor(joint_rad_array)
+
+    dataset_values = isaac_rad_to_lerobot_motor(joint_rad_array)
+    dataset_values[..., :5] = np.rad2deg(joint_rad_array[..., :5])
+    return dataset_values.astype(np.float32)
+
+
+def so101_dataset_to_isaac_rad(dataset_target: Any, arm_units: str) -> np.ndarray:
+    """Convert a checkpoint's 6D dataset-space target to Isaac radians.
+
+    Degree checkpoints use direct ``degree -> radian`` conversion for the five
+    arm joints.  Their gripper remains in ``[0, 100]`` and therefore continues
+    through the LeRobot-range converter.
+    """
+
+    arm_units = _validate_arm_units(arm_units)
+    dataset_array = _joint_array(dataset_target, "dataset_target")
+    if arm_units == SO101_ARM_UNITS_LEROBOT_MOTOR:
+        return lerobot_motor_to_isaac_rad(dataset_array)
+
+    joint_rad = lerobot_motor_to_isaac_rad(dataset_array)
+    joint_rad[..., :5] = np.deg2rad(dataset_array[..., :5])
+    return joint_rad.astype(np.float32)
+
+
+def so101_dataset_limits(arm_units: str) -> np.ndarray:
+    """Return dataset-space limits for five arm joints plus the gripper."""
+
+    arm_units = _validate_arm_units(arm_units)
+    limits = SO101_LEROBOT_MOTOR_LIMITS.copy()
+    if arm_units == SO101_ARM_UNITS_DEGREES:
+        limits[:5] = SO101_USD_JOINT_LIMITS_DEG[:5]
+    return limits
+
+
 def validate_runtime_joint_limits_match_converter(
     runtime_joint_limits_rad: Any,
     *,
@@ -101,7 +175,7 @@ def validate_runtime_joint_limits_match_converter(
 
     A different USD, joint order, sign convention, or joint range requires a
     different mapping.  Silently using this converter in that case would make
-    otherwise valid absolute motor targets point to the wrong physical poses.
+    otherwise valid absolute dataset targets point to the wrong physical poses.
     """
 
     limits = np.asarray(runtime_joint_limits_rad, dtype=np.float32)
@@ -111,16 +185,17 @@ def validate_runtime_joint_limits_match_converter(
         raise ValueError("runtime_joint_limits_rad contains NaN or infinity")
     if not np.allclose(limits, SO101_USD_JOINT_LIMITS_RAD, atol=float(atol), rtol=0.0):
         raise ValueError(
-            "Loaded Isaac SO101 joint limits do not match the LeIsaac motor-unit converter: "
+            "Loaded Isaac SO101 joint limits do not match the deployment coordinate converter: "
             f"expected_rad={SO101_USD_JOINT_LIMITS_RAD.round(5).tolist()} "
             f"actual_rad={limits.round(5).tolist()}"
         )
 
 
-def safe_absolute_motor_target_to_isaac_rad(
+def safe_absolute_dataset_target_to_isaac_rad(
     current_joint_rad: Any,
-    absolute_motor_target: Any,
+    absolute_dataset_target: Any,
     *,
+    arm_units: str,
     arm_target_scale: float = 1.0,
     max_arm_step_rad: float | None = 0.08,
     runtime_joint_limits_rad: Any | None = None,
@@ -128,22 +203,24 @@ def safe_absolute_motor_target_to_isaac_rad(
     """Safely convert one decoded absolute GR00T action to an Isaac target.
 
     ``Gr00tPolicy.get_action()`` returns the result after ``decode_action`` in
-    the raw dataset action space.  This project's raw SO101 actions are absolute
-    motor-domain targets, even though the processor may use a relative arm
-    representation internally.  This helper therefore never adds the returned
-    action to the current radians.
-    It converts the absolute motor-domain target first, then optionally limits
-    how far the five arm joints may move during one policy action.  The runner
-    may hold that command for multiple simulator steps to preserve policy time.
+    the raw dataset action space.  The raw SO101 actions are absolute targets,
+    even though the processor may use a relative arm representation internally.
+    This helper therefore never adds the returned action to the current radians.
+    It converts the selected dataset coordinate first, then optionally limits
+    how far the five arm joints may move during one policy action.
     """
 
+    arm_units = _validate_arm_units(arm_units)
     current = _joint_array(current_joint_rad, "current_joint_rad").reshape(6)
-    raw_motor = _joint_array(absolute_motor_target, "absolute_motor_target").reshape(6)
+    raw_dataset = _joint_array(absolute_dataset_target, "absolute_dataset_target").reshape(6)
 
-    motor_low = SO101_LEROBOT_MOTOR_LIMITS[:, 0]
-    motor_high = SO101_LEROBOT_MOTOR_LIMITS[:, 1]
-    clipped_motor = np.clip(raw_motor, motor_low, motor_high).astype(np.float32)
-    absolute_target_rad = lerobot_motor_to_isaac_rad(clipped_motor).reshape(6)
+    dataset_limits = so101_dataset_limits(arm_units)
+    clipped_dataset = np.clip(
+        raw_dataset,
+        dataset_limits[:, 0],
+        dataset_limits[:, 1],
+    ).astype(np.float32)
+    absolute_target_rad = so101_dataset_to_isaac_rad(clipped_dataset, arm_units).reshape(6)
 
     if not np.isfinite(arm_target_scale) or not 0.0 <= arm_target_scale <= 1.0:
         raise ValueError(f"arm_target_scale must be within [0, 1], got {arm_target_scale}")
@@ -177,13 +254,44 @@ def safe_absolute_motor_target_to_isaac_rad(
         raise ValueError("safe SO101 command contains NaN or infinity")
 
     diagnostics = {
-        "motor_limit_clipped": not np.allclose(clipped_motor, raw_motor, atol=1e-7, rtol=0.0),
+        "arm_units": arm_units,
+        "dataset_limit_clipped": not np.allclose(
+            clipped_dataset, raw_dataset, atol=1e-7, rtol=0.0
+        ),
         "arm_step_clipped": not np.allclose(applied_arm_delta, requested_arm_delta, atol=1e-7, rtol=0.0),
         "runtime_limit_clipped": runtime_limit_clipped,
-        "raw_motor_target": raw_motor,
-        "clipped_motor_target": clipped_motor,
+        "raw_dataset_target": raw_dataset,
+        "clipped_dataset_target": clipped_dataset,
         "absolute_target_rad": absolute_target_rad,
         "requested_arm_delta_rad": requested_arm_delta,
         "applied_arm_delta_rad": applied_arm_delta,
     }
     return command.astype(np.float32), diagnostics
+
+
+def safe_absolute_motor_target_to_isaac_rad(
+    current_joint_rad: Any,
+    absolute_motor_target: Any,
+    *,
+    arm_target_scale: float = 1.0,
+    max_arm_step_rad: float | None = 0.08,
+    runtime_joint_limits_rad: Any | None = None,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Backward-compatible wrapper for the synthetic motor-unit route."""
+
+    command, diagnostics = safe_absolute_dataset_target_to_isaac_rad(
+        current_joint_rad,
+        absolute_motor_target,
+        arm_units=SO101_ARM_UNITS_LEROBOT_MOTOR,
+        arm_target_scale=arm_target_scale,
+        max_arm_step_rad=max_arm_step_rad,
+        runtime_joint_limits_rad=runtime_joint_limits_rad,
+    )
+    diagnostics.update(
+        {
+            "motor_limit_clipped": diagnostics["dataset_limit_clipped"],
+            "raw_motor_target": diagnostics["raw_dataset_target"],
+            "clipped_motor_target": diagnostics["clipped_dataset_target"],
+        }
+    )
+    return command, diagnostics

@@ -338,6 +338,7 @@ cd "$SMART_PROJECT"
 ```bash
 python experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task/run_smart_task_closed_loop.py \
   --deployment-mode so101-finetuned \
+  --so101-checkpoint-joint-units lerobot_motor_units \
   --camera-layout dual \
   --front-observation-key camera3 \
   --wrist-observation-key camera2 \
@@ -347,6 +348,11 @@ python experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task/run_sma
   --debug-cameras-only \
   --headless
 ```
+
+这里显式保留 sim 的默认单位值，但 `--debug-cameras-only` 会在动作单位转换前退出，所以
+这一步只验证环境、场景和相机，不验证 motor/degree 转换链路。真机数据 checkpoint 的后续
+部署命令应把单位参数改成 `degrees`，并确保 bridge 与 runner 一致；真正的单位合约验证从
+bridge dry-run 握手和 one-step 开始。
 
 只有这一步通过，才进入 bridge dry-run 和 one-step。后续命令见
 [zero_shot_isaac_smart_task/README_ZH.md](../zero_shot_isaac_smart_task/README_ZH.md)。

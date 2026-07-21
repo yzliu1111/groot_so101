@@ -50,7 +50,7 @@ runner 在执行动作前会比较 layout 和 modality，不一致就停止。
 
 ## 4. SO101 action 约定
 
-SO101 微调路线的公开数据契约是：
+SO101 微调路线有两个显式数据坐标契约。sim 数据 checkpoint：
 
 ```text
 Isaac joint radians
@@ -60,6 +60,22 @@ Isaac joint radians
 -> Isaac joint radians
 -> env.step()
 ```
+
+真机数据 checkpoint：
+
+```text
+前五维 arm：Isaac radians -> degrees，作为 GR00T state
+第六维 gripper：Isaac radians -> LeRobot [0,100] range
+-> Gr00tPolicy.get_action()
+-> decode_action 后的绝对 arm degrees + gripper [0,100]
+-> 前五维 degree -> radians；gripper继续走 range -> radians 映射
+-> env.step()
+```
+
+部署命令应在 bridge 和 runner 两边显式传入相同的
+`--so101-checkpoint-joint-units {lerobot_motor_units,degrees}`；默认 motor 只用于兼容旧 sim
+命令。这个声明来自训练数据来源，不是 runner 从 checkpoint 自动推断；本次检查的
+`real_1.zip` / `sim_2.zip` LeRobot meta 没有单位字段。
 
 关键点：processor 的 `use_relative_action` 可以表示内部训练变换，但不能据此把
 `get_action()` 的返回值重新解释成 delta。部署侧禁止执行：
@@ -72,8 +88,8 @@ current_radians + returned_action
 
 ```text
 拒绝错误 shape / NaN / infinity
--> clip 到 LeRobot motor limits
--> 绝对 motor target 转 radians
+-> 按所选 checkpoint 坐标 clip：arm motor limits 或 arm degree/USD limits；gripper始终 [0,100]
+-> 绝对 dataset target 转 radians
 -> arm_target_scale 从当前姿态向目标插值（只作用于前 5 个 arm joints）
 -> max_arm_step_rad 限制一次 policy action 的 arm radian 变化
 -> clip 到 Isaac runtime soft joint limits
@@ -106,7 +122,8 @@ policy 时间基准与 Isaac step 分开。当前数据 30 Hz、env 60 Hz，所�
 
 ## 6. 路线边界
 
-- `so101-finetuned + joint`：当前主线，执行绝对 SO101 motor target。
+- `so101-finetuned + joint + lerobot_motor_units`：sim 数据 checkpoint，执行绝对 motor target。
+- `so101-finetuned + joint + degrees`：真机数据 checkpoint，执行绝对 arm degree target；gripper仍为 `[0,100]`。
 - `zero-shot-oxe`：embodiment 对照，不代表存在通用高维 action 到 SO101 的 adapter。
 - `eef`：把相对 EEF-frame `xyz + rot6d` 与当前末端位姿组合，再交给 IK action cfg。
 - Franka：用于更接近 OXE/DROID embodiment 的对照，不等于 SO101 checkpoint 部署。
@@ -126,6 +143,7 @@ policy 时间基准与 Isaac step 分开。当前数据 30 Hz、env 60 Hz，所�
 ```text
 训练 config 与 camera layout 对齐
 bridge ping 报告 modality + action_decoding
+bridge/runner 的 checkpoint joint units 一致
 runner camera-only 通过
 纯 Python tests 通过
 dry-run 通过

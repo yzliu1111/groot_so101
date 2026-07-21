@@ -12,11 +12,16 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from so101_joint_units import (  # noqa: E402
+    SO101_ARM_UNITS_DEGREES,
+    SO101_ARM_UNITS_LEROBOT_MOTOR,
     SO101_LEROBOT_MOTOR_LIMITS,
     SO101_USD_JOINT_LIMITS_DEG,
     isaac_rad_to_lerobot_motor,
+    isaac_rad_to_so101_dataset,
     lerobot_motor_to_isaac_rad,
+    safe_absolute_dataset_target_to_isaac_rad,
     safe_absolute_motor_target_to_isaac_rad,
+    so101_dataset_to_isaac_rad,
     validate_runtime_joint_limits_match_converter,
 )
 
@@ -42,6 +47,81 @@ class So101JointUnitsTest(unittest.TestCase):
             joint_rad,
             atol=2e-6,
         )
+
+    def test_degree_dataset_round_trip_preserves_arm_and_gripper(self) -> None:
+        joint_rad = np.asarray([0.2, -0.7, 0.8, 1.1, -1.2, 0.35], dtype=np.float32)
+        dataset_values = isaac_rad_to_so101_dataset(joint_rad, SO101_ARM_UNITS_DEGREES)
+
+        np.testing.assert_allclose(dataset_values[:5], np.rad2deg(joint_rad[:5]), atol=2e-5)
+        self.assertAlmostEqual(
+            float(dataset_values[5]),
+            float(isaac_rad_to_lerobot_motor(joint_rad)[5]),
+            places=5,
+        )
+        np.testing.assert_allclose(
+            so101_dataset_to_isaac_rad(dataset_values, SO101_ARM_UNITS_DEGREES),
+            joint_rad,
+            atol=2e-6,
+        )
+
+    def test_degree_target_converts_arm_directly_but_gripper_by_range(self) -> None:
+        current = np.zeros(6, dtype=np.float32)
+        dataset_target = np.asarray([90.0, -45.0, 0.0, 80.0, -90.0, 50.0], dtype=np.float32)
+        command, diagnostics = safe_absolute_dataset_target_to_isaac_rad(
+            current,
+            dataset_target,
+            arm_units=SO101_ARM_UNITS_DEGREES,
+            max_arm_step_rad=None,
+        )
+
+        np.testing.assert_allclose(command[:5], np.deg2rad(dataset_target[:5]), atol=2e-6)
+        expected_gripper = lerobot_motor_to_isaac_rad(
+            np.asarray([0.0, 0.0, 0.0, 0.0, 0.0, 50.0], dtype=np.float32)
+        )[5]
+        self.assertAlmostEqual(float(command[5]), float(expected_gripper), places=6)
+        self.assertNotAlmostEqual(float(command[5]), float(np.deg2rad(50.0)), places=3)
+        self.assertFalse(diagnostics["dataset_limit_clipped"])
+
+    def test_degree_target_reuses_dataset_and_step_limits(self) -> None:
+        current = np.zeros(6, dtype=np.float32)
+        command, diagnostics = safe_absolute_dataset_target_to_isaac_rad(
+            current,
+            np.asarray([500.0, -500.0, 500.0, 500.0, -500.0, 1000.0], dtype=np.float32),
+            arm_units=SO101_ARM_UNITS_DEGREES,
+            max_arm_step_rad=0.08,
+        )
+        self.assertTrue(diagnostics["dataset_limit_clipped"])
+        np.testing.assert_allclose(
+            diagnostics["clipped_dataset_target"],
+            np.asarray([110.0, -100.0, 90.0, 95.0, -160.0, 100.0], dtype=np.float32),
+        )
+        self.assertTrue(diagnostics["arm_step_clipped"])
+        self.assertLessEqual(float(np.max(np.abs(command[:5] - current[:5]))), 0.080001)
+        self.assertTrue(np.all(np.isfinite(command)))
+
+    def test_generic_motor_route_matches_compatibility_wrapper(self) -> None:
+        current = np.asarray([0.2, -0.7, 0.8, 1.1, -1.2, 0.35], dtype=np.float32)
+        target = np.asarray([20.0, -20.0, 30.0, 50.0, 40.0, 80.0], dtype=np.float32)
+        generic, generic_diagnostics = safe_absolute_dataset_target_to_isaac_rad(
+            current,
+            target,
+            arm_units=SO101_ARM_UNITS_LEROBOT_MOTOR,
+            max_arm_step_rad=None,
+        )
+        compatibility, compatibility_diagnostics = safe_absolute_motor_target_to_isaac_rad(
+            current,
+            target,
+            max_arm_step_rad=None,
+        )
+        np.testing.assert_allclose(generic, compatibility, atol=2e-6)
+        self.assertEqual(
+            generic_diagnostics["dataset_limit_clipped"],
+            compatibility_diagnostics["motor_limit_clipped"],
+        )
+
+    def test_unknown_checkpoint_arm_units_are_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "arm_units must be one of"):
+            isaac_rad_to_so101_dataset(np.zeros(6, dtype=np.float32), "radians")
 
     def test_runtime_limits_must_match_converter_mapping(self) -> None:
         runtime_limits = np.deg2rad(SO101_USD_JOINT_LIMITS_DEG)

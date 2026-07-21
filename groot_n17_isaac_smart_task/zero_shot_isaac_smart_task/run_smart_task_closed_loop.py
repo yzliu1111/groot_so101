@@ -133,10 +133,14 @@ from action_chunk import action_chunk_length, slice_action_step  # noqa: E402
 from action_timing import resolve_env_steps_per_policy_action  # noqa: E402
 from pose_math import compose_pose_delta, quat_wxyz_to_rot6d  # noqa: E402
 from so101_joint_units import (  # noqa: E402
+    SO101_ARM_UNITS_LEROBOT_MOTOR,
+    SO101_CHECKPOINT_ARM_UNIT_CHOICES,
+    SO101_GRIPPER_UNITS,
     SO101_JOINT_NAMES,
     SO101_LEROBOT_MOTOR_LIMITS,
-    isaac_rad_to_lerobot_motor,
-    safe_absolute_motor_target_to_isaac_rad,
+    isaac_rad_to_so101_dataset,
+    safe_absolute_dataset_target_to_isaac_rad,
+    so101_action_units_contract,
     validate_runtime_joint_limits_match_converter,
 )
 from wire import request  # noqa: E402
@@ -326,7 +330,10 @@ def validate_bridge_camera_layout(args: argparse.Namespace, ping: dict[str, Any]
     expected_action_contract = {
         "policy_api_output": "decoded_dataset_action",
         "dataset_action_semantics": "absolute_joint_position_targets",
-        "dataset_action_units": "lerobot_motor_units",
+        "dataset_action_units": so101_action_units_contract(args.so101_checkpoint_arm_units),
+        "dataset_arm_joint_units": args.so101_checkpoint_arm_units,
+        "dataset_state_arm_joint_units": args.so101_checkpoint_arm_units,
+        "dataset_gripper_units": SO101_GRIPPER_UNITS,
     }
     contract_mismatch = {
         key: (expected, action_decoding.get(key))
@@ -650,6 +657,7 @@ def build_so101_new_embodiment_observation(
     robot: str,
     camera_mapping: dict[str, str],
     camera_layout: str,
+    checkpoint_arm_units: str = SO101_ARM_UNITS_LEROBOT_MOTOR,
 ) -> dict[str, Any]:
     """Map LeIsaac SO101 observations to the trained NEW_EMBODIMENT schema."""
 
@@ -663,10 +671,10 @@ def build_so101_new_embodiment_observation(
         video[role] = history.latest(role)
 
     joint_rad = policy_obs["joint_pos"].detach().cpu().numpy()[0].astype(np.float32)
-    joint_lerobot = isaac_rad_to_lerobot_motor(joint_rad)
+    joint_dataset = isaac_rad_to_so101_dataset(joint_rad, checkpoint_arm_units)
     single_arm = np.zeros((1, 1, 5), dtype=np.float32)
-    single_arm[0, 0, : min(5, joint_lerobot.shape[0])] = joint_lerobot[:5]
-    gripper_value = float(joint_lerobot[5]) if joint_lerobot.shape[0] > 5 else 0.0
+    single_arm[0, 0, : min(5, joint_dataset.shape[0])] = joint_dataset[:5]
+    gripper_value = float(joint_dataset[5]) if joint_dataset.shape[0] > 5 else 0.0
     gripper = np.array([[[gripper_value]]], dtype=np.float32)
 
     return {
@@ -745,11 +753,12 @@ def so101_new_embodiment_action_to_leisaac_tensor(
     gripper_min: float | None = None,
     gripper_max: float | None = None,
     runtime_joint_limits: torch.Tensor | np.ndarray | None = None,
+    checkpoint_arm_units: str = SO101_ARM_UNITS_LEROBOT_MOTOR,
 ) -> torch.Tensor:
-    """Convert decoded absolute LeRobot actions to safe Isaac radian targets."""
+    """Convert decoded absolute dataset actions to safe Isaac radian targets."""
 
     current_rad = fallback_joint.detach().cpu().numpy()[0].astype(np.float32)
-    absolute_motor_target = isaac_rad_to_lerobot_motor(current_rad)
+    absolute_dataset_target = isaac_rad_to_so101_dataset(current_rad, checkpoint_arm_units)
 
     if "single_arm" in action:
         arm = np.asarray(action["single_arm"], dtype=np.float32)
@@ -758,7 +767,7 @@ def so101_new_embodiment_action_to_leisaac_tensor(
         usable = min(5, arm.shape[-1])
         # Gr00tPolicy.decode_action() has already undone normalization and
         # converted configured relative actions back to absolute dataset units.
-        absolute_motor_target[:usable] = arm[0, 0, :usable]
+        absolute_dataset_target[:usable] = arm[0, 0, :usable]
     else:
         print("[runner] warning: GR00T action lacks single_arm; holding arm joints", flush=True)
 
@@ -772,7 +781,7 @@ def so101_new_embodiment_action_to_leisaac_tensor(
             lower = float(default_lower) if gripper_min is None else float(gripper_min)
             upper = float(default_upper) if gripper_max is None else float(gripper_max)
             gripper_value = float(np.clip(gripper_value, lower, upper))
-        absolute_motor_target[5] = gripper_value
+        absolute_dataset_target[5] = gripper_value
     else:
         print("[runner] warning: GR00T action lacks gripper; holding gripper", flush=True)
 
@@ -783,18 +792,20 @@ def so101_new_embodiment_action_to_leisaac_tensor(
         else:
             runtime_limits_np = np.asarray(runtime_joint_limits, dtype=np.float32)
 
-    command, diagnostics = safe_absolute_motor_target_to_isaac_rad(
+    command, diagnostics = safe_absolute_dataset_target_to_isaac_rad(
         current_rad,
-        absolute_motor_target,
+        absolute_dataset_target,
+        arm_units=checkpoint_arm_units,
         arm_target_scale=arm_target_scale,
         max_arm_step_rad=max_arm_step_rad,
         runtime_joint_limits_rad=runtime_limits_np,
     )
-    if diagnostics["motor_limit_clipped"]:
+    if diagnostics["dataset_limit_clipped"]:
         print(
-            "[runner] SO101 safety clipped GR00T absolute motor target "
-            f"raw={diagnostics['raw_motor_target'].round(4).tolist()} "
-            f"clipped={diagnostics['clipped_motor_target'].round(4).tolist()}",
+            "[runner] SO101 safety clipped GR00T absolute dataset target "
+            f"arm_units={checkpoint_arm_units} "
+            f"raw={diagnostics['raw_dataset_target'].round(4).tolist()} "
+            f"clipped={diagnostics['clipped_dataset_target'].round(4).tolist()}",
             flush=True,
         )
     if diagnostics["arm_step_clipped"]:
@@ -884,6 +895,7 @@ def action_step_to_leisaac_tensor(
             step_action,
             env_device,
             policy_obs["joint_pos"],
+            checkpoint_arm_units=args.so101_checkpoint_arm_units,
             arm_target_scale=args.so101_arm_target_scale,
             max_arm_step_rad=args.so101_max_arm_step_rad,
             gripper_min=args.so101_gripper_min,
@@ -1415,6 +1427,18 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--so101-checkpoint-joint-units",
+        dest="so101_checkpoint_arm_units",
+        choices=SO101_CHECKPOINT_ARM_UNIT_CHOICES,
+        default=SO101_ARM_UNITS_LEROBOT_MOTOR,
+        help=(
+            "Dataset-space units used by the SO101 checkpoint's first five state/action joints. "
+            "Use lerobot_motor_units for LeIsaac/sim data or degrees for real-robot data. "
+            "The gripper always remains in the LeRobot [0,100] range."
+        ),
+    )
+
+    parser.add_argument(
         "--camera-profile",
         choices=("auto", *CAMERA_PROFILE_DEFAULTS.keys()),
         default="auto",
@@ -1552,13 +1576,13 @@ def parse_args() -> argparse.Namespace:
         "--so101-gripper-min",
         type=float,
         default=None,
-        help="Optional lower clamp in LeRobot motor units for the finetuned absolute gripper target.",
+        help="Optional lower clamp in the checkpoint gripper's LeRobot [0,100] range.",
     )
     parser.add_argument(
         "--so101-gripper-max",
         type=float,
         default=None,
-        help="Optional upper clamp in LeRobot motor units for the finetuned absolute gripper target.",
+        help="Optional upper clamp in the checkpoint gripper's LeRobot [0,100] range.",
     )
 
     # 请求 GR00T 的次数。每次请求会返回一个 action chunk。
@@ -1696,6 +1720,13 @@ def parse_args() -> argparse.Namespace:
         args.policy_schema = "so101-new-embodiment"
     elif args.policy_schema is None:
         args.policy_schema = "oxe"
+    if (
+        args.deployment_mode != "so101-finetuned"
+        and args.so101_checkpoint_arm_units != SO101_ARM_UNITS_LEROBOT_MOTOR
+    ):
+        raise ValueError(
+            "--so101-checkpoint-joint-units degrees requires --deployment-mode so101-finetuned"
+        )
     if args.deployment_mode != "so101-finetuned" and args.camera_layout != "dual":
         raise ValueError("--camera-layout wrist-only/triple requires --deployment-mode so101-finetuned")
     if args.max_policy_calls < 1:
@@ -1947,11 +1978,16 @@ def main() -> None:
         print(f"[runner] initial joint_pos values={tensor_values(policy_obs['joint_pos'])}", flush=True)
         if so101_runtime_joint_limits is not None:
             initial_joint_rad = policy_obs["joint_pos"].detach().cpu().numpy()[0].astype(np.float32)
-            initial_joint_motor = isaac_rad_to_lerobot_motor(initial_joint_rad)
+            initial_joint_dataset = isaac_rad_to_so101_dataset(
+                initial_joint_rad,
+                args.so101_checkpoint_arm_units,
+            )
             print(
                 "[runner] SO101 state conversion "
                 f"Isaac radians={initial_joint_rad.round(4).tolist()} -> "
-                f"LeRobot motor units={initial_joint_motor.round(4).tolist()}",
+                f"dataset values={initial_joint_dataset.round(4).tolist()} "
+                f"arm_units={args.so101_checkpoint_arm_units} "
+                f"gripper_units={SO101_GRIPPER_UNITS}",
                 flush=True,
             )
             print(
@@ -1966,6 +2002,7 @@ def main() -> None:
             build_observation = partial(
                 build_so101_new_embodiment_observation,
                 camera_layout=args.camera_layout,
+                checkpoint_arm_units=args.so101_checkpoint_arm_units,
             )
 
         # warmup：重复把当前 observation 放入 history，确保 history 至少有两帧。
@@ -2002,7 +2039,9 @@ def main() -> None:
             print(f"[runner] action keys: {sorted(action.keys())}", flush=True)
             if args.policy_schema == "so101-new-embodiment":
                 print(
-                    "[runner] SO101 action values below are decoded absolute LeRobot motor units",
+                    "[runner] SO101 action values below are decoded absolute dataset targets "
+                    f"arm_units={args.so101_checkpoint_arm_units} "
+                    f"gripper_units={SO101_GRIPPER_UNITS}",
                     flush=True,
                 )
             print(f"[runner] action summary: {summarize_action(action)}", flush=True)
