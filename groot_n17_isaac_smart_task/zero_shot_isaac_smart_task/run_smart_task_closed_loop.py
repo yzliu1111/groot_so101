@@ -105,10 +105,9 @@ SO101_VIDEO_KEYS = {
     "triple": ("top", "left", "wrist"),
 }
 
-TARGET_OBJECT_CANDIDATES = (
-    "red_2x4_lego_brick_pick",
-    "red_2x4_lego_brick",
-)
+# The process-local cuboid below is a compatibility path for the legacy base
+# SmartTask only. Other tasks must keep the scene and target declared by their
+# own LeIsaac env config.
 SMART_TARGET_OBJECT_KEY = "red_2x4_lego_brick_pick"
 SMART_TARGET_CUBOID_SIZE = (0.0318, 0.0158, 0.0096)
 SMART_TARGET_CUBOID_MASS = 0.02
@@ -140,6 +139,16 @@ from so101_joint_units import (  # noqa: E402
     isaac_rad_to_so101_dataset,
     safe_absolute_dataset_target_to_isaac_rad,
     validate_runtime_joint_limits_match_converter,
+)
+from task_selection import (  # noqa: E402
+    default_task_for_robot,
+    is_leisaac_smart_task,
+    resolve_smart_target_asset,
+    resolve_target_name,
+    resolve_task_instruction,
+    target_name_from_env_cfg,
+    uses_legacy_smart_task_asset_patch,
+    validate_robot_task,
 )
 from wire import request  # noqa: E402
 
@@ -367,39 +376,14 @@ def rigid_object_names(env: Any) -> list[str]:
     return []
 
 
-def resolve_target_object_name(env: Any, requested_name: str) -> str:
-    """Resolve the SmartTask target object across current and legacy scenes."""
+def resolve_target_object_name(
+    env: Any,
+    requested_name: str,
+    configured_name: str | None = None,
+) -> str:
+    """Resolve the selected task's target object for metrics and camera debug."""
 
-    names = rigid_object_names(env)
-    if requested_name != "auto":
-        if requested_name in names:
-            return requested_name
-        raise KeyError(
-            f"target object {requested_name!r} is not in scene rigid objects; "
-            f"available rigid objects are {names}"
-        )
-
-    for candidate in TARGET_OBJECT_CANDIDATES:
-        if candidate in names:
-            return candidate
-
-    fuzzy_matches = [
-        name for name in names
-        if "red" in name.lower() and "lego" in name.lower() and "brick" in name.lower()
-    ]
-    if fuzzy_matches:
-        return sorted(fuzzy_matches)[0]
-
-    raise KeyError(
-        "could not auto-detect SmartTask target object; "
-        f"tried {list(TARGET_OBJECT_CANDIDATES)}, available rigid objects are {names}"
-    )
-
-
-def is_leisaac_smart_task(task: str) -> bool:
-    """Return whether this runner task is a LeIsaac SO101 SmartTask variant."""
-
-    return task.startswith("LeIsaac-SO101-SmartTask")
+    return resolve_target_name(rigid_object_names(env), requested_name, configured_name)
 
 
 def resolve_smart_scene_usd(value: str) -> Path:
@@ -521,9 +505,28 @@ def add_smart_target_cfg(
 
 
 def install_smart_task_asset_patch(args: argparse.Namespace) -> Path | None:
-    """Patch LeIsaac SmartTask config in-process for portable scene and target fallback."""
+    """Install the legacy base-task asset workaround without altering other tasks."""
 
     if not is_leisaac_smart_task(args.task):
+        return None
+
+    target_asset = resolve_smart_target_asset(args.task, args.smart_target_asset)
+    if not uses_legacy_smart_task_asset_patch(args.task):
+        uses_legacy_override = (
+            args.smart_target_pos is not None
+            or args.smart_target_prim_path != SMART_TARGET_MANAGED_PRIM_PATH
+            or tuple(args.smart_target_cuboid_size) != SMART_TARGET_CUBOID_SIZE
+        )
+        if args.smart_scene_usd != "auto" or target_asset != "scene" or uses_legacy_override:
+            raise ValueError(
+                "--smart-scene-usd and --smart-target-* overrides are only supported for the "
+                "legacy LeIsaac-SO101-SmartTask-v0 scene. The selected task must own its scene "
+                "and target assets."
+            )
+        print(
+            f"[runner] selected task owns its scene and target assets: task={args.task!r}",
+            flush=True,
+        )
         return None
 
     scene_usd_path = resolve_smart_scene_usd(args.smart_scene_usd)
@@ -539,7 +542,7 @@ def install_smart_task_asset_patch(args: argparse.Namespace) -> Path | None:
         result = original_parse(str(scene_usd_path), env_cfg, *parse_args, **parse_kwargs)
         add_smart_target_cfg(
             env_cfg,
-            args.smart_target_asset,
+            target_asset,
             args.smart_target_prim_path,
             scene_usd_path,
             target_pos,
@@ -555,8 +558,8 @@ def install_smart_task_asset_patch(args: argparse.Namespace) -> Path | None:
     smart_task_cfg.parse_usd_and_create_subassets = parse_usd_and_create_subassets_with_target
 
     print(
-        "[runner] SmartTask asset patch "
-        f"scene_usd={scene_usd_path} target_asset={args.smart_target_asset} "
+        "[runner] legacy SmartTask asset patch "
+        f"scene_usd={scene_usd_path} target_asset={target_asset} "
         f"target_prim_path={args.smart_target_prim_path}",
         flush=True,
     )
@@ -1472,22 +1475,37 @@ def parse_args() -> argparse.Namespace:
         help="Isaac obs['policy'] key mapped to the GR00T wrist video input.",
     )
 
-    # IsaacLab task id。None 表示按 --robot 自动选择默认 task。
-    parser.add_argument("--task", default=None)
+    # IsaacLab task id。所选 task 的 env config 决定场景；None 表示按 robot 选旧默认值。
+    parser.add_argument(
+        "--task",
+        default=None,
+        help=(
+            "Registered Gym task ID. Its env config owns the Isaac scene. "
+            "Defaults to LeIsaac-SO101-SmartTask-v0 for SO101."
+        ),
+    )
 
     # GR00T bridge 的地址和端口。默认对应 README 中 bridge 的启动参数。
     parser.add_argument("--bridge-host", default="127.0.0.1")
     parser.add_argument("--bridge-port", type=int, default=5577)
 
-    # 传给 GR00T 的自然语言任务指令。
-    parser.add_argument("--instruction", default="Pick up the red 2x4 lego brick.")
+    # 传给 GR00T 的自然语言任务指令。None 表示读取所选 env cfg 的 task_description。
+    parser.add_argument(
+        "--instruction",
+        default=None,
+        help=(
+            "Language instruction used by the checkpoint. "
+            "Defaults to the legacy instruction for the base SO101/Franka tasks, otherwise "
+            "to the selected env config's task_description."
+        ),
+    )
 
     parser.add_argument(
         "--target-object-key",
         default="auto",
         help=(
             "Scene rigid-object key used for SmartTask metrics/debug. "
-            "auto supports current red_2x4_lego_brick_pick and legacy red_2x4_lego_brick."
+            "auto first reads the selected task's success termination and refuses ambiguous multi-LEGO scenes."
         ),
     )
     parser.add_argument(
@@ -1500,10 +1518,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--smart-target-asset",
-        default="cuboid",
+        default="auto",
         help=(
-            "SmartTask target object source for LeIsaac SO101 runs: "
-            "'cuboid' creates a red 2x4-sized primitive fallback, "
+            "Target object source for the legacy LeIsaac base SmartTask: "
+            "'auto' uses its red 2x4 cuboid workaround but leaves every other task's scene unchanged; "
+            "'cuboid' explicitly selects that workaround, "
             "'scene' relies on the LeIsaac scene parser, "
             "or pass a complete USD path."
         ),
@@ -1768,7 +1787,8 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("--capture-wait-timeout-s must be finite and positive")
 
     if args.task is None:
-        args.task = "Groot-Franka-SmartTask-v0" if args.robot == "franka" else "LeIsaac-SO101-SmartTask-v0"
+        args.task = default_task_for_robot(args.robot)
+    validate_robot_task(args.robot, args.task)
     if args.policy_schema == "so101-new-embodiment":
         if args.robot != "so101":
             raise ValueError("--policy-schema so101-new-embodiment requires --robot so101")
@@ -1840,10 +1860,24 @@ def main() -> None:
     # import franka_smart_task 的副作用是注册 experiments 里的 Franka task id。
     import franka_smart_task  # noqa: F401
 
-    smart_scene_usd_path = install_smart_task_asset_patch(args)
+    # 读取所选 task 的 env config。Gym ID 只代表注册存在；entry-point 缺类时
+    # parse_env_cfg 仍会失败，所以这里先打印完整异常并正常关闭 SimulationApp。
+    try:
+        smart_scene_usd_path = install_smart_task_asset_patch(args)
+        env_cfg = parse_env_cfg(args.task, device=args.device, num_envs=1)
+        configured_target_object_name = target_name_from_env_cfg(env_cfg)
+        args.instruction = resolve_task_instruction(args.instruction, env_cfg, args.task)
+    except Exception as exc:
+        print(
+            f"[runner] task setup failed for {args.task!r}: {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+        traceback.print_exc(file=sys.stderr)
+        sys.stderr.flush()
+        simulation_app.close()
+        raise
 
-    # 读取 task 默认配置，并指定 device / num_envs。
-    env_cfg = parse_env_cfg(args.task, device=args.device, num_envs=1)
     if smart_scene_usd_path is not None and hasattr(env_cfg.scene, "scene"):
         env_cfg.scene.scene.spawn.usd_path = str(smart_scene_usd_path)
 
@@ -1899,6 +1933,7 @@ def main() -> None:
             f"teleop_device={teleop_device}",
             flush=True,
         )
+        print(f"[runner] instruction={args.instruction!r}", flush=True)
 
         # reset Isaac env，拿到第一帧 observation。相机 debug 也必须放在 reset 后，
         # 因为此时 sensor/view/prim 才完整实例化。
@@ -1908,7 +1943,11 @@ def main() -> None:
         resolved_camera_profile, camera_mapping = resolve_camera_mapping(args, env)
         camera_mapping = active_camera_mapping(args.policy_schema, args.camera_layout, camera_mapping)
         validate_camera_mapping(policy_obs, camera_mapping)
-        target_object_name = resolve_target_object_name(env, args.target_object_key)
+        target_object_name = resolve_target_object_name(
+            env,
+            args.target_object_key,
+            configured_target_object_name,
+        )
         print(
             f"[runner] camera layout={args.camera_layout} profile={args.camera_profile} "
             f"resolved={resolved_camera_profile}",

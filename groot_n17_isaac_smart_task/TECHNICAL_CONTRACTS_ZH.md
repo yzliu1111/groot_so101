@@ -116,9 +116,19 @@ policy 时间基准与 Isaac step 分开。当前数据 30 Hz、env 60 Hz，所�
 
 ## 7. SmartTask 资产补丁
 
-同事的 LEGO USD 缺内部 layer。默认 `--smart-target-asset cuboid` 只在 experiments runner
-进程里创建替代物，不修改 `leisaac/`。拿到完整 USD 后可以传绝对路径；在确认 layer 完整前
-不要删除 fallback。
+部署时四个概念必须分开：
+
+```text
+--task              选择 Gym env cfg；env cfg 拥有 scene
+scene USD           场景资产，由所选 env cfg 加载
+--instruction       checkpoint 的语言条件；显式值优先；新 task 默认读 task_description
+--target-object-key metrics/debug 观察哪个刚体；不改变 task 或模型指令
+```
+
+当前基础 task 的 LEGO USD 缺内部 layer。`--smart-target-asset auto` 只为
+`LeIsaac-SO101-SmartTask-v0` 在 experiments runner 进程里创建红色 2x4 替代物，不修改
+`leisaac/`；其他 task 的 `auto` 等于 `scene`，不会复用这个红色 fallback。拿到基础 task 的
+完整 USD 后可以传绝对路径；在确认 layer 完整前不要删除 fallback。
 
 ## 8. 修改完成的最低检查
 

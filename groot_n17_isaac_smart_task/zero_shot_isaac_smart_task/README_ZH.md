@@ -90,11 +90,37 @@ export BRIDGE_HOST="${BRIDGE_HOST:-127.0.0.1}"
 export BRIDGE_PORT="${BRIDGE_PORT:-5577}"
 # sim checkpoint 用 lerobot_motor_units；真机 checkpoint 用 degrees。
 export SO101_CHECKPOINT_JOINT_UNITS="lerobot_motor_units"
+# Gym task 决定 LeIsaac env config / scene；instruction 要与 checkpoint 的训练文本一致。
+export ISAAC_TASK="LeIsaac-SO101-SmartTask-v0"
+export TASK_INSTRUCTION="Pick up the red 2x4 lego brick."
 ```
 
 不要在这个 conda env 里安装 LeRobot，也不要在这个终端运行 GR00T 训练。
 
-### 4.1 只检查相机和目标物
+### 4.1 选择 task / scene
+
+runner 只保留一个选择入口：`--task` 接受 Gym task ID，所选 env config 负责 scene、相机、
+目标物和 termination。bridge 不再接收 task。`--instruction` 显式值优先；当前基础
+SO101/Franka task 省略时保留旧默认训练文本，其他 task 省略时读取所选 env config 的
+`task_description`。checkpoint metadata 不保存 Gym task ID，所以不能从权重自动推断场景。
+
+当前 checkout 的真实状态：
+
+| 数据 / 场景 | 应选 task | 当前可用性 |
+|---|---|---|
+| 基础红色 2x4 抓取/抬起 | `LeIsaac-SO101-SmartTask-v0` | env cfg 已实现 |
+| 多物体中选红色 2x4 并放入木盘 | `LeIsaac-SO101-SmartTask-Red-v0` | 只有 Gym 注册，`SmartTaskRedEnvCfg` 缺失 |
+| 多物体中选蓝色 2x4 并放入木盘 | `LeIsaac-SO101-SmartTask-Blue-v0` | 只有 Gym 注册，`SmartTaskBlueEnvCfg` 缺失 |
+| 多物体中选小红色 2x2 并放入木盘 | `LeIsaac-SO101-SmartTask-SmallRed-v0` | 只有 Gym 注册，`SmartTaskSmallRedEnvCfg` 缺失 |
+| 无木盘、桌面单块抓取 | 当前没有对应 task ID | 尚不能选择 |
+
+因此这次 deploy 接口已经能随 `--task` 切换与当前 observation/action/target 契约兼容、且可
+实例化的 SmartTask 场景；但上表其余场景
+不能仅靠 runner 补全。拿到包含对应 env cfg 的 LeIsaac 版本后，只需修改
+`ISAAC_TASK` / `TASK_INSTRUCTION`，无需再改 bridge 或新增一套 scene 参数。部署时使用普通 task，
+不要使用为数据生成准备的 `*-Mimic-v0`。
+
+### 4.2 只检查相机和目标物
 
 这一步不连接 bridge：
 
@@ -102,12 +128,14 @@ export SO101_CHECKPOINT_JOINT_UNITS="lerobot_motor_units"
 python experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task/run_smart_task_closed_loop.py \
   --deployment-mode so101-finetuned \
   --so101-checkpoint-joint-units "$SO101_CHECKPOINT_JOINT_UNITS" \
+  --task "$ISAAC_TASK" \
+  --instruction "$TASK_INSTRUCTION" \
   --camera-layout dual \
   --front-observation-key camera3 \
   --wrist-observation-key camera2 \
   --robot so101 \
   --control-mode joint \
-  --smart-target-asset cuboid \
+  --smart-target-asset auto \
   --debug-cameras-only \
   --headless
 ```
@@ -120,18 +148,20 @@ camera2 -> GR00T video.wrist
 target object state prim_path=... root_pos_w=...
 ```
 
-### 4.2 请求一次 action，但不执行
+### 4.3 请求一次 action，但不执行
 
 ```bash
 python experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task/run_smart_task_closed_loop.py \
   --deployment-mode so101-finetuned \
   --so101-checkpoint-joint-units "$SO101_CHECKPOINT_JOINT_UNITS" \
+  --task "$ISAAC_TASK" \
+  --instruction "$TASK_INSTRUCTION" \
   --camera-layout dual \
   --front-observation-key camera3 \
   --wrist-observation-key camera2 \
   --robot so101 \
   --control-mode joint \
-  --smart-target-asset cuboid \
+  --smart-target-asset auto \
   --bridge-host "$BRIDGE_HOST" \
   --bridge-port "$BRIDGE_PORT" \
   --dry-run \
@@ -142,18 +172,20 @@ python experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task/run_sma
 `dataset_action_units=checkpoint_dataset_coordinates`；runner 日志里的 `arm_units` 必须与
 训练数据来源一致。
 
-### 4.3 第一次只执行一个 policy action
+### 4.4 第一次只执行一个 policy action
 
 ```bash
 python experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task/run_smart_task_closed_loop.py \
   --deployment-mode so101-finetuned \
   --so101-checkpoint-joint-units "$SO101_CHECKPOINT_JOINT_UNITS" \
+  --task "$ISAAC_TASK" \
+  --instruction "$TASK_INSTRUCTION" \
   --camera-layout dual \
   --front-observation-key camera3 \
   --wrist-observation-key camera2 \
   --robot so101 \
   --control-mode joint \
-  --smart-target-asset cuboid \
+  --smart-target-asset auto \
   --bridge-host "$BRIDGE_HOST" \
   --bridge-port "$BRIDGE_PORT" \
   --no-headless \
@@ -221,19 +253,24 @@ Isaac runtime limits → `env.step()`。更完整的代码契约见
 
 ## 7. LEGO USD 补丁
 
-同事的 LEGO USD 缺内部 layer。runner 默认使用：
+当前基础 task 的 LEGO USD 缺内部 layer。runner 默认使用：
 
 ```bash
---smart-target-asset cuboid
+--smart-target-asset auto
 ```
 
-它只在当前 runner 进程中创建红色 2x4 尺寸 cuboid，不修改 `leisaac/`。拿到完整 USD 后改为：
+对 `LeIsaac-SO101-SmartTask-v0`，`auto` 只在当前 runner 进程中创建红色 2x4
+cuboid，不修改 `leisaac/`。对其他 task，`auto` 等于 `scene`：完全使用该 task 自己的 scene，
+不会注入红色目标。这样切到 Blue / SmallRed / 多物体场景时不会静默选错积木。
+
+基础 task 拿到完整 USD 后可改为：
 
 ```bash
 --smart-target-asset /absolute/path/to/complete_lego.usd
 ```
 
-如果要完全依赖 scene parser，显式使用 `--smart-target-asset scene`。
+如果基础 task 要完全依赖 scene parser，显式使用 `--smart-target-asset scene`。非基础 task
+不接受旧红色 cuboid 补丁；其资产应在对应 env config 中声明。
 
 ## 8. Zero-shot 对照
 
@@ -267,7 +304,7 @@ Franka EEF:   --deployment-mode zero-shot-oxe --robot franka --control-mode eef
 |---|---|
 | bridge import/checkpoint 失败 | GR00T Python 3.12 venv、checkpoint 路径 |
 | camera key 不存在 | `--debug-cameras-only` 和 layout/live mapping |
-| 看不到 LEGO | `--smart-target-asset cuboid`、日志里的 `root_pos_w` |
+| 看不到 LEGO | 基础 task 检查 `--smart-target-asset auto`；其他 task 检查其 env cfg/scene；再看日志里的 `root_pos_w` |
 | action contract mismatch | bridge 与 runner 是否来自同一版代码，bridge 是否报告 decoded dataset action |
 | joint limit mismatch | 是否加载了另一套 SO101 USD；不要继续执行 |
 | 动作方向错误 | 立即停在 one-step，不要增加 horizon |

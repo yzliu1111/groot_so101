@@ -314,8 +314,8 @@ test -f "$LEISAAC_ROOT/assets/scenes/smart_scene/scene_portable.usda"
 [ OK ] Wrote portable scene: .../scene_portable.usda
 ```
 
-LEGO USD 缺内部 layer 的问题由 experiments runner 默认 `--smart-target-asset cuboid` 处理，
-不修改 `leisaac/`。
+基础 SmartTask 的 LEGO USD 缺内部 layer；experiments runner 默认
+`--smart-target-asset auto`，只对基础 task 使用 cuboid，不修改 `leisaac/`。
 
 ## 10. SmartTask smoke
 
@@ -338,12 +338,13 @@ cd "$SMART_PROJECT"
 ```bash
 python experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task/run_smart_task_closed_loop.py \
   --deployment-mode so101-finetuned \
+  --task LeIsaac-SO101-SmartTask-v0 \
   --camera-layout dual \
   --front-observation-key camera3 \
   --wrist-observation-key camera2 \
   --robot so101 \
   --control-mode joint \
-  --smart-target-asset cuboid \
+  --smart-target-asset auto \
   --debug-cameras-only \
   --headless
 ```

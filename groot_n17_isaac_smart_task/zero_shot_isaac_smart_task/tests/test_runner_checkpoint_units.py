@@ -56,6 +56,47 @@ def _finetuned_ping() -> dict:
 
 
 class RunnerCheckpointUnitsTest(unittest.TestCase):
+    def test_cli_defaults_to_base_so101_task(self) -> None:
+        with patch.object(sys, "argv", ["run_smart_task_closed_loop.py"]):
+            args = runner.parse_args()
+        self.assertEqual(args.task, "LeIsaac-SO101-SmartTask-v0")
+
+    def test_cli_preserves_explicit_task_id(self) -> None:
+        argv = [
+            "run_smart_task_closed_loop.py",
+            "--task",
+            "LeIsaac-SO101-SmartTask-Blue-v0",
+        ]
+        with patch.object(sys, "argv", argv):
+            args = runner.parse_args()
+        self.assertEqual(args.task, "LeIsaac-SO101-SmartTask-Blue-v0")
+
+    def test_cli_rejects_robot_task_mismatch(self) -> None:
+        argv = [
+            "run_smart_task_closed_loop.py",
+            "--robot",
+            "franka",
+            "--task",
+            "LeIsaac-SO101-SmartTask-v0",
+        ]
+        with patch.object(sys, "argv", argv), self.assertRaisesRegex(
+            ValueError,
+            "requires --robot so101",
+        ):
+            runner.parse_args()
+
+    def test_nonbase_task_rejects_legacy_asset_overrides(self) -> None:
+        args = SimpleNamespace(
+            task="LeIsaac-SO101-SmartTask-Blue-v0",
+            smart_scene_usd="auto",
+            smart_target_asset="auto",
+            smart_target_pos=(0.1, 0.2, 0.3),
+            smart_target_prim_path=runner.SMART_TARGET_MANAGED_PRIM_PATH,
+            smart_target_cuboid_size=runner.SMART_TARGET_CUBOID_SIZE,
+        )
+        with self.assertRaisesRegex(ValueError, r"--smart-target-\*"):
+            runner.install_smart_task_asset_patch(args)
+
     def test_cli_defaults_to_sim_motor_units(self) -> None:
         with patch.object(sys, "argv", ["run_smart_task_closed_loop.py"]):
             args = runner.parse_args()
