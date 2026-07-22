@@ -114,29 +114,34 @@ policy 时间基准与 Isaac step 分开。当前数据 30 Hz、env 60 Hz，所�
 [LEISAAC_ACTION_ADAPTER_AUDIT_ZH.md](zero_shot_isaac_smart_task/LEISAAC_ACTION_ADAPTER_AUDIT_ZH.md)；
 它是审计记录，不是必读流程。
 
-## 7. SmartTask 资产补丁
+## 7. SmartTask 场景契约
 
-部署时四个概念必须分开：
+部署时五个概念必须分开：
 
 ```text
---task              选择 Gym env cfg；env cfg 拥有 scene
-scene USD           场景资产，由所选 env cfg 加载
---instruction       checkpoint 的语言条件；显式值优先；新 task 默认读 task_description
---target-object-key metrics/debug 观察哪个刚体；不改变 task 或模型指令
+--task               选择机器人/action/observation/camera 等基础 Gym env
+--scene-profile      选择部署前的木盘和 LEGO 布局
+scene wrapper / USD  把基础 scene 与完整 repo-local 资产组合成 live scene
+--instruction        checkpoint 的语言条件，必须与训练文本一致
+--target-object-key  multi 场景选择哪个刚体；同时用于 metric/debug/termination
 ```
 
-当前基础 task 的 LEGO USD 缺内部 layer。`--smart-target-asset auto` 只为
-`LeIsaac-SO101-SmartTask-v0` 在 experiments runner 进程里创建红色 2x4 替代物，不修改
-`leisaac/`；其他 task 的 `auto` 等于 `scene`，不会复用这个红色 fallback。拿到基础 task 的
-完整 USD 后可以传绝对路径；在确认 layer 完整前不要删除 fallback。
+`tray-red24`、`table-red24` 和 `multi-lego-tray` 都在 `experiments/` 内实现，不依赖额外
+task ID，也不修改 `leisaac/`。显式 profile 会停用旧 LEGO composition arc，加载完整红 2x4 /
+红 2x2 USD；蓝 2x4 复用红 2x4 几何并覆盖为蓝色材质。`multi-lego-tray` 必须显式指定 target
+和 instruction，物体 pose 沿用 LeIsaac authored layout。
+
+`task-default` 才保留旧 scene / cuboid fallback 兼容语义；不要把 `--smart-target-*`
+与显式 scene profile 混用。
 
 ## 8. 修改完成的最低检查
 
 ```text
 训练 config 与 camera layout 对齐
 bridge ping 报告 modality + action_decoding
+runner task / scene profile / target / instruction 与 checkpoint 对齐
 runner units 与 checkpoint 的训练数据来源一致
-runner camera-only 通过
+runner camera-only 与 scene rigid-object 列表通过
 纯 Python tests 通过
 dry-run 通过
 最后才执行 one policy action

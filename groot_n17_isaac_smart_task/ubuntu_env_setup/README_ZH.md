@@ -270,7 +270,7 @@ python experiments/groot_n17_isaac_smart_task/ubuntu_env_setup/isaac_stack_probe
 
 `omni.physx`/`omni.physics` 是 Kit extension；失败时不要把它们当普通 pip 包安装。
 
-## 9. Assets 和 portable SmartTask scene
+## 9. Assets 和 scene-profile composition
 
 本节可能在另一个终端执行，因此先完整恢复 Isaac 终端状态：
 
@@ -283,11 +283,14 @@ export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}"
 cd "$SMART_PROJECT"
 ```
 
-LeIsaac repo 不一定包含完整 assets。至少检查：
+LeIsaac repo 不一定包含完整 assets。显式 scene profile 至少需要：
 
 ```bash
 test -f "$LEISAAC_ROOT/assets/robots/so101_follower.usd"
 test -f "$LEISAAC_ROOT/assets/scenes/smart_scene/scene.usd"
+test -f "$LEISAAC_ROOT/assets/scenes/smart_scene/assets/plate.usd"
+test -f "$LEISAAC_ROOT/assets/scenes/smart_scene/assets/red_2x4_lego_brick.usd"
+test -f "$LEISAAC_ROOT/assets/scenes/smart_scene/assets/red_2x2_lego_brick.usd"
 ```
 
 缺少 SO101 USD 时，从 LeIsaac release 获取：
@@ -298,24 +301,13 @@ curl -L -o "$LEISAAC_ROOT/assets/robots/so101_follower.usd" \
   "https://github.com/LightwheelAI/leisaac/releases/download/v0.1.0/so101_follower.usd"
 ```
 
-把 SmartTask 中的历史绝对路径转换成 repo-local USDA；原始 `scene.usd` 不会被覆盖：
+正常部署不再预生成 `scene_portable.usda`，也不再用 cuboid 代替 LEGO。
+runner 会为显式 `--scene-profile` 自动生成 file-backed wrapper，并用上面两个完整 LEGO USD
+创建 managed rigid objects；蓝色 2x4 复用红色 2x4 几何后覆盖材质。原始 `scene.usd` 和
+`leisaac/` 源码都不会被修改。
 
-```bash
-python "$SMART_PROJECT/experiments/groot_n17_isaac_smart_task/ubuntu_env_setup/make_smart_scene_portable.py" \
-  --write --check
-
-test -f "$LEISAAC_ROOT/assets/scenes/smart_scene/scene_portable.usda"
-```
-
-成功标志：
-
-```text
-[ OK ] No absolute /home or /Users USD paths remain after rewrite.
-[ OK ] Wrote portable scene: .../scene_portable.usda
-```
-
-基础 SmartTask 的 LEGO USD 缺内部 layer；experiments runner 默认
-`--smart-target-asset auto`，只对基础 task 使用 cuboid，不修改 `leisaac/`。
+旧的 `make_smart_scene_portable.py` 只保留给 `task-default` 历史排障，不是三种新 profile
+的前置步骤。
 
 ## 10. SmartTask smoke
 
@@ -339,14 +331,24 @@ cd "$SMART_PROJECT"
 python experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task/run_smart_task_closed_loop.py \
   --deployment-mode so101-finetuned \
   --task LeIsaac-SO101-SmartTask-v0 \
-  --camera-layout dual \
-  --front-observation-key camera3 \
-  --wrist-observation-key camera2 \
+  --scene-profile table-red24 \
+  --target-object-key auto \
+  --camera-layout wrist-only \
+  --isaac-wrist-camera-key camera1 \
   --robot so101 \
   --control-mode joint \
-  --smart-target-asset auto \
   --debug-cameras-only \
   --headless
+```
+
+至少确认：
+
+```text
+[runner] scene profile=table-red24 ... wrapper=...
+[runner] scene profile objects=['red_2x4_lego_brick'] tray_active=False
+[runner] Isaac env created successfully
+[runner] camera-debug scene rigid objects: ['red_2x4_lego_brick']
+[runner] target object=red_2x4_lego_brick
 ```
 
 `--debug-cameras-only` 不验证动作单位；单位参数从后续 dry-run/one-step 开始按部署 README 设置。
@@ -363,7 +365,7 @@ python experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task/run_sma
 | Isaac `CXXABI` 错误 | 确保 `$CONDA_PREFIX/lib` 位于 `LD_LIBRARY_PATH` 最前 |
 | `lerobot` 出现在 Isaac env | 环境混装；重建干净 env，不继续补包 |
 | `omni.physx` import 失败 | 先跑 `isaac_stack_probe --launch-app`，不要 pip install omni 包 |
-| portable scene 仍有绝对路径 | 停止，先补缺失 asset/修 scene 引用 |
+| scene profile 创建失败 | 检查三份完整 SmartTask asset、wrapper/objects/tray 日志 |
 | SmartTask camera/asset 失败 | 不进入模型调试，先修 runtime/scene |
 | checkpoint 能加载但动作不对 | 回到 camera dry-run、单位契约和 one-step |
 
@@ -373,7 +375,7 @@ python experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task/run_sma
 GR00T import/GPU
 -> Isaac import
 -> SimulationApp
--> portable scene
+-> scene-profile wrapper + asset smoke
 -> SmartTask camera smoke
 -> bridge dry-run
 -> one policy action

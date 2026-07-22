@@ -90,37 +90,90 @@ export BRIDGE_HOST="${BRIDGE_HOST:-127.0.0.1}"
 export BRIDGE_PORT="${BRIDGE_PORT:-5577}"
 # sim checkpoint 用 lerobot_motor_units；真机 checkpoint 用 degrees。
 export SO101_CHECKPOINT_JOINT_UNITS="lerobot_motor_units"
-# Gym task 决定 LeIsaac env config / scene；instruction 要与 checkpoint 的训练文本一致。
+# task 只选基础 env；scene profile 单独选择部署布局。
 export ISAAC_TASK="LeIsaac-SO101-SmartTask-v0"
+export ISAAC_SCENE_PROFILE="table-red24"
+export TARGET_OBJECT_KEY="auto"
+# instruction 必须与 checkpoint 的训练文本一致。
 export TASK_INSTRUCTION="Pick up the red 2x4 lego brick."
 ```
 
 不要在这个 conda env 里安装 LeRobot，也不要在这个终端运行 GR00T 训练。
 
-### 4.1 选择 task / scene
+### 4.1 选择基础 task 与 scene profile
 
-runner 只保留一个选择入口：`--task` 接受 Gym task ID，所选 env config 负责 scene、相机、
-目标物和 termination。bridge 不再接收 task。`--instruction` 显式值优先；当前基础
-SO101/Franka task 省略时保留旧默认训练文本，其他 task 省略时读取所选 env config 的
-`task_description`。checkpoint metadata 不保存 Gym task ID，所以不能从权重自动推断场景。
+两个入口的职责固定分开：
 
-当前 checkout 的真实状态：
+- `--task` 只选择机器人、action、observation、camera 等基础 Gym env；SO101 三种部署场景都使用
+  `LeIsaac-SO101-SmartTask-v0`。
+- `--scene-profile` 只选择部署前的木盘和 LEGO 布局，不依赖额外 Gym task ID。
+- bridge 不接收 task 或 scene profile；`--instruction` 仍必须与 checkpoint 的训练文本一致。
 
-| 数据 / 场景 | 应选 task | 当前可用性 |
+| `--scene-profile` | 部署场景 | target 规则 |
 |---|---|---|
-| 基础红色 2x4 抓取/抬起 | `LeIsaac-SO101-SmartTask-v0` | env cfg 已实现 |
-| 多物体中选红色 2x4 并放入木盘 | `LeIsaac-SO101-SmartTask-Red-v0` | 只有 Gym 注册，`SmartTaskRedEnvCfg` 缺失 |
-| 多物体中选蓝色 2x4 并放入木盘 | `LeIsaac-SO101-SmartTask-Blue-v0` | 只有 Gym 注册，`SmartTaskBlueEnvCfg` 缺失 |
-| 多物体中选小红色 2x2 并放入木盘 | `LeIsaac-SO101-SmartTask-SmallRed-v0` | 只有 Gym 注册，`SmartTaskSmallRedEnvCfg` 缺失 |
-| 无木盘、桌面单块抓取 | 当前没有对应 task ID | 尚不能选择 |
+| `tray-red24` | 桌上有木盘，单个红色 2x4 位于木盘内 | `auto` 自动选择红色 2x4 |
+| `table-red24` | 桌上没有木盘，单个红色 2x4 位于桌面 | `auto` 自动选择红色 2x4 |
+| `multi-lego-tray` | 桌上有木盘，红 2x4、红 2x2、蓝 2x4 位于木盘一侧 | 必须显式传 `--target-object-key` |
+| `task-default` | 保留所选 task 原生 scene 和旧资产兼容路径 | 从 env cfg 解析 |
 
-因此这次 deploy 接口已经能随 `--task` 切换与当前 observation/action/target 契约兼容、且可
-实例化的 SmartTask 场景；但上表其余场景
-不能仅靠 runner 补全。拿到包含对应 env cfg 的 LeIsaac 版本后，只需修改
-`ISAAC_TASK` / `TASK_INSTRUCTION`，无需再改 bridge 或新增一套 scene 参数。部署时使用普通 task，
-不要使用为数据生成准备的 `*-Mimic-v0`。
+因此，无木盘的桌面单块场景已经可直接选择：
 
-### 4.2 只检查相机和目标物
+```text
+--task LeIsaac-SO101-SmartTask-v0 --scene-profile table-red24
+```
+
+`multi-lego-tray` 的 target 可选
+`red_2x4_lego_brick`、`red_2x2_lego_brick` 或 `blue_2x4_lego_brick`，并且必须显式传
+与 checkpoint 训练文本一致的 `--instruction`。多块位置直接沿用当前 LeIsaac scene 的 authored
+布局，不再增加 x/y 方向参数。
+
+例如选择蓝色 2x4：
+
+```bash
+export ISAAC_SCENE_PROFILE="multi-lego-tray"
+export TARGET_OBJECT_KEY="blue_2x4_lego_brick"
+export TASK_INSTRUCTION="Pick up the blue 2x4 lego brick and place it in the tray."
+```
+
+三个显式 profile 当前只与基础 SO101 task 组合；不要使用数据生成用的 `*-Mimic-v0`。
+checkpoint metadata 不保存 Gym task ID 或 scene profile，所以 runner 不会从权重猜场景。
+
+### 4.2 恢复 LeIsaac SmartTask 相机
+
+当前 `leisaac/main` 只保留单相机配置，仅暴露一个腕部 `camera1`。要使用
+`dual` / `triple` checkpoint，需要手工恢复 LeIsaac 已有的三路相机定义；runner 的 key 参数
+只能映射已经存在的 observation，不能创建缺失的 sensor。
+
+修改下面这个文件：
+
+```text
+leisaac/source/leisaac/leisaac/tasks/smart_task/smart_task_env_cfg.py
+```
+
+不要只取消注释，因为当前 wrist 和被注释的 left 块都叫 `camera1`。真正的约束只有两个：
+
+1. `SmartTaskSceneCfg` 中启用所需的 wrist、left、front/top sensor，并给它们互不重复的字段名。
+2. `SmartTaskObservationsCfg.PolicyCfg` 为这些 sensor 暴露同名 observation term；每个
+   `SceneEntityCfg(...)` 必须与 scene sensor 名称一致。
+
+`camera1/2/3` 本身没有固定语义。改动最少的一种做法是保留现有 wrist=`camera1`，将启用的
+left 块命名为 `camera2`，front/top 继续使用 `camera3`：
+
+```text
+camera1 = wrist
+camera2 = left
+camera3 = front/top
+```
+
+这只是 LeIsaac 文件的一个最小改动示例，不是 runner 的硬编码约定。也可以使用其他名称或
+排列，只要各 key 唯一，并在启动 runner 时用 `--isaac-front/left/wrist-camera-key` 明确映射。
+同时保留两个 `__post_init__()` 中删除父类旧 `front` / `wrist` / `left` 属性的逻辑。
+
+`wrist-only` 只需暴露一条腕部 observation；`dual` 需要两条不同的 front/top 与 wrist；
+`triple` 需要三条不同的 front/top、left、wrist。现有场景 USD 已包含 left/front 的 xform，
+腕部 camera prim 由 `TiledCameraCfg` 创建，不需要另外修改 USD 路径。
+
+### 4.3 只检查相机和目标物
 
 这一步不连接 bridge：
 
@@ -129,13 +182,14 @@ python experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task/run_sma
   --deployment-mode so101-finetuned \
   --so101-checkpoint-joint-units "$SO101_CHECKPOINT_JOINT_UNITS" \
   --task "$ISAAC_TASK" \
+  --scene-profile "$ISAAC_SCENE_PROFILE" \
+  --target-object-key "$TARGET_OBJECT_KEY" \
   --instruction "$TASK_INSTRUCTION" \
   --camera-layout dual \
-  --front-observation-key camera3 \
-  --wrist-observation-key camera2 \
+  --isaac-front-camera-key camera3 \
+  --isaac-wrist-camera-key camera1 \
   --robot so101 \
   --control-mode joint \
-  --smart-target-asset auto \
   --debug-cameras-only \
   --headless
 ```
@@ -144,24 +198,25 @@ python experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task/run_sma
 
 ```text
 camera3 -> GR00T video.top
-camera2 -> GR00T video.wrist
+camera1 -> GR00T video.wrist
 target object state prim_path=... root_pos_w=...
 ```
 
-### 4.3 请求一次 action，但不执行
+### 4.4 请求一次 action，但不执行
 
 ```bash
 python experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task/run_smart_task_closed_loop.py \
   --deployment-mode so101-finetuned \
   --so101-checkpoint-joint-units "$SO101_CHECKPOINT_JOINT_UNITS" \
   --task "$ISAAC_TASK" \
+  --scene-profile "$ISAAC_SCENE_PROFILE" \
+  --target-object-key "$TARGET_OBJECT_KEY" \
   --instruction "$TASK_INSTRUCTION" \
   --camera-layout dual \
-  --front-observation-key camera3 \
-  --wrist-observation-key camera2 \
+  --isaac-front-camera-key camera3 \
+  --isaac-wrist-camera-key camera1 \
   --robot so101 \
   --control-mode joint \
-  --smart-target-asset auto \
   --bridge-host "$BRIDGE_HOST" \
   --bridge-port "$BRIDGE_PORT" \
   --dry-run \
@@ -172,20 +227,21 @@ python experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task/run_sma
 `dataset_action_units=checkpoint_dataset_coordinates`；runner 日志里的 `arm_units` 必须与
 训练数据来源一致。
 
-### 4.4 第一次只执行一个 policy action
+### 4.5 第一次只执行一个 policy action
 
 ```bash
 python experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task/run_smart_task_closed_loop.py \
   --deployment-mode so101-finetuned \
   --so101-checkpoint-joint-units "$SO101_CHECKPOINT_JOINT_UNITS" \
   --task "$ISAAC_TASK" \
+  --scene-profile "$ISAAC_SCENE_PROFILE" \
+  --target-object-key "$TARGET_OBJECT_KEY" \
   --instruction "$TASK_INSTRUCTION" \
   --camera-layout dual \
-  --front-observation-key camera3 \
-  --wrist-observation-key camera2 \
+  --isaac-front-camera-key camera3 \
+  --isaac-wrist-camera-key camera1 \
   --robot so101 \
   --control-mode joint \
-  --smart-target-asset auto \
   --bridge-host "$BRIDGE_HOST" \
   --bridge-port "$BRIDGE_PORT" \
   --no-headless \
@@ -209,16 +265,21 @@ bridge 和 runner 的 `--camera-layout` 必须与训练 checkpoint 一致。
 
 | layout | bridge | runner live mapping |
 |---|---|---|
-| `wrist-only` | `--camera-layout wrist-only` | `--wrist-observation-key camera2` |
-| `dual` | `--camera-layout dual` | `camera3 -> top`，`camera2 -> wrist` |
-| `triple` | `--camera-layout triple` | `camera3 -> top`，`camera1 -> left`，`camera2 -> wrist` |
+| `wrist-only` | `--camera-layout wrist-only` | 例：`--isaac-wrist-camera-key camera1` |
+| `dual` | `--camera-layout dual` | 例：`--isaac-front-camera-key camera3 --isaac-wrist-camera-key camera1` |
+| `triple` | `--camera-layout triple` | 在 dual 示例上增加 `--isaac-left-camera-key camera2` |
 
 prepared 数据里的历史 key 与 live key 不是同一概念：
 
 ```text
 训练语义：video.top / video.left / video.wrist
-当前 live：camera3 / camera1 / camera2
+live key：由当前 LeIsaac env cfg 决定，通过 --isaac-*-camera-key 显式映射
 ```
+
+这里的 `dataset-*` 和 `isaac-*` 参数故意使用不同前缀：训练侧参数指定 LeRobot dataset
+feature key，部署侧参数指定 `obs["policy"]` 中的 live key。runner 会同时检查 key 是否存在，
+以及所选角色是否映射到不同的 live camera；例如 triple 中把三路都指定成 `camera1` 会在请求
+模型前直接报错。
 
 ## 6. checkpoint 单位和四个安全参数
 
@@ -251,26 +312,24 @@ Isaac runtime limits → `env.step()`。更完整的代码契约见
 准备读或修改这条链路时，看
 [SmartTask 代码阅读约定](../TECHNICAL_CONTRACTS_ZH.md)；实际运行不要求先读完技术手册。
 
-## 7. LEGO USD 补丁
+## 7. Scene profile 的 USD 组合
 
-当前基础 task 的 LEGO USD 缺内部 layer。runner 默认使用：
+三个显式 scene profile 都由 `experiments/` 在 runner 进程内组合，不修改 `leisaac/`：
 
-```bash
---smart-target-asset auto
-```
+- 生成 file-backed USDA wrapper，让 LeIsaac parser 与 live scene 读取同一份组合结果。
+- wrapper 停用原 scene 里的 legacy LEGO，并清空其中写死到同事机器的 payload；两个仅用于
+  viewport 显示的 camera preview mesh 也会清空绝对 reference，真实 Camera prim 不受影响。
+- 红 2x4 和红 2x2 使用 repo 内完整 USD；蓝 2x4 复用完整红 2x4 几何，再以
+  `PreviewSurfaceCfg` 覆盖为 LeIsaac authored 的纯蓝材质。
+- 木盘继续使用 scene 中完整的 `plate.usd`；`table-red24` 会真正 deactivate 木盘 prim，
+  不是只隐藏画面。
 
-对 `LeIsaac-SO101-SmartTask-v0`，`auto` 只在当前 runner 进程中创建红色 2x4
-cuboid，不修改 `leisaac/`。对其他 task，`auto` 等于 `scene`：完全使用该 task 自己的 scene，
-不会注入红色目标。这样切到 Blue / SmallRed / 多物体场景时不会静默选错积木。
+wrapper 写入 `zero_shot_isaac_smart_task/runs/scene_profiles/`，该目录已被 git ignore。
+显式 profile 自己拥有资产和 pose，因此会拒绝 `--smart-target-*` 以及自定义
+`--smart-scene-usd`，避免两套配置叠加。
 
-基础 task 拿到完整 USD 后可改为：
-
-```bash
---smart-target-asset /absolute/path/to/complete_lego.usd
-```
-
-如果基础 task 要完全依赖 scene parser，显式使用 `--smart-target-asset scene`。非基础 task
-不接受旧红色 cuboid 补丁；其资产应在对应 env config 中声明。
+`task-default` 只为旧命令兼容，仍沿用原 task scene / cuboid fallback；新三种部署场景不要
+再传 legacy 资产参数。
 
 ## 8. Zero-shot 对照
 
@@ -304,7 +363,7 @@ Franka EEF:   --deployment-mode zero-shot-oxe --robot franka --control-mode eef
 |---|---|
 | bridge import/checkpoint 失败 | GR00T Python 3.12 venv、checkpoint 路径 |
 | camera key 不存在 | `--debug-cameras-only` 和 layout/live mapping |
-| 看不到 LEGO | 基础 task 检查 `--smart-target-asset auto`；其他 task 检查其 env cfg/scene；再看日志里的 `root_pos_w` |
+| 场景物体不对 | 检查 `scene profile=...`、wrapper、objects/tray 日志、`target object=...` 和 `root_pos_w` |
 | action contract mismatch | bridge 与 runner 是否来自同一版代码，bridge 是否报告 decoded dataset action |
 | joint limit mismatch | 是否加载了另一套 SO101 USD；不要继续执行 |
 | 动作方向错误 | 立即停在 one-step，不要增加 horizon |
@@ -315,6 +374,7 @@ Franka EEF:   --deployment-mode zero-shot-oxe --robot franka --control-mode eef
 ```text
 groot_bridge_server.py       GR00T 进程
 run_smart_task_closed_loop.py Isaac/LeIsaac 主流程
+scene_profiles.py             部署布局、USD wrapper、真实 LEGO 资产与 target 重绑
 wire.py                      本地 socket 协议
 action_chunk.py              action shape/时间维校验与切片
 action_timing.py             policy/env 频率对齐

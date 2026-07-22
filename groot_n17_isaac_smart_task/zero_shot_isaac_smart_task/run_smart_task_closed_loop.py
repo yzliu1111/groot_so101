@@ -73,9 +73,11 @@ LEISAAC_ISAACLAB_PACKAGES = (
     LEISAAC_ISAACLAB_SRC / "isaaclab_mimic",
 )
 
-# Current colleague LeIsaac and the older leisaac2 copy expose the same policy
-# observation keys, but their camera semantics differ:
-# - leisaac-current: camera1=left, camera2=wrist, camera3=front/top.
+# These profiles are convenience presets, not required camera-number semantics.
+# Explicit --isaac-*-camera-key arguments may map any distinct live keys to the
+# model roles. The current single-camera LeIsaac main must first expose enough
+# sensors and policy observations as documented in README_ZH.md.
+# - leisaac-current preset: camera1=left, camera2=wrist, camera3=front/top.
 # - leisaac2-legacy: camera1=front/top, camera2=left, camera3=template wrist.
 # The runner prints the resolved mapping so the log shows what GR00T saw.
 CAMERA_PROFILE_DEFAULTS = {
@@ -131,6 +133,7 @@ for package_path in reversed(LEISAAC_ISAACLAB_PACKAGES):
 from action_chunk import action_chunk_length, slice_action_step  # noqa: E402
 from action_timing import resolve_env_steps_per_policy_action  # noqa: E402
 from pose_math import compose_pose_delta, quat_wxyz_to_rot6d  # noqa: E402
+import scene_profiles  # noqa: E402
 from so101_joint_units import (  # noqa: E402
     SO101_ARM_UNITS_LEROBOT_MOTOR,
     SO101_CHECKPOINT_ARM_UNIT_CHOICES,
@@ -258,13 +261,13 @@ def detect_camera_profile(env: Any) -> str:
     if "wrist" in scene_sensors:
         return "leisaac2-legacy"
 
-    # Current colleague LeIsaac renamed the robot-mounted wrist sensor to camera2.
+    # The historical leisaac-current preset names the robot-mounted wrist sensor camera2.
     camera2_prim = _sensor_cfg_prim_path(scene_sensors.get("camera2"))
     if "wrist" in camera2_prim or "/Robot/" in camera2_prim:
         return "leisaac-current"
 
-    # Prefer the current layout when auto-detection is inconclusive because the
-    # project-level leisaac directory is expected to track the latest colleague code.
+    # Prefer the current three-camera layout when detection is inconclusive. The
+    # post-reset live-key validation will still fail closed if sensors are missing.
     return "leisaac-current"
 
 
@@ -277,10 +280,10 @@ def resolve_camera_mapping(args: argparse.Namespace, env: Any) -> tuple[str, dic
 
     defaults = CAMERA_PROFILE_DEFAULTS[profile]
     mapping = {
-        "exterior": args.exterior_camera_key or defaults["exterior"],
-        "top": args.front_observation_key or defaults["top"],
-        "left": args.left_observation_key or defaults["left"],
-        "wrist": args.wrist_observation_key or defaults["wrist"],
+        "exterior": args.isaac_exterior_camera_key or defaults["exterior"],
+        "top": args.isaac_front_camera_key or defaults["top"],
+        "left": args.isaac_left_camera_key or defaults["left"],
+        "wrist": args.isaac_wrist_camera_key or defaults["wrist"],
     }
     return profile, mapping
 
@@ -300,7 +303,22 @@ def validate_camera_mapping(
     policy_obs: dict[str, torch.Tensor],
     camera_mapping: dict[str, str],
 ) -> None:
-    """Validate all selected live observation keys immediately after env reset."""
+    """Validate selected live keys and reject one camera reused for multiple roles."""
+
+    roles_by_observation_key: dict[str, list[str]] = {}
+    for role, observation_key in camera_mapping.items():
+        roles_by_observation_key.setdefault(observation_key, []).append(role)
+
+    duplicate_keys = {
+        observation_key: roles
+        for observation_key, roles in roles_by_observation_key.items()
+        if len(roles) > 1
+    }
+    if duplicate_keys:
+        raise ValueError(
+            "Each selected camera role must map to a different Isaac policy observation key; "
+            f"duplicate mappings={duplicate_keys}. Do not reuse one live camera for dual/triple inputs."
+        )
 
     for role, observation_key in camera_mapping.items():
         get_policy_camera(policy_obs, observation_key, role)
@@ -504,8 +522,88 @@ def add_smart_target_cfg(
     )
 
 
+def validate_scene_profile_asset_args(args: argparse.Namespace) -> None:
+    """Reject legacy/custom asset controls when an explicit profile owns composition."""
+
+    if args.scene_profile == scene_profiles.TASK_DEFAULT_SCENE_PROFILE:
+        return
+    if args.smart_scene_usd != "auto":
+        raise ValueError(
+            "An explicit --scene-profile uses the current LeIsaac SmartTask scene; "
+            "do not combine it with --smart-scene-usd"
+        )
+    uses_legacy_target_override = (
+        args.smart_target_asset != "auto"
+        or args.smart_target_pos is not None
+        or args.smart_target_prim_path != SMART_TARGET_MANAGED_PRIM_PATH
+        or tuple(args.smart_target_cuboid_size) != SMART_TARGET_CUBOID_SIZE
+    )
+    if uses_legacy_target_override:
+        raise ValueError(
+            "--scene-profile owns its LEGO assets and poses; do not combine an explicit profile "
+            "with --smart-target-* legacy overrides"
+        )
+
+
+def install_scene_profile_patch(args: argparse.Namespace) -> Path:
+    """Compose one deployment scene profile without adding another Gym task."""
+
+    scene_profiles.validate_scene_profile_task(args.task, args.scene_profile)
+    validate_scene_profile_asset_args(args)
+
+    import leisaac.assets.scenes.smart_scene as smart_scene
+    import leisaac.tasks.smart_task.smart_task_env_cfg as smart_task_cfg
+
+    # Follow the current LeIsaac module's source scene. Do not silently prefer a
+    # stale runner-generated scene_portable.usda from an older workflow.
+    source_scene_usd = Path(smart_scene.SMART_SCENE_USD_PATH).expanduser().resolve()
+    if not source_scene_usd.is_file():
+        raise FileNotFoundError(f"LeIsaac SmartTask scene USD does not exist: {source_scene_usd}")
+    wrapper_path = scene_profiles.write_scene_wrapper(
+        source_scene_usd,
+        args.scene_profile,
+        SCRIPT_DIR / "runs" / "scene_profiles",
+    )
+    lego_asset_dir = LEISAAC_ROOT / "assets" / "scenes" / "smart_scene" / "assets"
+
+    original_parse = smart_task_cfg.parse_usd_and_create_subassets
+
+    def parse_usd_and_create_subassets_with_profile(usd_path, env_cfg, *parse_args, **parse_kwargs):
+        result = original_parse(str(wrapper_path), env_cfg, *parse_args, **parse_kwargs)
+        added_keys = scene_profiles.add_scene_profile_objects(
+            env_cfg,
+            args.scene_profile,
+            lego_asset_dir,
+        )
+        print(
+            f"[runner] scene profile objects={list(added_keys)} tray_active="
+            f"{scene_profiles.get_scene_profile(args.scene_profile).tray_active}",
+            flush=True,
+        )
+        return result
+
+    # LeIsaac's parser and the live AssetBaseCfg must see the same file-backed layer.
+    smart_scene.SMART_SCENE_USD_PATH = str(wrapper_path)
+    smart_scene.SMART_SCENE_CFG.spawn.usd_path = str(wrapper_path)
+    smart_task_cfg.SMART_SCENE_USD_PATH = str(wrapper_path)
+    smart_task_cfg.SMART_SCENE_CFG.spawn.usd_path = str(wrapper_path)
+    smart_task_cfg.parse_usd_and_create_subassets = parse_usd_and_create_subassets_with_profile
+
+    print(
+        f"[runner] scene profile={args.scene_profile} source_scene={source_scene_usd} "
+        f"wrapper={wrapper_path}",
+        flush=True,
+    )
+    return wrapper_path
+
+
 def install_smart_task_asset_patch(args: argparse.Namespace) -> Path | None:
     """Install the legacy base-task asset workaround without altering other tasks."""
+
+    if getattr(args, "scene_profile", scene_profiles.TASK_DEFAULT_SCENE_PROFILE) != (
+        scene_profiles.TASK_DEFAULT_SCENE_PROFILE
+    ):
+        return install_scene_profile_patch(args)
 
     if not is_leisaac_smart_task(args.task):
         return None
@@ -1446,42 +1544,43 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--exterior-observation-key",
-        "--exterior-camera-key",
-        dest="exterior_camera_key",
+        "--isaac-exterior-camera-key",
         default=None,
         help="Isaac obs['policy'] key for OXE/DROID exterior_image_1_left.",
     )
     parser.add_argument(
-        "--front-observation-key",
-        "--front-camera-key",
-        "--top-camera-key",
-        dest="front_observation_key",
+        "--isaac-front-camera-key",
         default=None,
         help="Isaac obs['policy'] key mapped to SO101 GR00T video.top.",
     )
     parser.add_argument(
-        "--left-observation-key",
-        "--left-camera-key",
-        dest="left_observation_key",
+        "--isaac-left-camera-key",
         default=None,
         help="Isaac obs['policy'] key mapped to SO101 GR00T video.left in triple mode.",
     )
     parser.add_argument(
-        "--wrist-observation-key",
-        "--wrist-camera-key",
-        dest="wrist_observation_key",
+        "--isaac-wrist-camera-key",
         default=None,
         help="Isaac obs['policy'] key mapped to the GR00T wrist video input.",
     )
 
-    # IsaacLab task id。所选 task 的 env config 决定场景；None 表示按 robot 选旧默认值。
+    # Gym task chooses the base environment implementation; scene profile below
+    # independently chooses deployment-time tray/LEGO composition.
     parser.add_argument(
         "--task",
         default=None,
         help=(
-            "Registered Gym task ID. Its env config owns the Isaac scene. "
+            "Registered Gym task ID for the base robot/action/observation environment. "
             "Defaults to LeIsaac-SO101-SmartTask-v0 for SO101."
+        ),
+    )
+    parser.add_argument(
+        "--scene-profile",
+        choices=scene_profiles.SCENE_PROFILE_CHOICES,
+        default=scene_profiles.TASK_DEFAULT_SCENE_PROFILE,
+        help=(
+            "Deployment-time object layout, independent of Gym task registration: "
+            "tray-red24, table-red24, or multi-lego-tray. task-default keeps the selected task scene."
         ),
     )
 
@@ -1505,7 +1604,8 @@ def parse_args() -> argparse.Namespace:
         default="auto",
         help=(
             "Scene rigid-object key used for SmartTask metrics/debug. "
-            "auto first reads the selected task's success termination and refuses ambiguous multi-LEGO scenes."
+            "Single-object scene profiles resolve auto; multi-lego-tray requires one explicit object key. "
+            "task-default reads the selected task configuration."
         ),
     )
     parser.add_argument(
@@ -1789,6 +1889,20 @@ def parse_args() -> argparse.Namespace:
     if args.task is None:
         args.task = default_task_for_robot(args.robot)
     validate_robot_task(args.robot, args.task)
+    scene_profiles.validate_scene_profile_task(args.task, args.scene_profile)
+    validate_scene_profile_asset_args(args)
+    scene_profile_target = scene_profiles.resolve_scene_profile_target(
+        args.scene_profile,
+        args.target_object_key,
+    )
+    if args.scene_profile != scene_profiles.TASK_DEFAULT_SCENE_PROFILE:
+        profile = scene_profiles.get_scene_profile(args.scene_profile)
+        if profile.requires_explicit_instruction and args.instruction is None:
+            raise ValueError(
+                f"--scene-profile {args.scene_profile} requires --instruction to match the checkpoint task"
+            )
+        if scene_profile_target is None:
+            raise RuntimeError(f"scene profile {args.scene_profile!r} did not resolve a target")
     if args.policy_schema == "so101-new-embodiment":
         if args.robot != "so101":
             raise ValueError("--policy-schema so101-new-embodiment requires --robot so101")
@@ -1865,7 +1979,19 @@ def main() -> None:
     try:
         smart_scene_usd_path = install_smart_task_asset_patch(args)
         env_cfg = parse_env_cfg(args.task, device=args.device, num_envs=1)
-        configured_target_object_name = target_name_from_env_cfg(env_cfg)
+        scene_profile_target = scene_profiles.resolve_scene_profile_target(
+            args.scene_profile,
+            args.target_object_key,
+        )
+        if scene_profile_target is not None:
+            scene_profiles.apply_scene_profile_target(
+                env_cfg,
+                args.scene_profile,
+                scene_profile_target,
+            )
+            configured_target_object_name = scene_profile_target
+        else:
+            configured_target_object_name = target_name_from_env_cfg(env_cfg)
         args.instruction = resolve_task_instruction(args.instruction, env_cfg, args.task)
     except Exception as exc:
         print(
@@ -1929,7 +2055,8 @@ def main() -> None:
 
     try:
         print(
-            f"[runner] robot={args.robot} task={args.task} control mode={args.control_mode} "
+            f"[runner] robot={args.robot} task={args.task} scene_profile={args.scene_profile} "
+            f"control mode={args.control_mode} "
             f"teleop_device={teleop_device}",
             flush=True,
         )
