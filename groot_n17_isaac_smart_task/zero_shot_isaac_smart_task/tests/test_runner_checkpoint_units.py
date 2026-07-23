@@ -62,6 +62,27 @@ class RunnerCheckpointUnitsTest(unittest.TestCase):
         self.assertEqual(args.task, "LeIsaac-SO101-SmartTask-v0")
         self.assertEqual(args.scene_profile, "task-default")
 
+    def test_cli_action_horizon_zero_is_the_full_chunk_sentinel(self) -> None:
+        with patch.object(sys, "argv", ["run_smart_task_closed_loop.py"]):
+            default_args = runner.parse_args()
+        with patch.object(
+            sys,
+            "argv",
+            ["run_smart_task_closed_loop.py", "--action-horizon", "0"],
+        ):
+            explicit_args = runner.parse_args()
+
+        self.assertEqual(default_args.action_horizon, 0)
+        self.assertEqual(explicit_args.action_horizon, 0)
+
+    def test_cli_rejects_negative_action_horizon(self) -> None:
+        argv = ["run_smart_task_closed_loop.py", "--action-horizon", "-1"]
+        with patch.object(sys, "argv", argv), self.assertRaisesRegex(
+            ValueError,
+            "must be 0 or a positive integer",
+        ):
+            runner.parse_args()
+
     def test_cli_accepts_table_red24_without_another_task_id(self) -> None:
         argv = ["run_smart_task_closed_loop.py", "--scene-profile", "table-red24"]
         with patch.object(sys, "argv", argv):

@@ -28,9 +28,11 @@ BLUE24_OBJECT_KEY = "blue_2x4_lego_brick"
 RED24_ASSET = "red_2x4_lego_brick.usd"
 RED22_ASSET = "red_2x2_lego_brick.usd"
 
-# Poses mirror the authored inactive LEGO/tray layout in LeIsaac smart_scene/scene.usd.
-TRAY_RED24_POS = (0.0, 0.25, 0.025)
-TABLE_RED24_POS = (0.126, 0.25, 0.015)
+# Poses mirror the authored single-pick and multi-LEGO prims in LeIsaac
+# smart_scene/scene.usd. The single-pick profiles share the same object spec;
+# their scene composition differs by tray activation.
+SINGLE_PICK_RED24_POS = (0.0, 0.25, 0.025)
+MULTI_RED24_POS = (0.126, 0.25, 0.015)
 MULTI_RED22_POS = (0.126, 0.15, 0.015)
 MULTI_BLUE24_POS = (0.186, 0.15, 0.015)
 RED24_ROT = (0.70710677, 0.0, 0.0, -0.70710677)
@@ -60,10 +62,17 @@ class SceneProfile:
         return tuple(obj.key for obj in self.objects)
 
 
-_RED24_TABLE = SceneObjectSpec(
+_SINGLE_PICK_RED24 = SceneObjectSpec(
     key=RED24_OBJECT_KEY,
     asset_filename=RED24_ASSET,
-    pos=TABLE_RED24_POS,
+    pos=SINGLE_PICK_RED24_POS,
+    rot=RED24_ROT,
+)
+
+_MULTI_RED24 = SceneObjectSpec(
+    key=RED24_OBJECT_KEY,
+    asset_filename=RED24_ASSET,
+    pos=MULTI_RED24_POS,
     rot=RED24_ROT,
 )
 
@@ -71,21 +80,14 @@ SCENE_PROFILES = {
     TRAY_RED24_SCENE_PROFILE: SceneProfile(
         name=TRAY_RED24_SCENE_PROFILE,
         tray_active=True,
-        objects=(
-            SceneObjectSpec(
-                key=RED24_OBJECT_KEY,
-                asset_filename=RED24_ASSET,
-                pos=TRAY_RED24_POS,
-                rot=RED24_ROT,
-            ),
-        ),
+        objects=(_SINGLE_PICK_RED24,),
         default_target_key=RED24_OBJECT_KEY,
         requires_explicit_instruction=False,
     ),
     TABLE_RED24_SCENE_PROFILE: SceneProfile(
         name=TABLE_RED24_SCENE_PROFILE,
         tray_active=False,
-        objects=(_RED24_TABLE,),
+        objects=(_SINGLE_PICK_RED24,),
         default_target_key=RED24_OBJECT_KEY,
         requires_explicit_instruction=False,
     ),
@@ -93,7 +95,7 @@ SCENE_PROFILES = {
         name=MULTI_LEGO_TRAY_SCENE_PROFILE,
         tray_active=True,
         objects=(
-            _RED24_TABLE,
+            _MULTI_RED24,
             SceneObjectSpec(
                 key=RED22_OBJECT_KEY,
                 asset_filename=RED22_ASSET,

@@ -344,7 +344,7 @@ python experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task/run_sma
 至少确认：
 
 ```text
-[runner] scene profile=table-red24 ... wrapper=...
+[runner] scene profile=table-red24 source_scene=... wrapper=...
 [runner] scene profile objects=['red_2x4_lego_brick'] tray_active=False
 [runner] Isaac env created successfully
 [runner] camera-debug scene rigid objects: ['red_2x4_lego_brick']
@@ -353,7 +353,7 @@ python experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task/run_sma
 
 `--debug-cameras-only` 不验证动作单位；单位参数从后续 dry-run/one-step 开始按部署 README 设置。
 
-只有这一步通过，才进入 bridge dry-run 和 one-step。后续命令见
+只有这一步通过，才进入 runner dry-run（通过 bridge 请求 action）和 one-step。后续命令见
 [zero_shot_isaac_smart_task/README_ZH.md](../zero_shot_isaac_smart_task/README_ZH.md)。
 
 ## 11. 常见错误
@@ -377,7 +377,7 @@ GR00T import/GPU
 -> SimulationApp
 -> scene-profile wrapper + asset smoke
 -> SmartTask camera smoke
--> bridge dry-run
+-> runner dry-run（通过 bridge 请求 action）
 -> one policy action
 ```
 

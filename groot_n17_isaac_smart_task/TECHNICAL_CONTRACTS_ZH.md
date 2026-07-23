@@ -36,13 +36,18 @@ checkpoint schema 使用语义角色：
 video.top / video.left / video.wrist
 ```
 
-当前 SmartTask live observation 默认映射：
+当前 `leisaac/main` 实际只暴露 wrist=`camera1`。部署 README 采用“保留这条现有 wrist，
+再恢复其余相机”的最小改动示例：
 
 ```text
 camera3 -> top
-camera1 -> left
-camera2 -> wrist
+camera2 -> left
+camera1 -> wrist
 ```
+
+这不是相机编号的固定语义。runner 的历史 `leisaac-current` preset 使用过
+camera3=top、camera1=left、camera2=wrist；部署命令通过三个 `--isaac-...-camera-key`
+显式参数覆盖 preset，因此应以 env cfg 实际暴露的 key 和 runner 启动日志为准。
 
 prepared dataset 的 `camera1/camera2/camera3` 与 live key 不能按名字直接等同。新增 layout
 时必须同时更新训练 config、bridge modality 校验、runner live mapping 和测试。bridge 与
@@ -92,9 +97,12 @@ GR00T action 数组统一为 `(B, T, D)`。`action_chunk.py` 负责：
 两个容易混淆的参数：
 
 ```text
-action_horizon   一个返回 chunk 最多执行多少个 policy action
-max_policy_calls 整个 run 最多向 bridge 请求多少个 chunk
+action_horizon   一个返回 chunk 最多执行多少个 policy action；0 = 完整返回 chunk
+max_policy_calls 整个 run 最多向 bridge 请求多少个 chunk；不是总 action 步数
 ```
+
+例如 `max_policy_calls=4, action_horizon=0` 表示最多完整执行 4 个 chunk，不是执行 4 步。
+dry-run 仍按 `max_policy_calls` 请求 chunk，但不执行 action，因此 action horizon 不参与执行。
 
 policy 时间基准与 Isaac step 分开。当前数据 30 Hz、env 60 Hz，所以同一个 policy target
 保持两个 `env.step()`。`action_timing.py` 只接受整数倍；非整数比例会报错，而不是静默取整。
@@ -106,7 +114,8 @@ policy 时间基准与 Isaac step 分开。当前数据 30 Hz、env 60 Hz，所�
 
 - `so101-finetuned + joint + lerobot_motor_units`：sim 数据 checkpoint，执行绝对 motor target。
 - `so101-finetuned + joint + degrees`：真机数据 checkpoint，执行绝对 arm degree target；gripper仍为 `[0,100]`。
-- `zero-shot-oxe`：embodiment 对照，不代表存在通用高维 action 到 SO101 的 adapter。
+- `zero-shot-oxe`：embodiment 对照，只允许 dual camera layout 和 motor-unit 选项；不代表存在
+  通用高维 action 到 SO101 的 adapter。
 - `eef`：把相对 EEF-frame `xyz + rot6d` 与当前末端位姿组合，再交给 IK action cfg。
 - Franka：用于更接近 OXE/DROID embodiment 的对照，不等于 SO101 checkpoint 部署。
 
@@ -120,7 +129,7 @@ policy 时间基准与 Isaac step 分开。当前数据 30 Hz、env 60 Hz，所�
 
 ```text
 --task               选择机器人/action/observation/camera 等基础 Gym env
---scene-profile      选择部署前的木盘和 LEGO 布局
+--scene-profile      选择木盘和 LEGO 布局；multi 还会重绑 env cfg 的 success 判据
 scene wrapper / USD  把基础 scene 与完整 repo-local 资产组合成 live scene
 --instruction        checkpoint 的语言条件，必须与训练文本一致
 --target-object-key  multi 场景选择哪个刚体；同时用于 metric/debug/termination
@@ -130,6 +139,11 @@ scene wrapper / USD  把基础 scene 与完整 repo-local 资产组合成 live s
 task ID，也不修改 `leisaac/`。显式 profile 会停用旧 LEGO composition arc，加载完整红 2x4 /
 红 2x2 USD；蓝 2x4 复用红 2x4 几何并覆盖为蓝色材质。`multi-lego-tray` 必须显式指定 target
 和 instruction，物体 pose 沿用 LeIsaac authored layout。
+
+`tray-red24` 和 `table-red24` 都只有红色 2x4，并共享 single-pick 的完整 pose；前者启用木盘，
+后者停用木盘。`multi-lego-tray` 使用另一套三块 LEGO pose，并将 env cfg 的 success 判据
+改为 `object_placed_on_tray`。runner 默认禁用原生 success termination，因为当前判据过松；
+只有显式传 `--use-env-success-termination` 才会让该判据参与 episode 自动终止。
 
 `task-default` 才保留旧 scene / cuboid fallback 兼容语义；不要把 `--smart-target-*`
 与显式 scene profile 混用。

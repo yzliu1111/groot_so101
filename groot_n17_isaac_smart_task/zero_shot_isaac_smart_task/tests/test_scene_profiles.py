@@ -22,21 +22,33 @@ class SceneProfilesTest(unittest.TestCase):
             ("task-default", "tray-red24", "table-red24", "multi-lego-tray"),
         )
 
-    def test_table_red24_has_no_tray_and_one_red_block(self) -> None:
-        profile = scene_profiles.get_scene_profile("table-red24")
-        self.assertFalse(profile.tray_active)
-        self.assertEqual(profile.object_keys, (scene_profiles.RED24_OBJECT_KEY,))
-        self.assertEqual(profile.objects[0].pos, scene_profiles.TABLE_RED24_POS)
+    def test_single_pick_profiles_share_object_spec_and_differ_by_tray_activation(self) -> None:
+        tray_profile = scene_profiles.get_scene_profile("tray-red24")
+        table_profile = scene_profiles.get_scene_profile("table-red24")
+
+        self.assertTrue(tray_profile.tray_active)
+        self.assertFalse(table_profile.tray_active)
+        self.assertEqual(tray_profile.object_keys, (scene_profiles.RED24_OBJECT_KEY,))
+        self.assertEqual(table_profile.object_keys, (scene_profiles.RED24_OBJECT_KEY,))
+        self.assertEqual(tray_profile.objects, table_profile.objects)
+        self.assertEqual(tray_profile.default_target_key, table_profile.default_target_key)
+        self.assertEqual(
+            tray_profile.requires_explicit_instruction,
+            table_profile.requires_explicit_instruction,
+        )
+        self.assertEqual(tray_profile.objects[0].pos, (0.0, 0.25, 0.025))
+        self.assertEqual(
+            tray_profile.objects[0].rot,
+            (0.70710677, 0.0, 0.0, -0.70710677),
+        )
+        self.assertEqual(
+            scene_profiles.resolve_scene_profile_target("tray-red24", "auto"),
+            scene_profiles.RED24_OBJECT_KEY,
+        )
         self.assertEqual(
             scene_profiles.resolve_scene_profile_target("table-red24", "auto"),
             scene_profiles.RED24_OBJECT_KEY,
         )
-
-    def test_tray_red24_places_one_red_block_at_authored_tray_pose(self) -> None:
-        profile = scene_profiles.get_scene_profile("tray-red24")
-        self.assertTrue(profile.tray_active)
-        self.assertEqual(profile.object_keys, (scene_profiles.RED24_OBJECT_KEY,))
-        self.assertEqual(profile.objects[0].pos, scene_profiles.TRAY_RED24_POS)
 
     def test_multi_lego_tray_follows_leisaac_authored_layout(self) -> None:
         profile = scene_profiles.get_scene_profile("multi-lego-tray")
@@ -50,9 +62,14 @@ class SceneProfilesTest(unittest.TestCase):
             ),
         )
         positions = {obj.key: obj.pos for obj in profile.objects}
-        self.assertEqual(positions[scene_profiles.RED24_OBJECT_KEY], scene_profiles.TABLE_RED24_POS)
-        self.assertEqual(positions[scene_profiles.RED22_OBJECT_KEY], scene_profiles.MULTI_RED22_POS)
-        self.assertEqual(positions[scene_profiles.BLUE24_OBJECT_KEY], scene_profiles.MULTI_BLUE24_POS)
+        self.assertEqual(
+            positions,
+            {
+                scene_profiles.RED24_OBJECT_KEY: (0.126, 0.25, 0.015),
+                scene_profiles.RED22_OBJECT_KEY: (0.126, 0.15, 0.015),
+                scene_profiles.BLUE24_OBJECT_KEY: (0.186, 0.15, 0.015),
+            },
+        )
         blue = next(obj for obj in profile.objects if obj.key == scene_profiles.BLUE24_OBJECT_KEY)
         self.assertEqual(blue.asset_filename, scene_profiles.RED24_ASSET)
         self.assertIsNotNone(blue.diffuse_color)

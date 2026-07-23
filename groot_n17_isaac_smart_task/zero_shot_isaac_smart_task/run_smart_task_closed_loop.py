@@ -1564,8 +1564,9 @@ def parse_args() -> argparse.Namespace:
         help="Isaac obs['policy'] key mapped to the GR00T wrist video input.",
     )
 
-    # Gym task chooses the base environment implementation; scene profile below
-    # independently chooses deployment-time tray/LEGO composition.
+    # Gym task chooses the base environment implementation. The scene profile
+    # owns deployment-time tray/LEGO composition and may also rebind the env
+    # cfg success criterion. The runner disables that termination by default.
     parser.add_argument(
         "--task",
         default=None,
@@ -1579,8 +1580,9 @@ def parse_args() -> argparse.Namespace:
         choices=scene_profiles.SCENE_PROFILE_CHOICES,
         default=scene_profiles.TASK_DEFAULT_SCENE_PROFILE,
         help=(
-            "Deployment-time object layout, independent of Gym task registration: "
-            "tray-red24, table-red24, or multi-lego-tray. task-default keeps the selected task scene."
+            "Deployment-time object layout and profile-owned target/configured-success behavior, independent of "
+            "Gym task registration: tray-red24, table-red24, or multi-lego-tray. "
+            "task-default keeps the selected task scene."
         ),
     )
 
