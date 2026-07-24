@@ -85,6 +85,57 @@ current_radians + returned_action
 runner 还会核对当前 USD 的 6 个 joint 名称、顺序和范围。更换 SO101 USD、关节顺序、
 符号或范围时，必须同步修改 converter 和测试，不能绕过校验。
 
+### 4.1 SO101 初始姿态与首帧时序
+
+SO101 微调部署的首个 proprioception 和腕部图像必须来自同一个、与 checkpoint 数据来源
+匹配的 reset pose。runner 的 `--so101-initial-pose auto` 只在
+`so101-finetuned + so101 + joint` 路线解析为 `dataset-start`：
+
+```text
+lerobot_motor_units -> sim 数据 50 集 frame_index=5 的逐维中位数
+degrees              -> real 数据 50 集 frame_index=0 的逐维中位数
+其他路线             -> LeIsaac authored USD default
+```
+
+`dataset-first-frame` 仅保留为旧命令的兼容别名，也会解析成 `dataset-start`。sim 的 frame 0
+是复位瞬态；当前 frame 5 参考比它晚约 `0.17 s`，腕部更朝向桌面但仍早于约 frame 10 的
+稳定姿态。选择其他帧时必须使用 `--so101-initial-dataset-state` 显式记录六维值。
+
+实现时序固定为：
+
+```text
+解析 checkpoint units 和 initial-pose
+-> dataset state 转 Isaac radians，并拒绝越过 USD limits
+-> 将 arm/gripper JointPositionActionCfg.use_default_offset 显式设为 False
+-> 只修改 parse_env_cfg() 返回的当前 env_cfg.scene.robot.init_state.joint_pos
+-> 设置 rerender_on_reset=True
+-> gym.make()
+-> 确认两个实例化 action term 的 runtime offset 都是 0
+-> env.reset()
+-> 校验实际 joint_pos 与 preset 的最大误差不超过 0.0001 rad
+-> 读取同一姿态下的新 camera observation
+-> 填充 FrameHistory
+-> bridge inference
+-> policy action loop
+```
+
+IsaacLab 的 `JointPositionActionCfg.use_default_offset` 默认为 `True`；它会把
+`asset.data.default_joint_pos` 加到 raw action。由于本 runner 已将模型输出转换成绝对
+radians，非零 reset pose 不能同时充当 action offset，否则每一步会得到
+`absolute_target + reset_pose`。arm 和 gripper 两项都必须关闭该默认行为，并在 env 创建后
+fail closed 验证。
+
+不能在 `env.reset()` 后只调用 `set_joint_position_target()`：它只设置 action/actuator target，
+不会立即把 articulation state、FK 和腕部 camera 一起重建。也不能用全零 action 做
+“settle”，因为当前 `JointPositionAction` 把 action 当绝对 radians，会将 preset 拉回零姿态。
+初始姿态/reset/rerender 不计入 `action_horizon`、`max_policy_calls` 或 viewport capture。
+
+内置值是带明确 frame provenance 的 dataset-start 中位数，不是全数据中位数。若换用另一批
+real/sim 数据，必须通过
+`--so101-initial-dataset-state` 显式覆盖或更新有 provenance 的 preset；不能假定所有
+`degrees` checkpoint 共用一个 home pose。gripper 在任何模式下仍按 LeRobot `[0,100]`
+解释。
+
 ## 5. action chunk 和时间约定
 
 GR00T action 数组统一为 `(B, T, D)`。`action_chunk.py` 负责：
@@ -155,6 +206,8 @@ task ID，也不修改 `leisaac/`。显式 profile 会停用旧 LEGO composition
 bridge ping 报告 modality + action_decoding
 runner task / scene profile / target / instruction 与 checkpoint 对齐
 runner units 与 checkpoint 的训练数据来源一致
+runner arm/gripper use_default_offset=False，runtime offsets 全零
+runner initial-pose source / units 正确，reset verification 不超过 0.0001 rad
 runner camera-only 与 scene rigid-object 列表通过
 纯 Python tests 通过
 dry-run 通过

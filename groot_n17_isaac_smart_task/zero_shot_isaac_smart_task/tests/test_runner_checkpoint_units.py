@@ -207,6 +207,290 @@ class RunnerCheckpointUnitsTest(unittest.TestCase):
         self.assertEqual(args.so101_checkpoint_arm_units, "degrees")
         self.assertEqual(args.policy_schema, "so101-new-embodiment")
 
+    def test_zero_shot_auto_initial_pose_keeps_usd_default(self) -> None:
+        with patch.object(sys, "argv", ["run_smart_task_closed_loop.py"]):
+            args = runner.parse_args()
+
+        self.assertEqual(args.so101_initial_pose, "auto")
+        self.assertIsNone(runner.resolve_so101_initial_pose(args))
+
+    def test_finetuned_auto_initial_pose_selects_motor_frame_five_median(self) -> None:
+        argv = [
+            "run_smart_task_closed_loop.py",
+            "--deployment-mode",
+            "so101-finetuned",
+        ]
+        with patch.object(sys, "argv", argv):
+            args = runner.parse_args()
+
+        pose = runner.resolve_so101_initial_pose(args)
+        self.assertIsNotNone(pose)
+        self.assertEqual(pose["mode"], "dataset-start")
+        self.assertEqual(pose["source"], "sim_2.parquet:frame-5-median")
+        np.testing.assert_allclose(
+            pose["dataset_state"],
+            runner.SO101_DATASET_START_MEDIAN_STATE["lerobot_motor_units"],
+            atol=1e-7,
+        )
+        np.testing.assert_allclose(
+            pose["joint_rad"],
+            [-0.0439360, -0.1178652, 0.0787711, 1.5077535, -1.4915221, -0.1517543],
+            atol=2e-6,
+        )
+
+    def test_finetuned_auto_initial_pose_selects_degree_frame_zero_median(self) -> None:
+        argv = [
+            "run_smart_task_closed_loop.py",
+            "--deployment-mode",
+            "so101-finetuned",
+            "--so101-checkpoint-joint-units",
+            "degrees",
+        ]
+        with patch.object(sys, "argv", argv):
+            args = runner.parse_args()
+
+        pose = runner.resolve_so101_initial_pose(args)
+        self.assertIsNotNone(pose)
+        self.assertEqual(pose["mode"], "dataset-start")
+        self.assertEqual(pose["source"], "real_1.parquet:frame-0-median")
+        np.testing.assert_allclose(
+            pose["dataset_state"],
+            runner.SO101_DATASET_START_MEDIAN_STATE["degrees"],
+            atol=1e-7,
+        )
+        np.testing.assert_allclose(
+            pose["joint_rad"],
+            [0.0253169, 0.0130420, 0.1120079, 1.6018670, -1.6432946, -0.1356880],
+            atol=2e-6,
+        )
+
+    def test_legacy_first_frame_name_aliases_dataset_start(self) -> None:
+        argv = [
+            "run_smart_task_closed_loop.py",
+            "--deployment-mode",
+            "so101-finetuned",
+            "--so101-initial-pose",
+            "dataset-first-frame",
+        ]
+        with patch.object(sys, "argv", argv):
+            args = runner.parse_args()
+
+        pose = runner.resolve_so101_initial_pose(args)
+        self.assertEqual(pose["mode"], "dataset-start")
+        self.assertEqual(pose["source"], "sim_2.parquet:frame-5-median")
+
+    def test_configure_initial_pose_updates_only_env_cfg_instance_and_rerenders(self) -> None:
+        argv = [
+            "run_smart_task_closed_loop.py",
+            "--deployment-mode",
+            "so101-finetuned",
+            "--so101-checkpoint-joint-units",
+            "degrees",
+        ]
+        with patch.object(sys, "argv", argv):
+            args = runner.parse_args()
+
+        authored_joint_pos = {name: 0.0 for name in runner.SO101_JOINT_NAMES}
+        env_cfg = SimpleNamespace(
+            scene=SimpleNamespace(
+                robot=SimpleNamespace(
+                    init_state=SimpleNamespace(joint_pos=authored_joint_pos),
+                )
+            ),
+            rerender_on_reset=False,
+        )
+        pose = runner.configure_so101_initial_pose(env_cfg, args)
+
+        self.assertIsNotNone(pose)
+        self.assertTrue(env_cfg.rerender_on_reset)
+        self.assertIsNot(env_cfg.scene.robot.init_state.joint_pos, authored_joint_pos)
+        self.assertEqual(authored_joint_pos, {name: 0.0 for name in runner.SO101_JOINT_NAMES})
+        np.testing.assert_allclose(
+            [env_cfg.scene.robot.init_state.joint_pos[name] for name in runner.SO101_JOINT_NAMES],
+            pose["joint_rad"],
+            atol=1e-7,
+        )
+
+    def test_usd_default_initial_pose_does_not_modify_env_cfg(self) -> None:
+        argv = [
+            "run_smart_task_closed_loop.py",
+            "--deployment-mode",
+            "so101-finetuned",
+            "--so101-initial-pose",
+            "usd-default",
+        ]
+        with patch.object(sys, "argv", argv):
+            args = runner.parse_args()
+
+        authored_joint_pos = {name: 0.0 for name in runner.SO101_JOINT_NAMES}
+        env_cfg = SimpleNamespace(
+            scene=SimpleNamespace(
+                robot=SimpleNamespace(
+                    init_state=SimpleNamespace(joint_pos=authored_joint_pos),
+                )
+            ),
+            rerender_on_reset=False,
+        )
+
+        self.assertIsNone(runner.configure_so101_initial_pose(env_cfg, args))
+        self.assertIs(env_cfg.scene.robot.init_state.joint_pos, authored_joint_pos)
+        self.assertFalse(env_cfg.rerender_on_reset)
+
+    def test_finetuned_joint_actions_disable_default_pose_offsets(self) -> None:
+        argv = [
+            "run_smart_task_closed_loop.py",
+            "--deployment-mode",
+            "so101-finetuned",
+        ]
+        with patch.object(sys, "argv", argv):
+            args = runner.parse_args()
+
+        env_cfg = SimpleNamespace(
+            actions=SimpleNamespace(
+                arm_action=SimpleNamespace(use_default_offset=True),
+                gripper_action=SimpleNamespace(use_default_offset=True),
+            )
+        )
+        self.assertTrue(runner.configure_so101_absolute_joint_actions(env_cfg, args))
+        self.assertFalse(env_cfg.actions.arm_action.use_default_offset)
+        self.assertFalse(env_cfg.actions.gripper_action.use_default_offset)
+
+        with patch.object(sys, "argv", ["run_smart_task_closed_loop.py"]):
+            zero_shot_args = runner.parse_args()
+        zero_shot_cfg = SimpleNamespace(
+            actions=SimpleNamespace(
+                arm_action=SimpleNamespace(use_default_offset=True),
+                gripper_action=SimpleNamespace(use_default_offset=True),
+            )
+        )
+        self.assertFalse(
+            runner.configure_so101_absolute_joint_actions(zero_shot_cfg, zero_shot_args)
+        )
+        self.assertTrue(zero_shot_cfg.actions.arm_action.use_default_offset)
+        self.assertTrue(zero_shot_cfg.actions.gripper_action.use_default_offset)
+
+    def test_runtime_joint_action_offsets_must_stay_zero(self) -> None:
+        argv = [
+            "run_smart_task_closed_loop.py",
+            "--deployment-mode",
+            "so101-finetuned",
+        ]
+        with patch.object(sys, "argv", argv):
+            args = runner.parse_args()
+
+        terms = {
+            "arm_action": SimpleNamespace(
+                cfg=SimpleNamespace(use_default_offset=False),
+                _offset=torch.zeros((1, 5)),
+            ),
+            "gripper_action": SimpleNamespace(
+                cfg=SimpleNamespace(use_default_offset=False),
+                _offset=torch.zeros((1, 1)),
+            ),
+        }
+        env = SimpleNamespace(
+            action_manager=SimpleNamespace(get_term=lambda name: terms[name]),
+        )
+        runner.validate_so101_absolute_joint_actions(env, args)
+
+        terms["arm_action"]._offset[0, 0] = 0.25
+        with self.assertRaisesRegex(RuntimeError, "runtime offset must be zero"):
+            runner.validate_so101_absolute_joint_actions(env, args)
+
+    def test_initial_pose_verification_fails_closed_on_reset_mismatch(self) -> None:
+        argv = [
+            "run_smart_task_closed_loop.py",
+            "--deployment-mode",
+            "so101-finetuned",
+            "--so101-checkpoint-joint-units",
+            "degrees",
+        ]
+        with patch.object(sys, "argv", argv):
+            args = runner.parse_args()
+
+        configured_pose = runner.resolve_so101_initial_pose(args)
+        policy_obs = {"joint_pos": torch.zeros((1, 6), dtype=torch.float32)}
+        runtime_limits = torch.from_numpy(runner.SO101_USD_JOINT_LIMITS_RAD.copy())
+        with self.assertRaisesRegex(RuntimeError, "did not reach the configured initial pose"):
+            runner.log_so101_initial_joint_state(
+                policy_obs,
+                args,
+                runtime_limits,
+                configured_pose,
+            )
+
+    def test_custom_initial_dataset_state_overrides_unit_preset(self) -> None:
+        custom_state = ["1", "2", "3", "4", "5", "6"]
+        argv = [
+            "run_smart_task_closed_loop.py",
+            "--deployment-mode",
+            "so101-finetuned",
+            "--so101-checkpoint-joint-units",
+            "degrees",
+            "--so101-initial-dataset-state",
+            *custom_state,
+        ]
+        with patch.object(sys, "argv", argv):
+            args = runner.parse_args()
+
+        pose = runner.resolve_so101_initial_pose(args)
+        self.assertEqual(pose["source"], "cli:--so101-initial-dataset-state")
+        np.testing.assert_allclose(pose["dataset_state"], [1, 2, 3, 4, 5, 6])
+
+    def test_initial_dataset_state_rejects_wrong_route_conflict_and_limits(self) -> None:
+        wrong_route = [
+            "run_smart_task_closed_loop.py",
+            "--so101-initial-dataset-state",
+            "1",
+            "2",
+            "3",
+            "4",
+            "5",
+            "6",
+        ]
+        with patch.object(sys, "argv", wrong_route), self.assertRaisesRegex(
+            ValueError,
+            "requires --deployment-mode so101-finetuned",
+        ):
+            runner.parse_args()
+
+        conflict = [
+            "run_smart_task_closed_loop.py",
+            "--deployment-mode",
+            "so101-finetuned",
+            "--so101-initial-pose",
+            "usd-default",
+            "--so101-initial-dataset-state",
+            "1",
+            "2",
+            "3",
+            "4",
+            "5",
+            "6",
+        ]
+        with patch.object(sys, "argv", conflict), self.assertRaisesRegex(
+            ValueError,
+            "cannot be combined",
+        ):
+            runner.parse_args()
+
+        outside_limits = [
+            "run_smart_task_closed_loop.py",
+            "--deployment-mode",
+            "so101-finetuned",
+            "--so101-initial-dataset-state",
+            "500",
+            "0",
+            "0",
+            "0",
+            "0",
+            "0",
+        ]
+        with patch.object(sys, "argv", outside_limits):
+            args = runner.parse_args()
+        with self.assertRaisesRegex(ValueError, "outside the converter's USD joint limits"):
+            runner.resolve_so101_initial_pose(args)
+
     def test_cli_rejects_degree_units_for_zero_shot(self) -> None:
         argv = [
             "run_smart_task_closed_loop.py",

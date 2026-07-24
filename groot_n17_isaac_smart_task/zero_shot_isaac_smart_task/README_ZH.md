@@ -16,8 +16,8 @@
 
 | 目的 | bridge 参数 | runner 参数 |
 |---|---|---|
-| sim 数据微调权重 | `--deployment-mode so101-finetuned` | 同左，`--so101-checkpoint-joint-units lerobot_motor_units --robot so101 --control-mode joint` |
-| 真机数据微调权重 | `--deployment-mode so101-finetuned` | 同左，`--so101-checkpoint-joint-units degrees --robot so101 --control-mode joint` |
+| sim 数据微调权重 | `--deployment-mode so101-finetuned` | 同左，`--so101-checkpoint-joint-units lerobot_motor_units --so101-initial-pose dataset-start --robot so101 --control-mode joint` |
+| 真机数据微调权重 | `--deployment-mode so101-finetuned` | 同左，`--so101-checkpoint-joint-units degrees --so101-initial-pose dataset-start --robot so101 --control-mode joint` |
 | base model 对照 | `--deployment-mode zero-shot-oxe --camera-layout dual` | 同左；SO101 或 Franka；不要传 `degrees` |
 
 SO101 微调部署的三种显式场景都固定使用：
@@ -57,6 +57,18 @@ episode 会在成功时自动停止。
 --action-horizon 0      = 完整执行 bridge 实际返回的 chunk，不是“执行 0 步”
 --max-policy-calls 1    = 最多请求 1 个 chunk，不是“执行 1 步”
 ```
+
+SO101 微调路线还会在创建 env 前按 checkpoint 单位选择匹配的数据集起始参考姿态：
+
+```text
+lerobot_motor_units -> sim_2.parquet 的 50 集 frame_index=5 中位数
+degrees              -> real_1.parquet 的 50 集 frame_index=0 中位数
+```
+
+本手册显式传 `--so101-initial-pose dataset-start`，避免日志看不出本次验证用了哪种
+reset。代码默认 `auto` 在 SO101 微调路线中等价于该值；旧的 `dataset-first-frame` 名称
+仍可使用，但只作为兼容别名，也会解析成 `dataset-start`。`zero-shot-oxe` 的 `auto` 仍保留
+原 USD 初始姿态。需要做旧零姿态对照时才改为 `--so101-initial-pose usd-default`。
 
 ## 2. 每个新终端先恢复路径
 
@@ -157,12 +169,19 @@ export BRIDGE_HOST="${BRIDGE_HOST:-127.0.0.1}"
 export BRIDGE_PORT="${BRIDGE_PORT:-5577}"
 # sim checkpoint 用 lerobot_motor_units；真机 checkpoint 用 degrees。
 export SO101_CHECKPOINT_JOINT_UNITS="lerobot_motor_units"
+# SO101 微调验证使用与上面单位匹配的数据集起始参考姿态。
+export SO101_INITIAL_POSE="dataset-start"
 # 必须与终端 1 的 bridge 和 checkpoint 一致。
 export CAMERA_LAYOUT="dual"
 # 下面是恢复三路相机后的示例 live key；所选 layout 不使用的 key 会被 runner 忽略。
 export ISAAC_FRONT_CAMERA_KEY="camera3"
 export ISAAC_LEFT_CAMERA_KEY="camera2"
 export ISAAC_WRIST_CAMERA_KEY="camera1"
+
+case "$SO101_INITIAL_POSE" in
+  auto|dataset-start|dataset-first-frame|usd-default) printf '[OK] runner initial-pose=%s\n' "$SO101_INITIAL_POSE" ;;
+  *) printf '[FAIL] invalid SO101_INITIAL_POSE=%s\n' "$SO101_INITIAL_POSE" >&2; false ;;
+esac
 
 if [[ "${CONDA_DEFAULT_ENV:-}" == "$LEISAAC_ENV" &&
       -n "${CONDA_PREFIX:-}" &&
@@ -182,7 +201,8 @@ else
 fi
 ```
 
-必须看到四行 `[OK]`。出现 `[FAIL]`，或 conda 激活失败时，都停在这里。不要在这个
+必须先看到 initial-pose 的 `[OK]`，再看到四行 runner env `[OK]`。出现 `[FAIL]`，或 conda
+激活失败时，都停在这里。不要在这个
 conda env 里安装 LeRobot，也不要在这个终端运行 GR00T 训练。
 
 ### 4.1 选择基础 task 与 scene profile
@@ -295,6 +315,9 @@ so101-finetuned + --robot franka
 so101-finetuned + --control-mode eef
 zero-shot-oxe + --camera-layout wrist-only/triple
 zero-shot-oxe + --so101-checkpoint-joint-units degrees
+zero-shot-oxe + --so101-initial-pose dataset-start
+zero-shot-oxe + --so101-initial-pose dataset-first-frame（旧兼容名）
+--so101-initial-pose usd-default + --so101-initial-dataset-state ...
 bridge / runner / checkpoint 使用不同 camera layout
 ```
 
@@ -348,6 +371,7 @@ camera3 = front/top
 python experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task/run_smart_task_closed_loop.py \
   --deployment-mode so101-finetuned \
   --so101-checkpoint-joint-units "$SO101_CHECKPOINT_JOINT_UNITS" \
+  --so101-initial-pose "$SO101_INITIAL_POSE" \
   --task "$ISAAC_TASK" \
   --scene-profile "$ISAAC_SCENE_PROFILE" \
   --target-object-key "$TARGET_OBJECT_KEY" \
@@ -368,7 +392,11 @@ python experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task/run_sma
 ```text
 [runner] scene profile=... source_scene=... wrapper=...
 [runner] scene profile objects=... tray_active=...
+[runner] SO101 action semantics configured absolute_radians=True ...use_default_offset=False
+[runner] SO101 initial pose configured mode=dataset-start source=... arm_units=...
+[runner] SO101 action semantics verified absolute_radians=True runtime_offsets=...
 [runner] Isaac env created successfully
+[runner] SO101 initial pose verification source=... max_abs_error_rad=...
 [runner] Isaac obs['policy'][...] -> GR00T video....
 [runner] target object=...
 [runner] target object state prim_path=... root_pos_w=...
@@ -402,6 +430,7 @@ bridge，任一项不对都不要进入 dry-run。
 python experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task/run_smart_task_closed_loop.py \
   --deployment-mode so101-finetuned \
   --so101-checkpoint-joint-units "$SO101_CHECKPOINT_JOINT_UNITS" \
+  --so101-initial-pose "$SO101_INITIAL_POSE" \
   --task "$ISAAC_TASK" \
   --scene-profile "$ISAAC_SCENE_PROFILE" \
   --target-object-key "$TARGET_OBJECT_KEY" \
@@ -453,6 +482,7 @@ run_selected_scene_chunk() {
   : "${MAX_POLICY_CALLS:?set MAX_POLICY_CALLS before running}"
   : "${ACTION_HORIZON:?set ACTION_HORIZON before running}"
   : "${SO101_CHECKPOINT_JOINT_UNITS:?redo the terminal 2 setup}"
+  : "${SO101_INITIAL_POSE:?redo the terminal 2 setup}"
   : "${ISAAC_TASK:?copy one complete scene preset}"
   : "${ISAAC_SCENE_PROFILE:?copy one complete scene preset}"
   : "${TARGET_OBJECT_KEY:?copy one complete scene preset}"
@@ -466,6 +496,7 @@ run_selected_scene_chunk() {
   python experiments/groot_n17_isaac_smart_task/zero_shot_isaac_smart_task/run_smart_task_closed_loop.py \
     --deployment-mode so101-finetuned \
     --so101-checkpoint-joint-units "$SO101_CHECKPOINT_JOINT_UNITS" \
+    --so101-initial-pose "$SO101_INITIAL_POSE" \
     --task "$ISAAC_TASK" \
     --scene-profile "$ISAAC_SCENE_PROFILE" \
     --target-object-key "$TARGET_OBJECT_KEY" \
@@ -617,7 +648,7 @@ feature key，部署侧参数指定 `obs["policy"]` 中的 live key。runner 会
 以及所选角色是否映射到不同的 live camera；例如 triple 中把三路都指定成 `camera1` 会在请求
 模型前直接报错。
 
-## 6. checkpoint 单位和四个安全参数
+## 6. checkpoint 单位、初始姿态和安全参数
 
 | checkpoint 来源 | 前五个 arm state/action | gripper |
 |---|---|---|
@@ -634,10 +665,56 @@ Isaac runtime limits → `env.step()`。更完整的代码契约见
 | 参数 | 含义 |
 |---|---|
 | `--so101-checkpoint-joint-units` | checkpoint 前五个 arm state/action 的单位；sim 用 `lerobot_motor_units`，真机用 `degrees` |
+| `--so101-initial-pose` | `auto` 在 SO101 微调路线按单位选择匹配的数据集起始参考姿态；`dataset-start` 显式启用；`dataset-first-frame` 是兼容别名；`usd-default` 恢复旧的全零 USD reset |
+| `--so101-initial-dataset-state` | 可选的 6 值覆盖；前五维按 checkpoint 单位解释，第六维始终为 gripper `[0,100]` |
 | `--max-policy-calls` | 整个 run 最多请求多少个 action chunk；不是总 action 步数 |
 | `--action-horizon` | 每个 chunk 最多执行多少个 policy action；`0` 表示完整返回 chunk，不是 0 步 |
 | `--so101-arm-target-scale` | 当前姿态朝绝对目标移动的比例，范围 `[0,1]` |
 | `--so101-max-arm-step-rad` | 每个 policy action 的最大关节变化，单位 radian |
+
+当前两个内置 preset 来自用户提供的完整 Parquet。每个文件都与对应 ZIP 的帧数、50 个
+episode 长度和连续 `frame_index` 严格一致。runner 对 sim 取 50 集 `frame_index=5` 的
+逐维中位数，对 real 仍取 50 集 `frame_index=0` 的逐维中位数；都不是全数据均值或某一个
+episode：
+
+```text
+sim / lerobot_motor_units / frame_index=5:
+dataset = [-2.288494, -6.753181, 10.013950, 90.934647, -53.411201, 1.186470]
+Isaac rad = [-0.043936, -0.117865, 0.078771, 1.507753, -1.491522, -0.151754]
+
+real / degrees / frame_index=0（gripper 仍为 motor [0,100]）:
+dataset = [1.450549, 0.747253, 6.417583, 91.780220, -94.153847, 2.023320]
+Isaac rad = [0.025317, 0.013042, 0.112008, 1.601867, -1.643295, -0.135688]
+```
+
+sim 的 frame 0 是复位运动的瞬态：其 flex/roll 约为 `50.18/-29.84` motor；frame 5 已到
+`90.93/-53.41`，约在 frame 10 才稳定到 `96.34/-56.79`。当前 motor preset 在实际腕部相机
+预览后从 frame 0 后移到 frame 5：按 30 Hz 只后移约 `0.17 s`，夹爪更朝向桌面且红色 LEGO
+回到腕部视野，但仍不是完全 settle 姿态。若要比较其他起始帧，应显式传
+`--so101-initial-dataset-state`，并记录采用的是哪一帧。
+
+runner 在 `gym.make()` 前写入当前 env cfg 的 reset pose，不修改 LeIsaac 全局机器人配置；
+随后启用 `rerender_on_reset=True`，确保腕部相机首帧来自新姿态。启动日志必须同时看到
+configured 和 verification；后者的 `max_abs_error_rad` 必须不超过 `0.0001 rad`，否则
+runner 会在连接 bridge 前停止。
+
+还必须看到以下 action 语义日志：
+
+```text
+[runner] SO101 action semantics configured absolute_radians=True ...use_default_offset=False
+[runner] SO101 action semantics verified absolute_radians=True runtime_offsets=...
+```
+
+这是必要保护，不是普通 debug 信息：IsaacLab 的 `JointPositionAction` 默认会把机器人
+`default_joint_pos` 再加到输入 action 上，而本 runner 送入的是绝对 radians 目标。runner
+显式将 arm 和 gripper 的 `use_default_offset` 都设为 `False`，并在 env 实例化后确认 runtime
+offset 全零，防止新的非零 reset pose 被重复加到每一步命令上。
+
+若要与旧行为对照：
+
+```bash
+export SO101_INITIAL_POSE="usd-default"
+```
 
 旧参数 `--so101-arm-delta-scale` 和 `--so101-max-arm-delta` 只保留兼容，不要再写进新命令。
 

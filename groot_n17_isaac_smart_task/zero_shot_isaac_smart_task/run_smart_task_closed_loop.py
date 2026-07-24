@@ -135,12 +135,15 @@ from action_timing import resolve_env_steps_per_policy_action  # noqa: E402
 from pose_math import compose_pose_delta, quat_wxyz_to_rot6d  # noqa: E402
 import scene_profiles  # noqa: E402
 from so101_joint_units import (  # noqa: E402
+    SO101_ARM_UNITS_DEGREES,
     SO101_ARM_UNITS_LEROBOT_MOTOR,
     SO101_CHECKPOINT_ARM_UNIT_CHOICES,
     SO101_JOINT_NAMES,
     SO101_LEROBOT_MOTOR_LIMITS,
+    SO101_USD_JOINT_LIMITS_RAD,
     isaac_rad_to_so101_dataset,
     safe_absolute_dataset_target_to_isaac_rad,
+    so101_dataset_to_isaac_rad,
     validate_runtime_joint_limits_match_converter,
 )
 from task_selection import (  # noqa: E402
@@ -158,6 +161,56 @@ from wire import request  # noqa: E402
 # AppLauncher 要在 sys.path 调整后再 import，这样 isaaclab/isaaclab_assets 会优先
 # 来自 copied LeIsaac dependencies，而不是机器上其它源码副本。
 from isaaclab.app import AppLauncher  # noqa: E402
+
+
+# These deterministic reset presets are coordinate-wise medians across all 50
+# episodes at an explicit dataset-start reference frame:
+# - outputs/sim_2.parquet frame_index=5 (~0.17 s): LeRobot motor units for the
+#   first five joints.  This is slightly later than the reset-transient frame 0,
+#   but still precedes the settled wrist pose around frame 10.
+# - outputs/real_1.parquet frame_index=0: degrees for the first five joints.
+# The gripper remains in LeRobot [0, 100] coordinates in both datasets.
+#
+# A median is used because the real episode-0 pose is an outlier and the first
+# three sim joints also vary between episodes.  These are dataset-start
+# proprioception references, not whole-dataset means.
+SO101_DATASET_START_MEDIAN_STATE = {
+    SO101_ARM_UNITS_LEROBOT_MOTOR: (
+        -2.288494110107422,
+        -6.753181457519531,
+        10.01395034790039,
+        90.93464660644531,
+        -53.41120147705078,
+        1.1864696741104126,
+    ),
+    SO101_ARM_UNITS_DEGREES: (
+        1.4505494832992554,
+        0.7472527623176575,
+        6.4175825119018555,
+        91.78022003173828,
+        -94.15384674072266,
+        2.023319721221924,
+    ),
+}
+
+SO101_DATASET_START_MEDIAN_SOURCE = {
+    SO101_ARM_UNITS_LEROBOT_MOTOR: "sim_2.parquet:frame-5-median",
+    SO101_ARM_UNITS_DEGREES: "real_1.parquet:frame-0-median",
+}
+
+SO101_INITIAL_POSE_AUTO = "auto"
+SO101_INITIAL_POSE_DATASET_START = "dataset-start"
+# Backward-compatible alias for commands copied before the sim preset moved
+# from frame 0 to frame 5.  It resolves to the canonical dataset-start mode.
+SO101_INITIAL_POSE_DATASET_FIRST_FRAME = "dataset-first-frame"
+SO101_INITIAL_POSE_USD_DEFAULT = "usd-default"
+SO101_INITIAL_POSE_CHOICES = (
+    SO101_INITIAL_POSE_AUTO,
+    SO101_INITIAL_POSE_DATASET_START,
+    SO101_INITIAL_POSE_DATASET_FIRST_FRAME,
+    SO101_INITIAL_POSE_USD_DEFAULT,
+)
+SO101_INITIAL_POSE_VERIFY_ATOL_RAD = 1e-4
 
 
 def eef_state_to_9d(ee_frame_state: torch.Tensor) -> np.ndarray:
@@ -1533,6 +1586,29 @@ def parse_args() -> argparse.Namespace:
             "The gripper always remains in the LeRobot [0,100] range."
         ),
     )
+    parser.add_argument(
+        "--so101-initial-pose",
+        choices=SO101_INITIAL_POSE_CHOICES,
+        default=SO101_INITIAL_POSE_AUTO,
+        help=(
+            "SO101 reset pose. auto selects the unit-matched dataset-start reference for "
+            "so101-finetuned runs and keeps the authored USD default for other routes; "
+            "dataset-start explicitly selects that preset; dataset-first-frame is a legacy "
+            "alias; usd-default disables it."
+        ),
+    )
+    parser.add_argument(
+        "--so101-initial-dataset-state",
+        nargs=6,
+        type=float,
+        default=None,
+        metavar=("PAN", "LIFT", "ELBOW", "WRIST_FLEX", "WRIST_ROLL", "GRIPPER"),
+        help=(
+            "Override the six-value SO101 reset preset in checkpoint dataset coordinates. "
+            "The first five values use --so101-checkpoint-joint-units; gripper remains "
+            "LeRobot [0,100]. Only valid for so101-finetuned joint control."
+        ),
+    )
 
     parser.add_argument(
         "--camera-profile",
@@ -1843,6 +1919,32 @@ def parse_args() -> argparse.Namespace:
         raise ValueError(
             "--so101-checkpoint-joint-units degrees requires --deployment-mode so101-finetuned"
         )
+    dataset_start_pose_requested = args.so101_initial_pose in (
+        SO101_INITIAL_POSE_DATASET_START,
+        SO101_INITIAL_POSE_DATASET_FIRST_FRAME,
+    )
+    if dataset_start_pose_requested and args.deployment_mode != "so101-finetuned":
+        raise ValueError(
+            "--so101-initial-pose dataset-start/dataset-first-frame requires "
+            "--deployment-mode so101-finetuned"
+        )
+    if args.so101_initial_dataset_state is not None:
+        if args.deployment_mode != "so101-finetuned":
+            raise ValueError(
+                "--so101-initial-dataset-state requires "
+                "--deployment-mode so101-finetuned"
+            )
+        if args.so101_initial_pose == SO101_INITIAL_POSE_USD_DEFAULT:
+            raise ValueError(
+                "--so101-initial-dataset-state cannot be combined with "
+                "--so101-initial-pose usd-default"
+            )
+        initial_dataset_state = np.asarray(
+            args.so101_initial_dataset_state,
+            dtype=np.float32,
+        )
+        if not np.all(np.isfinite(initial_dataset_state)):
+            raise ValueError("--so101-initial-dataset-state values must be finite")
     if args.deployment_mode != "so101-finetuned" and args.camera_layout != "dual":
         raise ValueError("--camera-layout wrist-only/triple requires --deployment-mode so101-finetuned")
     if args.max_policy_calls < 1:
@@ -1930,6 +2032,265 @@ def keep_open(simulation_app: Any, env: Any, seconds: float) -> None:
         time.sleep(1.0 / 30.0)
 
 
+def is_so101_finetuned_joint_route(args: argparse.Namespace) -> bool:
+    """Return whether the runner uses the SO101 absolute-joint checkpoint contract."""
+
+    return (
+        args.deployment_mode == "so101-finetuned"
+        and args.robot == "so101"
+        and args.control_mode == "joint"
+        and args.policy_schema == "so101-new-embodiment"
+    )
+
+
+def resolve_so101_initial_pose(args: argparse.Namespace) -> dict[str, Any] | None:
+    """Resolve an optional unit-matched SO101 reset pose.
+
+    ``auto`` aligns finetuned SO101 runs to the unit-matched dataset-start
+    reference.  Other routes keep the task's authored USD reset pose.  A
+    six-value CLI override is interpreted in the selected checkpoint dataset
+    coordinates, including a LeRobot [0, 100] gripper value.
+    """
+
+    requested_mode = args.so101_initial_pose
+    finetuned_so101_joint = is_so101_finetuned_joint_route(args)
+
+    if requested_mode == SO101_INITIAL_POSE_AUTO:
+        resolved_mode = (
+            SO101_INITIAL_POSE_DATASET_START
+            if finetuned_so101_joint
+            else SO101_INITIAL_POSE_USD_DEFAULT
+        )
+    elif requested_mode == SO101_INITIAL_POSE_DATASET_FIRST_FRAME:
+        resolved_mode = SO101_INITIAL_POSE_DATASET_START
+    else:
+        resolved_mode = requested_mode
+
+    custom_state = args.so101_initial_dataset_state
+    if resolved_mode == SO101_INITIAL_POSE_USD_DEFAULT:
+        if custom_state is not None:
+            raise ValueError(
+                "--so101-initial-dataset-state cannot be combined with "
+                "--so101-initial-pose usd-default"
+            )
+        return None
+
+    if not finetuned_so101_joint:
+        raise ValueError(
+            "--so101-initial-pose dataset-start/dataset-first-frame and "
+            "--so101-initial-dataset-state require "
+            "--deployment-mode so101-finetuned --robot so101 --control-mode joint"
+        )
+
+    arm_units = args.so101_checkpoint_arm_units
+    if custom_state is None:
+        dataset_state = np.asarray(
+            SO101_DATASET_START_MEDIAN_STATE[arm_units],
+            dtype=np.float32,
+        )
+        source = SO101_DATASET_START_MEDIAN_SOURCE[arm_units]
+    else:
+        dataset_state = np.asarray(custom_state, dtype=np.float32)
+        source = "cli:--so101-initial-dataset-state"
+
+    joint_rad = so101_dataset_to_isaac_rad(dataset_state, arm_units).reshape(6)
+    lower = SO101_USD_JOINT_LIMITS_RAD[:, 0]
+    upper = SO101_USD_JOINT_LIMITS_RAD[:, 1]
+    if np.any(joint_rad < lower - 1e-6) or np.any(joint_rad > upper + 1e-6):
+        raise ValueError(
+            "SO101 initial pose falls outside the converter's USD joint limits: "
+            f"dataset_state={dataset_state.tolist()} arm_units={arm_units} "
+            f"joint_rad={joint_rad.tolist()}"
+        )
+
+    return {
+        "mode": resolved_mode,
+        "source": source,
+        "arm_units": arm_units,
+        "dataset_state": dataset_state,
+        "joint_rad": joint_rad,
+    }
+
+
+def apply_so101_initial_pose(
+    env_cfg: Any,
+    pose: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Apply an already-resolved pose to this env config before ``gym.make()``."""
+
+    if pose is None:
+        return None
+
+    try:
+        init_state = env_cfg.scene.robot.init_state
+        authored_joint_pos = init_state.joint_pos
+    except AttributeError as exc:
+        raise ValueError("Selected env cfg does not expose scene.robot.init_state.joint_pos") from exc
+    if not isinstance(authored_joint_pos, dict):
+        raise TypeError(
+            "env_cfg.scene.robot.init_state.joint_pos must be a joint-name dictionary, "
+            f"got {type(authored_joint_pos).__name__}"
+        )
+
+    updated_joint_pos = dict(authored_joint_pos)
+    updated_joint_pos.update(
+        {
+            joint_name: float(joint_value)
+            for joint_name, joint_value in zip(SO101_JOINT_NAMES, pose["joint_rad"])
+        }
+    )
+    init_state.joint_pos = updated_joint_pos
+
+    # The wrist camera moves with the arm.  Ask IsaacLab to render the reset
+    # state before it computes the first RTX-camera observation returned to the
+    # policy; otherwise the image may still show the authored USD pose.
+    env_cfg.rerender_on_reset = True
+
+    print(
+        "[runner] SO101 initial pose configured "
+        f"mode={pose['mode']} source={pose['source']} arm_units={pose['arm_units']} "
+        f"dataset_values={format_vec(pose['dataset_state'], precision=6)} "
+        f"Isaac_radians={format_vec(pose['joint_rad'], precision=6)} "
+        "rerender_on_reset=True",
+        flush=True,
+    )
+    return pose
+
+
+def configure_so101_initial_pose(
+    env_cfg: Any,
+    args: argparse.Namespace,
+) -> dict[str, Any] | None:
+    """Resolve and apply the SO101 pose; retained as a unit-testable helper."""
+
+    return apply_so101_initial_pose(env_cfg, resolve_so101_initial_pose(args))
+
+
+def configure_so101_absolute_joint_actions(
+    env_cfg: Any,
+    args: argparse.Namespace,
+) -> bool:
+    """Disable IsaacLab's default-position offsets for absolute SO101 commands."""
+
+    if not is_so101_finetuned_joint_route(args):
+        return False
+
+    try:
+        action_cfgs = {
+            "arm_action": env_cfg.actions.arm_action,
+            "gripper_action": env_cfg.actions.gripper_action,
+        }
+    except AttributeError as exc:
+        raise ValueError(
+            "SO101 finetuned joint control requires arm_action and gripper_action configs"
+        ) from exc
+
+    for name, action_cfg in action_cfgs.items():
+        if not hasattr(action_cfg, "use_default_offset"):
+            raise TypeError(
+                f"SO101 {name} must expose use_default_offset for absolute joint control"
+            )
+        action_cfg.use_default_offset = False
+
+    print(
+        "[runner] SO101 action semantics configured "
+        "absolute_radians=True arm_action.use_default_offset=False "
+        "gripper_action.use_default_offset=False",
+        flush=True,
+    )
+    return True
+
+
+def validate_so101_absolute_joint_actions(
+    env: Any,
+    args: argparse.Namespace,
+) -> None:
+    """Fail closed if instantiated action terms would add the reset pose again."""
+
+    if not is_so101_finetuned_joint_route(args):
+        return
+
+    offsets: dict[str, list[float]] = {}
+    for name in ("arm_action", "gripper_action"):
+        action_term = env.action_manager.get_term(name)
+        if getattr(action_term.cfg, "use_default_offset", None) is not False:
+            raise RuntimeError(
+                f"SO101 {name} did not preserve use_default_offset=False at runtime"
+            )
+        if not hasattr(action_term, "_offset"):
+            raise RuntimeError(f"SO101 {name} does not expose a verifiable runtime offset")
+
+        offset = action_term._offset
+        if isinstance(offset, torch.Tensor):
+            offset_array = offset.detach().cpu().numpy()
+        else:
+            offset_array = np.asarray(offset, dtype=np.float32)
+        if not np.all(np.isfinite(offset_array)) or not np.allclose(
+            offset_array,
+            0.0,
+            atol=1e-8,
+            rtol=0.0,
+        ):
+            raise RuntimeError(
+                f"SO101 {name} runtime offset must be zero for absolute commands, "
+                f"got {np.asarray(offset_array).tolist()}"
+            )
+        offsets[name] = np.asarray(offset_array, dtype=np.float64).round(8).reshape(-1).tolist()
+
+    print(
+        "[runner] SO101 action semantics verified "
+        f"absolute_radians=True runtime_offsets={offsets}",
+        flush=True,
+    )
+
+
+def log_so101_initial_joint_state(
+    policy_obs: dict[str, torch.Tensor],
+    args: argparse.Namespace,
+    runtime_joint_limits: torch.Tensor | None,
+    configured_pose: dict[str, Any] | None,
+) -> None:
+    """Log the post-reset SO101 state before camera debug or bridge access."""
+
+    print(f"[runner] initial joint_pos values={tensor_values(policy_obs['joint_pos'])}", flush=True)
+    if runtime_joint_limits is None:
+        return
+
+    initial_joint_rad = policy_obs["joint_pos"].detach().cpu().numpy()[0].astype(np.float32)
+    initial_joint_dataset = isaac_rad_to_so101_dataset(
+        initial_joint_rad,
+        args.so101_checkpoint_arm_units,
+    )
+    print(
+        "[runner] SO101 state conversion "
+        f"Isaac radians={initial_joint_rad.round(4).tolist()} -> "
+        f"dataset values={initial_joint_dataset.round(4).tolist()} "
+        f"arm_units={args.so101_checkpoint_arm_units}",
+        flush=True,
+    )
+    if configured_pose is not None:
+        max_abs_error_rad = float(
+            np.max(np.abs(initial_joint_rad - configured_pose["joint_rad"]))
+        )
+        print(
+            "[runner] SO101 initial pose verification "
+            f"source={configured_pose['source']} "
+            f"max_abs_error_rad={max_abs_error_rad:.8f}",
+            flush=True,
+        )
+        if max_abs_error_rad > SO101_INITIAL_POSE_VERIFY_ATOL_RAD:
+            raise RuntimeError(
+                "SO101 reset did not reach the configured initial pose: "
+                f"max_abs_error_rad={max_abs_error_rad:.8f} "
+                f"tolerance_rad={SO101_INITIAL_POSE_VERIFY_ATOL_RAD:.8f}"
+            )
+    print(
+        "[runner] SO101 Isaac runtime soft joint limits radians="
+        f"{runtime_joint_limits.detach().cpu().numpy().round(4).tolist()}",
+        flush=True,
+    )
+
+
 def get_so101_runtime_joint_limits(env: Any, policy_schema: str) -> torch.Tensor | None:
     """Validate the loaded SO101 joint order/ranges and return its soft limits."""
 
@@ -1959,6 +2320,10 @@ def main() -> None:
     """Isaac runner 主流程。"""
 
     args = parse_args()
+    # Resolve dataset coordinates and reject invalid custom poses before
+    # AppLauncher starts Kit, so a CLI/config error cannot leave a simulator
+    # process behind.
+    configured_initial_pose = resolve_so101_initial_pose(args)
 
     # AppLauncher 必须尽早创建；它会启动 Isaac Sim app。
     # `headless` 控制是否打开 viewport。
@@ -2006,30 +2371,43 @@ def main() -> None:
         simulation_app.close()
         raise
 
-    if smart_scene_usd_path is not None and hasattr(env_cfg.scene, "scene"):
-        env_cfg.scene.scene.spawn.usd_path = str(smart_scene_usd_path)
+    try:
+        if smart_scene_usd_path is not None and hasattr(env_cfg.scene, "scene"):
+            env_cfg.scene.scene.spawn.usd_path = str(smart_scene_usd_path)
 
-    # control-mode 决定 LeIsaac action manager 使用哪套 action cfg：
-    # - so101leader：JointPositionAction，action 维度 6。
-    # - mimic_so101leader：Differential IK pose + gripper，action 维度 8。
-    if args.robot == "franka":
-        teleop_device = "franka_ik" if args.control_mode == "eef" else "franka_joint"
-    else:
-        teleop_device = "mimic_so101leader" if args.control_mode == "eef" else "so101leader"
-    env_cfg.use_teleop_device(teleop_device)
+        # control-mode 决定 LeIsaac action manager 使用哪套 action cfg：
+        # - so101leader：JointPositionAction，action 维度 6。
+        # - mimic_so101leader：Differential IK pose + gripper，action 维度 8。
+        if args.robot == "franka":
+            teleop_device = "franka_ik" if args.control_mode == "eef" else "franka_joint"
+        else:
+            teleop_device = "mimic_so101leader" if args.control_mode == "eef" else "so101leader"
+        env_cfg.use_teleop_device(teleop_device)
+        configure_so101_absolute_joint_actions(env_cfg, args)
+        apply_so101_initial_pose(env_cfg, configured_initial_pose)
 
-    env_cfg.seed = args.seed
+        env_cfg.seed = args.seed
 
-    # 关闭 recorder，避免这个实验无意中写 LeIsaac 数据集。
-    env_cfg.recorders = None
+        # 关闭 recorder，避免这个实验无意中写 LeIsaac 数据集。
+        env_cfg.recorders = None
 
-    # 关闭 time_out termination，方便我们自己控制运行长度。
-    env_cfg.terminations.time_out = None
+        # 关闭 time_out termination，方便我们自己控制运行长度。
+        env_cfg.terminations.time_out = None
 
-    # SmartTask 当前 success 判断太松，会出现几乎没动就成功的问题。
-    # 默认禁用它；用户显式加 --use-env-success-termination 时才恢复。
-    if not args.use_env_success_termination and hasattr(env_cfg.terminations, "success"):
-        env_cfg.terminations.success = None
+        # SmartTask 当前 success 判断太松，会出现几乎没动就成功的问题。
+        # 默认禁用它；用户显式加 --use-env-success-termination 时才恢复。
+        if not args.use_env_success_termination and hasattr(env_cfg.terminations, "success"):
+            env_cfg.terminations.success = None
+    except Exception as exc:
+        print(
+            f"[runner] env config failed for {args.task!r}: {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+        traceback.print_exc(file=sys.stderr)
+        sys.stderr.flush()
+        simulation_app.close()
+        raise
 
     # 创建 gymnasium env，并拿 unwrapped 环境方便访问 scene、sim、cfg 等属性。
     # gym.make() 期间也可能因为 scene/asset 配置错误失败。必须在关闭
@@ -2037,16 +2415,23 @@ def main() -> None:
     # 和运行框架，如果先 close()，真正的 Python 异常可能在终端里消失，只剩
     # 下一个 shell prompt，看起来像“窗口无报错自动关闭”。
     print(f"[runner] creating Isaac env via gym.make(task={args.task!r})", flush=True)
+    env = None
     try:
         env = gym.make(args.task, cfg=env_cfg).unwrapped
+        validate_so101_absolute_joint_actions(env, args)
     except Exception as exc:
         print(
-            f"[runner] gym.make failed: {type(exc).__name__}: {exc}",
+            f"[runner] env creation/validation failed: {type(exc).__name__}: {exc}",
             file=sys.stderr,
             flush=True,
         )
         traceback.print_exc(file=sys.stderr)
         sys.stderr.flush()
+        if env is not None:
+            try:
+                env.close()
+            except Exception:
+                pass
         simulation_app.close()
         raise
     print("[runner] Isaac env created successfully", flush=True)
@@ -2069,6 +2454,12 @@ def main() -> None:
         obs, _ = env.reset()
         policy_obs = obs["policy"]
         so101_runtime_joint_limits = get_so101_runtime_joint_limits(env, args.policy_schema)
+        log_so101_initial_joint_state(
+            policy_obs,
+            args,
+            so101_runtime_joint_limits,
+            configured_initial_pose,
+        )
         resolved_camera_profile, camera_mapping = resolve_camera_mapping(args, env)
         camera_mapping = active_camera_mapping(args.policy_schema, args.camera_layout, camera_mapping)
         validate_camera_mapping(policy_obs, camera_mapping)
@@ -2138,25 +2529,6 @@ def main() -> None:
         print(f"[runner] bridge action decoding: {ping.get('action_decoding')}", flush=True)
         validate_bridge_camera_layout(args, ping)
 
-        print(f"[runner] initial joint_pos values={tensor_values(policy_obs['joint_pos'])}", flush=True)
-        if so101_runtime_joint_limits is not None:
-            initial_joint_rad = policy_obs["joint_pos"].detach().cpu().numpy()[0].astype(np.float32)
-            initial_joint_dataset = isaac_rad_to_so101_dataset(
-                initial_joint_rad,
-                args.so101_checkpoint_arm_units,
-            )
-            print(
-                "[runner] SO101 state conversion "
-                f"Isaac radians={initial_joint_rad.round(4).tolist()} -> "
-                f"dataset values={initial_joint_dataset.round(4).tolist()} "
-                f"arm_units={args.so101_checkpoint_arm_units}",
-                flush=True,
-            )
-            print(
-                "[runner] SO101 Isaac runtime soft joint limits radians="
-                f"{so101_runtime_joint_limits.detach().cpu().numpy().round(4).tolist()}",
-                flush=True,
-            )
         print_metrics(env, "initial", args.robot, target_object_name)
 
         build_observation = build_oxe_observation
