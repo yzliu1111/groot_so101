@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import os
+import random
 import socket
 import sys
 import traceback
@@ -129,6 +130,28 @@ def _load_policy(args: argparse.Namespace):
     return policy
 
 
+def _seed_inference(seed: int | None) -> None:
+    """Seed controllable RNG sources used by stochastic action inference.
+
+    This is best-effort control, not a bitwise-determinism guarantee for CUDA
+    kernels or renderer-dependent closed-loop evaluation.
+    """
+
+    if seed is None:
+        print("[bridge] inference seed: <unseeded>", flush=True)
+        return
+
+    import numpy as np
+    import torch
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    print(f"[bridge] inference seed: {seed}", flush=True)
+
+
 def _summarize_modality(policy: Any) -> dict[str, Any]:
     """把 GR00T policy 的 modality config 压缩成容易打印和传输的 dict。
 
@@ -216,6 +239,7 @@ def serve(args: argparse.Namespace) -> None:
         os.environ.setdefault("HF_HUB_OFFLINE", "1")
         os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 
+    _seed_inference(args.seed)
     print("[bridge] loading GR00T policy...", flush=True)
     policy = _load_policy(args)
     modality = _summarize_modality(policy)
@@ -338,6 +362,16 @@ def parse_args() -> argparse.Namespace:
 
     # 推理设备。通常用 cuda；如果只是调试 schema，也可以尝试 cpu，但会非常慢。
     parser.add_argument("--device", default="cuda")
+
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help=(
+            "Best-effort seed for Python, NumPy, and torch before model load and stochastic "
+            "action sampling; does not guarantee bitwise CUDA/closed-loop determinism."
+        ),
+    )
 
     # bridge 监听地址。127.0.0.1 表示仅本机访问，避免暴露到局域网。
     parser.add_argument("--host", default="127.0.0.1")

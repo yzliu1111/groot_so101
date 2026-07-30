@@ -55,12 +55,271 @@ def _finetuned_ping() -> dict:
     }
 
 
+class _FakeUsdPath:
+    def __init__(self, path: str):
+        self.pathString = path
+
+    def __str__(self) -> str:
+        return self.pathString
+
+
+class _FakeUsdAttribute:
+    def __init__(self, value=None, *, valid: bool = True):
+        self.value = value
+        self.valid = valid
+        self.set_calls: list[tuple[float, float, float]] = []
+
+    def IsValid(self) -> bool:
+        return self.valid
+
+    def Get(self):
+        return self.value
+
+    def Set(self, value) -> bool:
+        self.value = tuple(float(component) for component in value)
+        self.set_calls.append(self.value)
+        return True
+
+
+class _FakeUsdPrim:
+    def __init__(
+        self,
+        path: str,
+        diffuse_attr: _FakeUsdAttribute,
+        *,
+        type_name: str = "Shader",
+    ):
+        self.path = _FakeUsdPath(path)
+        self.diffuse_attr = diffuse_attr
+        self.type_name = type_name
+
+    def GetPath(self) -> _FakeUsdPath:
+        return self.path
+
+    def GetTypeName(self) -> str:
+        return self.type_name
+
+    def GetAttribute(self, name: str) -> _FakeUsdAttribute:
+        if name == runner.SO101_PRINTED_MATERIAL_DIFFUSE_INPUT:
+            return self.diffuse_attr
+        return _FakeUsdAttribute(valid=False)
+
+
+class _FakeUsdStage:
+    def __init__(self, prims: list[_FakeUsdPrim]):
+        self.prims = prims
+
+    def Traverse(self):
+        return iter(self.prims)
+
+
 class RunnerCheckpointUnitsTest(unittest.TestCase):
     def test_cli_defaults_to_base_so101_task(self) -> None:
         with patch.object(sys, "argv", ["run_smart_task_closed_loop.py"]):
             args = runner.parse_args()
         self.assertEqual(args.task, "LeIsaac-SO101-SmartTask-v0")
         self.assertEqual(args.scene_profile, "task-default")
+        self.assertEqual(args.red24_material_resolved, "asset")
+        self.assertEqual(args.so101_robot_material, "auto")
+        self.assertEqual(args.so101_robot_material_resolved, "asset")
+
+    def test_real_degree_checkpoint_auto_selects_pure_red_2x4_material(self) -> None:
+        argv = [
+            "run_smart_task_closed_loop.py",
+            "--deployment-mode",
+            "so101-finetuned",
+            "--so101-checkpoint-joint-units",
+            "degrees",
+        ]
+        with patch.object(sys, "argv", argv):
+            args = runner.parse_args()
+        self.assertEqual(args.red24_material, "auto")
+        self.assertEqual(args.red24_material_resolved, "real-red")
+
+    def test_real_degree_checkpoint_auto_selects_white_so101_material(self) -> None:
+        argv = [
+            "run_smart_task_closed_loop.py",
+            "--deployment-mode",
+            "so101-finetuned",
+            "--so101-checkpoint-joint-units",
+            "degrees",
+        ]
+        with patch.object(sys, "argv", argv):
+            args = runner.parse_args()
+
+        self.assertEqual(args.so101_robot_material, "auto")
+        self.assertEqual(args.so101_robot_material_resolved, "real-white")
+
+    def test_explicit_asset_so101_material_overrides_real_auto_selection(self) -> None:
+        argv = [
+            "run_smart_task_closed_loop.py",
+            "--deployment-mode",
+            "so101-finetuned",
+            "--so101-checkpoint-joint-units",
+            "degrees",
+            "--so101-robot-material",
+            "asset",
+        ]
+        with patch.object(sys, "argv", argv):
+            args = runner.parse_args()
+
+        self.assertEqual(args.so101_robot_material_resolved, "asset")
+
+    def test_real_white_so101_material_rejects_non_so101_robot(self) -> None:
+        argv = [
+            "run_smart_task_closed_loop.py",
+            "--robot",
+            "franka",
+            "--so101-robot-material",
+            "real-white",
+        ]
+        with patch.object(sys, "argv", argv), self.assertRaisesRegex(
+            ValueError,
+            "requires --robot so101",
+        ):
+            runner.parse_args()
+
+    def test_explicit_asset_material_overrides_real_auto_selection(self) -> None:
+        argv = [
+            "run_smart_task_closed_loop.py",
+            "--deployment-mode",
+            "so101-finetuned",
+            "--so101-checkpoint-joint-units",
+            "degrees",
+            "--red24-material",
+            "asset",
+        ]
+        with patch.object(sys, "argv", argv):
+            args = runner.parse_args()
+        self.assertEqual(args.red24_material_resolved, "asset")
+
+    def test_sim_checkpoint_can_explicitly_request_real_red_material(self) -> None:
+        argv = [
+            "run_smart_task_closed_loop.py",
+            "--red24-material",
+            "real-red",
+        ]
+        with patch.object(sys, "argv", argv):
+            args = runner.parse_args()
+        self.assertEqual(args.red24_material_resolved, "real-red")
+
+    def test_real_white_changes_only_so101_printed_material_shader(self) -> None:
+        printed_path = (
+            "/World/envs/env_0/Robot/Looks/material_a_3d_printed/Shader"
+        )
+        motor_path = "/World/envs/env_0/Robot/Looks/material_sts3215/Shader"
+        printed_attr = _FakeUsdAttribute((1.0, 0.82, 0.12))
+        motor_attr = _FakeUsdAttribute((0.1, 0.1, 0.1))
+        stage = _FakeUsdStage(
+            [
+                _FakeUsdPrim(printed_path, printed_attr),
+                _FakeUsdPrim(motor_path, motor_attr),
+            ]
+        )
+
+        env = SimpleNamespace(
+            num_envs=1,
+            cfg=SimpleNamespace(rerender_on_reset=False),
+        )
+        summary = runner.apply_so101_robot_material(
+            env,
+            "real-white",
+            requested_material="auto",
+            stage=stage,
+        )
+
+        self.assertEqual(printed_attr.value, (1.0, 1.0, 1.0))
+        self.assertEqual(printed_attr.set_calls, [(1.0, 1.0, 1.0)])
+        self.assertEqual(motor_attr.value, (0.1, 0.1, 0.1))
+        self.assertEqual(motor_attr.set_calls, [])
+        self.assertTrue(summary["applied"])
+        self.assertTrue(summary["changed"])
+        self.assertTrue(summary["rerender_on_reset"])
+        self.assertTrue(env.cfg.rerender_on_reset)
+        self.assertEqual(summary["matched_shader_paths"], [printed_path])
+        self.assertEqual(
+            summary["diffuse_color_before"][printed_path],
+            [1.0, 0.82, 0.12],
+        )
+        self.assertEqual(
+            summary["diffuse_color_after"][printed_path],
+            [1.0, 1.0, 1.0],
+        )
+
+    def test_real_white_fails_before_editing_on_abnormal_shader_count(self) -> None:
+        first_attr = _FakeUsdAttribute((1.0, 0.82, 0.12))
+        second_attr = _FakeUsdAttribute((1.0, 0.82, 0.12))
+        stage = _FakeUsdStage(
+            [
+                _FakeUsdPrim(
+                    "/World/envs/env_0/Robot/Looks/material_a_3d_printed/Shader",
+                    first_attr,
+                ),
+                _FakeUsdPrim(
+                    "/World/envs/env_1/Robot/Looks/material_a_3d_printed/Shader",
+                    second_attr,
+                ),
+            ]
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "expected=1 matched=2"):
+            runner.apply_so101_robot_material(
+                SimpleNamespace(
+                    num_envs=1,
+                    cfg=SimpleNamespace(rerender_on_reset=False),
+                ),
+                "real-white",
+                stage=stage,
+            )
+
+        self.assertEqual(first_attr.set_calls, [])
+        self.assertEqual(second_attr.set_calls, [])
+
+    def test_real_white_fails_on_missing_shader_or_omniverse_input(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "expected=1 matched=0"):
+            runner.apply_so101_robot_material(
+                SimpleNamespace(
+                    num_envs=1,
+                    cfg=SimpleNamespace(rerender_on_reset=False),
+                ),
+                "real-white",
+                stage=_FakeUsdStage([]),
+            )
+
+        invalid_attr = _FakeUsdAttribute(valid=False)
+        stage = _FakeUsdStage(
+            [
+                _FakeUsdPrim(
+                    "/World/envs/env_0/Robot/Looks/material_a_3d_printed/Shader",
+                    invalid_attr,
+                )
+            ]
+        )
+        with self.assertRaisesRegex(RuntimeError, "missing OmniPBR input"):
+            runner.apply_so101_robot_material(
+                SimpleNamespace(
+                    num_envs=1,
+                    cfg=SimpleNamespace(rerender_on_reset=False),
+                ),
+                "real-white",
+                stage=stage,
+            )
+        self.assertEqual(invalid_attr.set_calls, [])
+
+    def test_asset_so101_material_preserves_stage_without_lookup(self) -> None:
+        with patch.object(
+            runner,
+            "get_usd_stage",
+            side_effect=AssertionError("asset mode must not inspect the stage"),
+        ):
+            summary = runner.apply_so101_robot_material(
+                SimpleNamespace(num_envs=1),
+                "asset",
+                requested_material="auto",
+            )
+
+        self.assertFalse(summary["applied"])
+        self.assertEqual(summary["resolved"], "asset")
 
     def test_cli_action_horizon_zero_is_the_full_chunk_sentinel(self) -> None:
         with patch.object(sys, "argv", ["run_smart_task_closed_loop.py"]):
@@ -74,6 +333,227 @@ class RunnerCheckpointUnitsTest(unittest.TestCase):
 
         self.assertEqual(default_args.action_horizon, 0)
         self.assertEqual(explicit_args.action_horizon, 0)
+
+    def test_capture_camera_path_is_optional_and_preserved(self) -> None:
+        with patch.object(sys, "argv", ["run_smart_task_closed_loop.py"]):
+            default_args = runner.parse_args()
+        camera_path = "/World/envs/env_0/Scene/camera_front_xform/camera_front"
+        with patch.object(
+            sys,
+            "argv",
+            ["run_smart_task_closed_loop.py", "--capture-camera-path", camera_path],
+        ):
+            explicit_args = runner.parse_args()
+
+        self.assertIsNone(default_args.capture_camera_path)
+        self.assertEqual(explicit_args.capture_camera_path, camera_path)
+
+    def test_viewport_camera_path_is_human_only_and_does_not_enable_capture(self) -> None:
+        camera_path = "/World/envs/env_0/Scene/camera_left_xform/camera_left"
+        with patch.object(
+            sys,
+            "argv",
+            [
+                "run_smart_task_closed_loop.py",
+                "--no-headless",
+                "--viewport-camera-path",
+                camera_path,
+            ],
+        ):
+            args = runner.parse_args()
+
+        self.assertEqual(args.viewport_camera_path, camera_path)
+        self.assertFalse(args.capture_video)
+
+    def test_viewport_camera_path_rejects_headless_and_video_capture(self) -> None:
+        camera_path = "/World/envs/env_0/Scene/camera_left_xform/camera_left"
+        with patch.object(
+            sys,
+            "argv",
+            ["run_smart_task_closed_loop.py", "--viewport-camera-path", camera_path],
+        ), self.assertRaisesRegex(ValueError, "requires --no-headless"):
+            runner.parse_args()
+
+        with patch.object(
+            sys,
+            "argv",
+            [
+                "run_smart_task_closed_loop.py",
+                "--no-headless",
+                "--viewport-camera-path",
+                camera_path,
+                "--capture-video",
+            ],
+        ), self.assertRaisesRegex(ValueError, "human-view-only"):
+            runner.parse_args()
+
+    def test_set_human_viewport_camera_validates_and_switches_camera(self) -> None:
+        class FakePrim:
+            def __init__(self, valid: bool, type_name: str):
+                self._valid = valid
+                self._type_name = type_name
+
+            def IsValid(self) -> bool:
+                return self._valid
+
+            def GetTypeName(self) -> str:
+                return self._type_name
+
+        class FakeStage:
+            def __init__(self, prim):
+                self.prim = prim
+
+            def GetPrimAtPath(self, _path: str):
+                return self.prim
+
+        class FakePath:
+            def __init__(self, path: str):
+                self.pathString = path
+
+        class FakeViewport:
+            def __init__(self):
+                self.camera_path = FakePath("/OmniverseKit_Persp")
+
+            def set_active_camera(self, path: str) -> None:
+                self.camera_path = FakePath(path)
+
+        camera_path = "/World/envs/env_0/Scene/camera_left_xform/camera_left"
+        viewport = FakeViewport()
+        previous_path = runner.set_human_viewport_camera(
+            camera_path,
+            stage=FakeStage(FakePrim(True, "Camera")),
+            viewport=viewport,
+        )
+
+        self.assertEqual(previous_path, "/OmniverseKit_Persp")
+        self.assertEqual(viewport.camera_path.pathString, camera_path)
+
+        with self.assertRaisesRegex(ValueError, "live USD prim"):
+            runner.set_human_viewport_camera(
+                camera_path,
+                stage=FakeStage(FakePrim(False, "Camera")),
+                viewport=viewport,
+            )
+        with self.assertRaisesRegex(ValueError, "USD Camera prim"):
+            runner.set_human_viewport_camera(
+                camera_path,
+                stage=FakeStage(FakePrim(True, "Xform")),
+                viewport=viewport,
+            )
+
+    def test_dynamic_gripper_effort_override_is_optional_and_can_be_disabled(self) -> None:
+        with patch.object(sys, "argv", ["run_smart_task_closed_loop.py"]):
+            default_args = runner.parse_args()
+        with patch.object(
+            sys,
+            "argv",
+            [
+                "run_smart_task_closed_loop.py",
+                "--no-dynamic-reset-gripper-effort-limit",
+            ],
+        ):
+            disabled_args = runner.parse_args()
+
+        self.assertIsNone(default_args.dynamic_reset_gripper_effort_limit)
+        self.assertIs(disabled_args.dynamic_reset_gripper_effort_limit, False)
+
+    def test_explicit_gripper_control_limits_parse_on_finetuned_route(self) -> None:
+        argv = [
+            "run_smart_task_closed_loop.py",
+            "--deployment-mode",
+            "so101-finetuned",
+            "--so101-max-gripper-step-rad",
+            "0.04",
+            "--so101-gripper-effort-limit-sim",
+            "0.1",
+        ]
+        with patch.object(sys, "argv", argv):
+            args = runner.parse_args()
+
+        self.assertAlmostEqual(args.so101_max_gripper_step_rad, 0.04)
+        self.assertAlmostEqual(args.so101_gripper_effort_limit_sim, 0.1)
+
+    def test_explicit_gripper_effort_rejects_dynamic_reset(self) -> None:
+        argv = [
+            "run_smart_task_closed_loop.py",
+            "--deployment-mode",
+            "so101-finetuned",
+            "--so101-gripper-effort-limit-sim",
+            "0.1",
+            "--dynamic-reset-gripper-effort-limit",
+        ]
+        with patch.object(sys, "argv", argv), self.assertRaisesRegex(
+            ValueError,
+            "cannot be combined",
+        ):
+            runner.parse_args()
+
+    def test_explicit_gripper_control_limits_require_finetuned_route(self) -> None:
+        argv = [
+            "run_smart_task_closed_loop.py",
+            "--so101-max-gripper-step-rad",
+            "0.04",
+        ]
+        with patch.object(sys, "argv", argv), self.assertRaisesRegex(
+            ValueError,
+            "require the finetuned SO101 joint route",
+        ):
+            runner.parse_args()
+
+    def test_configure_and_validate_explicit_gripper_effort_limit(self) -> None:
+        actuator_cfg = SimpleNamespace(effort_limit_sim=10.0)
+        env_cfg = SimpleNamespace(
+            scene=SimpleNamespace(
+                robot=SimpleNamespace(
+                    actuators={"sts3215-gripper": actuator_cfg},
+                )
+            ),
+            dynamic_reset_gripper_effort_limit=True,
+        )
+        args = SimpleNamespace(
+            deployment_mode="so101-finetuned",
+            robot="so101",
+            control_mode="joint",
+            policy_schema="so101-new-embodiment",
+            so101_gripper_effort_limit_sim=0.1,
+        )
+
+        summary = runner.configure_so101_gripper_effort_limit(env_cfg, args)
+
+        self.assertEqual(
+            summary,
+            {
+                "previous_effort_limit_sim": 10.0,
+                "requested_effort_limit_sim": 0.1,
+            },
+        )
+        self.assertAlmostEqual(actuator_cfg.effort_limit_sim, 0.1)
+        self.assertFalse(env_cfg.dynamic_reset_gripper_effort_limit)
+
+        live_limits = torch.full((1, 6), 10.0, dtype=torch.float32)
+        live_limits[0, 5] = 0.1
+        env = SimpleNamespace(
+            cfg=SimpleNamespace(dynamic_reset_gripper_effort_limit=False),
+            scene={
+                "robot": SimpleNamespace(
+                    data=SimpleNamespace(
+                        joint_names=[
+                            "shoulder_pan",
+                            "shoulder_lift",
+                            "elbow_flex",
+                            "wrist_flex",
+                            "wrist_roll",
+                            "gripper",
+                        ],
+                        joint_effort_limits=live_limits,
+                    ),
+                )
+            },
+        )
+        self.assertAlmostEqual(
+            runner.validate_so101_gripper_effort_limit(env, args),
+            0.1,
+        )
 
     def test_cli_rejects_negative_action_horizon(self) -> None:
         argv = ["run_smart_task_closed_loop.py", "--action-horizon", "-1"]
@@ -142,7 +622,7 @@ class RunnerCheckpointUnitsTest(unittest.TestCase):
         argv = [
             "run_smart_task_closed_loop.py",
             "--scene-profile",
-            "multi-lego-tray",
+            "multi-lego-tray-raw-a",
             "--target-object-key",
             "red_2x2_lego_brick",
             "--instruction",
@@ -150,7 +630,7 @@ class RunnerCheckpointUnitsTest(unittest.TestCase):
         ]
         with patch.object(sys, "argv", argv):
             args = runner.parse_args()
-        self.assertEqual(args.scene_profile, "multi-lego-tray")
+        self.assertEqual(args.scene_profile, "multi-lego-tray-raw-a")
         self.assertEqual(args.target_object_key, "red_2x2_lego_brick")
 
     def test_cli_preserves_explicit_task_id(self) -> None:
@@ -188,6 +668,97 @@ class RunnerCheckpointUnitsTest(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, r"--smart-target-\*"):
             runner.install_smart_task_asset_patch(args)
+
+    def test_task_owned_default_scene_rejects_unverifiable_real_red_override(self) -> None:
+        args = SimpleNamespace(
+            scene_profile=runner.scene_profiles.TASK_DEFAULT_SCENE_PROFILE,
+            task="LeIsaac-SO101-SmartTask-Blue-v0",
+            smart_scene_usd="auto",
+            smart_target_asset="auto",
+            smart_target_pos=None,
+            smart_target_prim_path=runner.SMART_TARGET_MANAGED_PRIM_PATH,
+            smart_target_cuboid_size=runner.SMART_TARGET_CUBOID_SIZE,
+            red24_material_resolved=runner.scene_profiles.RED24_MATERIAL_REAL_RED,
+        )
+        with self.assertRaisesRegex(ValueError, "task-owned task-default scene"):
+            runner.install_smart_task_asset_patch(args)
+
+    def test_task_default_cuboid_uses_resolved_red24_material(self) -> None:
+        class FakeCfg:
+            def __init__(self, **kwargs):
+                for key, value in kwargs.items():
+                    setattr(self, key, value)
+
+        class FakeRigidObjectCfg(FakeCfg):
+            class InitialStateCfg(FakeCfg):
+                pass
+
+        fake_isaaclab = ModuleType("isaaclab")
+        fake_isaaclab.__path__ = []  # type: ignore[attr-defined]
+        fake_sim = ModuleType("isaaclab.sim")
+        for cfg_name in (
+            "CuboidCfg",
+            "RigidBodyPropertiesCfg",
+            "MassPropertiesCfg",
+            "CollisionPropertiesCfg",
+            "RigidBodyMaterialCfg",
+            "PreviewSurfaceCfg",
+        ):
+            setattr(fake_sim, cfg_name, FakeCfg)
+        fake_assets = ModuleType("isaaclab.assets")
+        fake_assets.RigidObjectCfg = FakeRigidObjectCfg
+        fake_isaaclab.sim = fake_sim  # type: ignore[attr-defined]
+
+        def build_env(material: str) -> SimpleNamespace:
+            env_cfg = SimpleNamespace(scene=SimpleNamespace())
+            with patch.dict(
+                sys.modules,
+                {
+                    "isaaclab": fake_isaaclab,
+                    "isaaclab.sim": fake_sim,
+                    "isaaclab.assets": fake_assets,
+                },
+            ):
+                runner.add_smart_target_cfg(
+                    env_cfg,
+                    "cuboid",
+                    runner.SMART_TARGET_MANAGED_PRIM_PATH,
+                    Path("/unused/scene.usd"),
+                    (0.0, 0.25, 0.07),
+                    runner.SMART_TARGET_CUBOID_SIZE,
+                    material,
+                )
+            return env_cfg
+
+        asset_env = build_env(runner.scene_profiles.RED24_MATERIAL_ASSET)
+        real_env = build_env(runner.scene_profiles.RED24_MATERIAL_REAL_RED)
+        asset_material = getattr(
+            asset_env.scene,
+            runner.SMART_TARGET_OBJECT_KEY,
+        ).spawn.visual_material
+        real_material = getattr(
+            real_env.scene,
+            runner.SMART_TARGET_OBJECT_KEY,
+        ).spawn.visual_material
+
+        self.assertEqual(asset_material.diffuse_color, runner.SMART_TARGET_CUBOID_ASSET_COLOR)
+        self.assertEqual(
+            real_material.diffuse_color,
+            runner.scene_profiles.REAL_RED24_DIFFUSE_COLOR,
+        )
+        self.assertEqual(real_material.roughness, runner.SMART_TARGET_CUBOID_ROUGHNESS)
+
+    def test_scene_owned_target_rejects_real_red_instead_of_silent_noop(self) -> None:
+        with self.assertRaisesRegex(ValueError, "runner does not own"):
+            runner.add_smart_target_cfg(
+                SimpleNamespace(scene=SimpleNamespace()),
+                "scene",
+                runner.SMART_TARGET_MANAGED_PRIM_PATH,
+                Path("/unused/scene.usd"),
+                None,
+                runner.SMART_TARGET_CUBOID_SIZE,
+                runner.scene_profiles.RED24_MATERIAL_REAL_RED,
+            )
 
     def test_cli_defaults_to_sim_motor_units(self) -> None:
         with patch.object(sys, "argv", ["run_smart_task_closed_loop.py"]):
@@ -299,7 +870,8 @@ class RunnerCheckpointUnitsTest(unittest.TestCase):
             ),
             rerender_on_reset=False,
         )
-        pose = runner.configure_so101_initial_pose(env_cfg, args)
+        pose = runner.resolve_so101_initial_pose(args)
+        pose = runner.apply_so101_initial_pose(env_cfg, pose)
 
         self.assertIsNotNone(pose)
         self.assertTrue(env_cfg.rerender_on_reset)
@@ -332,7 +904,8 @@ class RunnerCheckpointUnitsTest(unittest.TestCase):
             rerender_on_reset=False,
         )
 
-        self.assertIsNone(runner.configure_so101_initial_pose(env_cfg, args))
+        pose = runner.resolve_so101_initial_pose(args)
+        self.assertIsNone(runner.apply_so101_initial_pose(env_cfg, pose))
         self.assertIs(env_cfg.scene.robot.init_state.joint_pos, authored_joint_pos)
         self.assertFalse(env_cfg.rerender_on_reset)
 
@@ -536,6 +1109,55 @@ class RunnerCheckpointUnitsTest(unittest.TestCase):
             {"top": "camera3", "wrist": "camera2"},
         )
 
+    def test_injected_camera_mapping_accepts_explicit_slot_permutation(self) -> None:
+        args = SimpleNamespace(
+            isaac_front_camera_key="camera2",
+            isaac_left_camera_key="camera1",
+            isaac_wrist_camera_key="camera3",
+        )
+        physical_mapping = {
+            "top": "camera3",
+            "left": "camera2",
+            "wrist": "camera1",
+        }
+
+        selected = runner.apply_injected_camera_mapping(args, physical_mapping)
+
+        self.assertEqual(
+            selected,
+            {"top": "camera2", "left": "camera1", "wrist": "camera3"},
+        )
+
+    def test_injected_camera_mapping_rejects_non_injected_key(self) -> None:
+        args = SimpleNamespace(
+            isaac_front_camera_key="camera4",
+            isaac_left_camera_key=None,
+            isaac_wrist_camera_key=None,
+        )
+        physical_mapping = {
+            "top": "camera3",
+            "left": "camera2",
+            "wrist": "camera1",
+        }
+
+        with self.assertRaisesRegex(ValueError, "only exposes"):
+            runner.apply_injected_camera_mapping(args, physical_mapping)
+
+    def test_injected_camera_mapping_rejects_duplicate_slots(self) -> None:
+        args = SimpleNamespace(
+            isaac_front_camera_key="camera3",
+            isaac_left_camera_key="camera3",
+            isaac_wrist_camera_key="camera1",
+        )
+        physical_mapping = {
+            "top": "camera3",
+            "left": "camera2",
+            "wrist": "camera1",
+        }
+
+        with self.assertRaisesRegex(ValueError, "must use distinct"):
+            runner.apply_injected_camera_mapping(args, physical_mapping)
+
     def test_wrist_only_camera_mapping_accepts_one_live_key(self) -> None:
         policy_obs = {"camera2": torch.zeros((1, 2, 2, 3), dtype=torch.uint8)}
         runner.validate_camera_mapping(policy_obs, {"wrist": "camera2"})
@@ -632,6 +1254,33 @@ class RunnerCheckpointUnitsTest(unittest.TestCase):
         ).numpy()[0]
 
         np.testing.assert_allclose(command[:5], fallback_joint.numpy()[0, :5], atol=2e-6)
+
+    def test_degree_action_records_gripper_step_diagnostics(self) -> None:
+        fallback_joint = torch.tensor(
+            [[0.0, 0.0, 0.0, 0.0, 0.0, 0.279]],
+            dtype=torch.float32,
+        )
+        diagnostics: dict[str, object] = {}
+
+        command = runner.so101_new_embodiment_action_to_leisaac_tensor(
+            {"gripper": np.asarray([[[0.0]]], dtype=np.float32)},
+            "cpu",
+            fallback_joint,
+            max_arm_step_rad=None,
+            max_gripper_step_rad=0.04,
+            checkpoint_arm_units="degrees",
+            diagnostics_out=diagnostics,
+        ).numpy()[0]
+
+        self.assertAlmostEqual(float(command[5]), 0.239, places=6)
+        self.assertTrue(diagnostics["gripper_step_clipped"])
+        self.assertAlmostEqual(float(diagnostics["current_gripper_rad"]), 0.279, places=6)
+        self.assertAlmostEqual(
+            float(diagnostics["applied_gripper_delta_rad"]),
+            -0.04,
+            places=6,
+        )
+        self.assertLess(float(diagnostics["requested_gripper_delta_rad"]), -0.4)
 
 if __name__ == "__main__":
     unittest.main()

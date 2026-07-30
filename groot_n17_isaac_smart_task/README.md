@@ -1,9 +1,13 @@
 # GR00T N1.7 + LeIsaac SmartTask 实验索引
 
-根目录只做导航。按当前任务选择一份 README，不需要从头读完全部文档。
+根目录只做导航。操作、原理和稳定契约已经分开，不需要在一份长 README 中临时拼命令：
 
-操作手册负责“怎么跑”；跨文件语义和代码入口见
-[TECHNICAL_CONTRACTS_ZH.md](TECHNICAL_CONTRACTS_ZH.md)。
+| 需求 | 入口 |
+|---|---|
+| 公司复现五个部署 case | [公司检验操作手册](zero_shot_isaac_smart_task/COMPANY_EVAL_RUNBOOK_ZH.md) |
+| 学习代码与继续诊断 | [代码地图与诊断说明](zero_shot_isaac_smart_task/CODE_MAP_AND_DIAGNOSTICS_ZH.md) |
+| 核对跨文件稳定语义 | [TECHNICAL_CONTRACTS_ZH.md](TECHNICAL_CONTRACTS_ZH.md) |
+| 部署目录总览 | [zero-shot / deploy README](zero_shot_isaac_smart_task/README_ZH.md) |
 
 当前默认 GR00T 环境是 Python 3.12 checkout：`~/Isaac-GR00T-py312`。旧的
 `~/Isaac-GR00T` Python 3.10 checkout 只作为回滚 / 对照环境，不再作为新命令默认路径。
@@ -12,7 +16,7 @@
 
 | 阶段 | 目录 | 主要文件 |
 |---|---|---|
-| Bridge + Isaac 部署 | `zero_shot_isaac_smart_task/` | camera check、dry-run、one-step、zero-shot 对照 |
+| Bridge + Isaac 部署 | `zero_shot_isaac_smart_task/` | 五张公司运行卡、camera/dry-run/one-step、trace/contact/replay |
 | Full fine-tune | `full_finetune_so101/` | 训练入口、AWS Ubuntu 迁移说明、参数参考、modality configs |
 | Low-memory / LoRA / freeze | `lowmem_lora_freeze_so101/` | `train_so101_synthetic_groot_lowmem.py` |
 | Ubuntu 环境搭建 | `ubuntu_env_setup/` | `README_ZH.md` |
@@ -37,6 +41,8 @@ source /home/yzliu/physical_ai/company_project/smart_project/experiments/groot_n
 AWS 只跑 full FT       -> full_finetune_so101/AWS_UBUNTU_FULL_FINETUNE_ZH.md
 full FT OOM            -> lowmem_lora_freeze_so101/README_ZH.md
 部署 checkpoint        -> zero_shot_isaac_smart_task/README_ZH.md
+公司复现五个 case      -> zero_shot_isaac_smart_task/COMPANY_EVAL_RUNBOOK_ZH.md
+学习代码 / 继续诊断    -> zero_shot_isaac_smart_task/CODE_MAP_AND_DIAGNOSTICS_ZH.md
 ```
 
 所有命令都以子目录入口为准；根目录只保留这个 README。

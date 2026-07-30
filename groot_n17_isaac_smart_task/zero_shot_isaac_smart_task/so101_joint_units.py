@@ -187,6 +187,7 @@ def safe_absolute_dataset_target_to_isaac_rad(
     arm_units: str,
     arm_target_scale: float = 1.0,
     max_arm_step_rad: float | None = 0.08,
+    max_gripper_step_rad: float | None = None,
     runtime_joint_limits_rad: Any | None = None,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     """Safely convert one decoded absolute GR00T action to an Isaac target.
@@ -225,8 +226,28 @@ def safe_absolute_dataset_target_to_isaac_rad(
         if bound > 0.0:
             applied_arm_delta = np.clip(applied_arm_delta, -bound, bound)
 
+    requested_gripper_delta = float(absolute_target_rad[5] - current[5])
+    applied_gripper_delta = requested_gripper_delta
+    if max_gripper_step_rad is not None:
+        gripper_bound = float(max_gripper_step_rad)
+        if not np.isfinite(gripper_bound):
+            raise ValueError(
+                "max_gripper_step_rad must be finite or None, "
+                f"got {max_gripper_step_rad}"
+            )
+        if gripper_bound < 0.0:
+            raise ValueError(
+                "max_gripper_step_rad must be non-negative or None, "
+                f"got {max_gripper_step_rad}"
+            )
+        if gripper_bound > 0.0:
+            applied_gripper_delta = float(
+                np.clip(requested_gripper_delta, -gripper_bound, gripper_bound)
+            )
+
     command = absolute_target_rad.copy()
     command[:5] = current[:5] + applied_arm_delta
+    command[5] = current[5] + applied_gripper_delta
 
     runtime_limit_clipped = False
     if runtime_joint_limits_rad is not None:
@@ -254,5 +275,13 @@ def safe_absolute_dataset_target_to_isaac_rad(
         "absolute_target_rad": absolute_target_rad,
         "requested_arm_delta_rad": requested_arm_delta,
         "applied_arm_delta_rad": applied_arm_delta,
+        "gripper_step_clipped": not np.isclose(
+            applied_gripper_delta,
+            requested_gripper_delta,
+            atol=1e-7,
+            rtol=0.0,
+        ),
+        "requested_gripper_delta_rad": requested_gripper_delta,
+        "applied_gripper_delta_rad": applied_gripper_delta,
     }
     return command.astype(np.float32), diagnostics

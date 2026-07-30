@@ -1,7 +1,25 @@
-# SmartTask 代码阅读约定
+# SmartTask 技术契约
 
-这是一份代码地图，不是操作手册。运行命令看各阶段 README；准备修改 bridge、runner、
-相机布局或 action 语义时，先确认下面这些跨文件约定。
+这份文件只记录跨文件必须保持一致的稳定语义，不是操作手册，也不重复代码目录说明。
+
+- 公司复制运行：[公司检验操作手册](zero_shot_isaac_smart_task/COMPANY_EVAL_RUNBOOK_ZH.md)
+- 代码构成与诊断：[代码地图与诊断说明](zero_shot_isaac_smart_task/CODE_MAP_AND_DIAGNOSTICS_ZH.md)
+- 部署入口：[部署 README](zero_shot_isaac_smart_task/README_ZH.md)
+
+准备修改 bridge、runner、相机布局或 action 语义时，先确认下面这些跨文件约定。
+
+## 0. 验证来源边界
+
+正式质量验证按数据来源闭环：
+
+```text
+真机采集数据 -> 真机验证
+仿真采集数据 -> 同一套仿真协议验证
+```
+
+真机数据 checkpoint 在 Isaac 中仍可运行，用于验证 checkpoint 加载、modality、相机
+slot、单位转换、动作执行和接触物理；但交叉域成功率不能替代真机模型质量结论。侵入问题
+可以继续通过 contact probe 和 exact replay 诊断，只是当前优先级低于同域正式验证。
 
 ## 1. 推荐阅读顺序
 
@@ -15,7 +33,7 @@
 5. [纯 Python 回归测试](zero_shot_isaac_smart_task/tests/)
 
 先看 config，确定 checkpoint 的输入输出 schema；再沿 bridge 到 runner 看运行时数据流。
-四个小模块是从 runner 拆出的可独立测试边界，不需要启动 SimulationApp。
+这些小模块是从 runner 拆出的可独立测试边界，不需要启动 SimulationApp。
 
 ## 2. 进程和环境边界
 
@@ -36,18 +54,20 @@ checkpoint schema 使用语义角色：
 video.top / video.left / video.wrist
 ```
 
-当前 `leisaac/main` 实际只暴露 wrist=`camera1`。部署 README 采用“保留这条现有 wrist，
-再恢复其余相机”的最小改动示例：
+当前首选路线使用 `--inject-so101-eval-cameras`，在 runner 进程内创建 SO101 eval camera，
+不修改 vendor LeIsaac。注入后的物理角色是：
 
 ```text
-camera3 -> top
-camera2 -> left
-camera1 -> wrist
+camera3 = top/front
+camera2 = left
+camera1 = wrist
 ```
 
-这不是相机编号的固定语义。runner 的历史 `leisaac-current` preset 使用过
-camera3=top、camera1=left、camera2=wrist；部署命令通过三个 `--isaac-...-camera-key`
-显式参数覆盖 preset，因此应以 env cfg 实际暴露的 key 和 runner 启动日志为准。
+已手工恢复三路 sensor 的旧 LeIsaac checkout 仍可省略注入 flag 继续运行。无论 sensor
+来自哪条路径，相机编号都不是 checkpoint 语义；三个 `--isaac-...-camera-key` 参数决定
+model slot。real003 为复现 prepared checkpoint 使用过
+top=`camera2`、left=`camera1`、wrist=`camera3`。runner 会同时打印物理
+`physical_mapping` 和模型 `model_slot_mapping`，两者不能混写。
 
 prepared dataset 的 `camera1/camera2/camera3` 与 live key 不能按名字直接等同。新增 layout
 时必须同时更新训练 config、bridge modality 校验、runner live mapping 和测试。bridge 与
@@ -79,11 +99,16 @@ current_radians + returned_action
 -> 绝对 dataset target 转 radians
 -> arm_target_scale 从当前姿态向目标插值（只作用于前 5 个 arm joints）
 -> max_arm_step_rad 限制一次 policy action 的 arm radian 变化
+-> max_gripper_step_rad 以当前仿真实际 gripper joint 为基准限制一次变化
 -> clip 到 Isaac runtime soft joint limits
 ```
 
 runner 还会核对当前 USD 的 6 个 joint 名称、顺序和范围。更换 SO101 USD、关节顺序、
 符号或范围时，必须同步修改 converter 和测试，不能绕过校验。
+
+可选的 `--so101-gripper-effort-limit-sim` 会在 `gym.make()` 前写入显式 actuator effort，
+并关闭质量驱动的动态 effort reset；环境创建后还会核对 live effort buffer。delta 与 effort
+是部署 actuator envelope，不修改 policy 输出语义，也不能据此宣称 collider 侵入已完全解决。
 
 ### 4.1 SO101 初始姿态与首帧时序
 
@@ -161,6 +186,22 @@ policy 时间基准与 Isaac step 分开。当前数据 30 Hz、env 60 Hz，所�
 `max_arm_step_rad` 是每个 policy action 的位移保护，不是机器人硬件速度规格。正式阈值应由
 验证过的安全速度和 `policy_action_hz` 推导。
 
+### 5.1 随机种子与可复现证据
+
+bridge 的 `--seed` 在模型加载和随机 action sampling 前设置 Python、NumPy 和 torch；
+runner 的 `--seed` 传给 Isaac env。两者属于不同进程，必须分别记录。相同 seed 不保证
+CUDA diffusion 或闭环逐位一致，所以正式 trial 还必须：
+
+```text
+fresh bridge
+-> 固定 bridge seed + Isaac seed
+-> 保存 action trace 的 run_config 和每次 applied command
+-> 需要图像证据时保存 GUI viewport MP4 或 reset camera preflight
+```
+
+exact-action replay 读取 source trace 已保存的 `applied_commands_rad`。严格 replay 必须把
+runner 的 arm/gripper 单步限幅都设为 `0`，避免对 source target 二次限幅。
+
 ## 6. 路线边界
 
 - `so101-finetuned + joint + lerobot_motor_units`：sim 数据 checkpoint，执行绝对 motor target。
@@ -186,10 +227,25 @@ scene wrapper / USD  把基础 scene 与完整 repo-local 资产组合成 live s
 --target-object-key  multi 场景选择哪个刚体；同时用于 metric/debug/termination
 ```
 
-`tray-red24`、`table-red24` 和 `multi-lego-tray` 都在 `experiments/` 内实现，不依赖额外
-task ID，也不修改 `leisaac/`。显式 profile 会停用旧 LEGO composition arc，加载完整红 2x4 /
-红 2x2 USD；蓝 2x4 复用红 2x4 几何并覆盖为蓝色材质。`multi-lego-tray` 必须显式指定 target
-和 instruction，物体 pose 沿用 LeIsaac authored layout。
+全部显式 profile 都在 `experiments/` 内实现，不依赖额外 task ID，也不修改
+`leisaac/`。当前集合以 `scene_profiles.SCENE_PROFILE_CHOICES` 为唯一代码事实，包括：
+
+```text
+tray-red24
+tray-red24-d4-horizontal
+table-red24
+table-red24-d3-horizontal
+table-red24-d3-horizontal-right-front5mm
+table-red24-d3-horizontal-right10mm-front5mm
+multi-lego-tray
+multi-lego-tray-raw-a
+multi-lego-tray-real007-camera-a
+multi-lego-tray-real007-frame5
+multi-lego-tray-real007-frame5-forward2cm
+```
+
+显式 profile 会停用旧 LEGO composition arc，加载完整红 2x4 / 红 2x2 USD；蓝 2x4 复用
+红 2x4 几何并覆盖为蓝色材质。所有 multi profile 都必须显式指定 target 和 instruction。
 
 `tray-red24` 和 `table-red24` 都只有红色 2x4，并共享 single-pick 的完整 pose；前者启用木盘，
 后者停用木盘。`multi-lego-tray` 使用另一套三块 LEGO pose，并将 env cfg 的 success 判据
@@ -209,6 +265,8 @@ runner units 与 checkpoint 的训练数据来源一致
 runner arm/gripper use_default_offset=False，runtime offsets 全零
 runner initial-pose source / units 正确，reset verification 不超过 0.0001 rad
 runner camera-only 与 scene rigid-object 列表通过
+bridge seed 与 runner seed 分开记录
+需要 dual/triple 时，process-local camera 注入或已有 sensor 路线二选一且 mapping 日志正确
 纯 Python tests 通过
 dry-run 通过
 最后才执行 one policy action

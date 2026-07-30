@@ -107,6 +107,71 @@ class So101JointUnitsTest(unittest.TestCase):
         self.assertLessEqual(float(np.max(np.abs(command[:5] - current[:5]))), 0.080001)
         self.assertTrue(np.all(np.isfinite(command)))
 
+    def test_gripper_step_limit_clamps_closing_from_actual_joint(self) -> None:
+        current = np.asarray([0.0, 0.0, 0.0, 0.0, 0.0, 0.279], dtype=np.float32)
+        dataset_target = isaac_rad_to_so101_dataset(
+            np.asarray([0.0, 0.0, 0.0, 0.0, 0.0, -0.127], dtype=np.float32),
+            SO101_ARM_UNITS_DEGREES,
+        )
+        command, diagnostics = safe_absolute_dataset_target_to_isaac_rad(
+            current,
+            dataset_target,
+            arm_units=SO101_ARM_UNITS_DEGREES,
+            max_arm_step_rad=None,
+            max_gripper_step_rad=0.04,
+        )
+
+        self.assertAlmostEqual(float(command[5]), 0.239, places=6)
+        self.assertTrue(diagnostics["gripper_step_clipped"])
+        self.assertAlmostEqual(
+            float(diagnostics["requested_gripper_delta_rad"]),
+            -0.406,
+            places=5,
+        )
+        self.assertAlmostEqual(
+            float(diagnostics["applied_gripper_delta_rad"]),
+            -0.04,
+            places=6,
+        )
+
+    def test_gripper_step_limit_is_symmetric_for_opening(self) -> None:
+        current = np.asarray([0.0, 0.0, 0.0, 0.0, 0.0, -0.14], dtype=np.float32)
+        dataset_target = isaac_rad_to_so101_dataset(
+            np.asarray([0.0, 0.0, 0.0, 0.0, 0.0, 0.35], dtype=np.float32),
+            SO101_ARM_UNITS_LEROBOT_MOTOR,
+        )
+        command, diagnostics = _safe_motor_target(
+            current,
+            dataset_target,
+            max_arm_step_rad=None,
+            max_gripper_step_rad=0.04,
+        )
+
+        self.assertAlmostEqual(float(command[5]), -0.10, places=6)
+        self.assertTrue(diagnostics["gripper_step_clipped"])
+        self.assertAlmostEqual(
+            float(diagnostics["applied_gripper_delta_rad"]),
+            0.04,
+            places=6,
+        )
+
+    def test_zero_gripper_step_limit_preserves_absolute_target(self) -> None:
+        current = np.asarray([0.0, 0.0, 0.0, 0.0, 0.0, 0.279], dtype=np.float32)
+        dataset_target = isaac_rad_to_so101_dataset(
+            np.asarray([0.0, 0.0, 0.0, 0.0, 0.0, -0.127], dtype=np.float32),
+            SO101_ARM_UNITS_DEGREES,
+        )
+        command, diagnostics = safe_absolute_dataset_target_to_isaac_rad(
+            current,
+            dataset_target,
+            arm_units=SO101_ARM_UNITS_DEGREES,
+            max_arm_step_rad=None,
+            max_gripper_step_rad=0.0,
+        )
+
+        self.assertAlmostEqual(float(command[5]), -0.127, places=6)
+        self.assertFalse(diagnostics["gripper_step_clipped"])
+
     def test_unknown_checkpoint_arm_units_are_rejected(self) -> None:
         with self.assertRaisesRegex(ValueError, "arm_units must be one of"):
             isaac_rad_to_so101_dataset(np.zeros(6, dtype=np.float32), "radians")
@@ -186,6 +251,22 @@ class So101JointUnitsTest(unittest.TestCase):
                 np.zeros(6, dtype=np.float32),
                 np.zeros(6, dtype=np.float32),
                 max_arm_step_rad=-0.01,
+            )
+
+    def test_nonfinite_gripper_step_limit_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "must be finite"):
+            _safe_motor_target(
+                np.zeros(6, dtype=np.float32),
+                np.zeros(6, dtype=np.float32),
+                max_gripper_step_rad=np.nan,
+            )
+
+    def test_negative_gripper_step_limit_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "non-negative"):
+            _safe_motor_target(
+                np.zeros(6, dtype=np.float32),
+                np.zeros(6, dtype=np.float32),
+                max_gripper_step_rad=-0.01,
             )
 
 

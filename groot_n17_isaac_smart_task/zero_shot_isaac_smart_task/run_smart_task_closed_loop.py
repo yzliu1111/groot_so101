@@ -24,7 +24,9 @@ from __future__ import annotations
 
 import argparse
 from functools import partial
+import json
 import os
+import re
 import sys
 import time
 import traceback
@@ -114,6 +116,22 @@ SMART_TARGET_OBJECT_KEY = "red_2x4_lego_brick_pick"
 SMART_TARGET_CUBOID_SIZE = (0.0318, 0.0158, 0.0096)
 SMART_TARGET_CUBOID_MASS = 0.02
 SMART_TARGET_MANAGED_PRIM_PATH = f"{{ENV_REGEX_NS}}/Scene/{SMART_TARGET_OBJECT_KEY}_managed"
+SMART_TARGET_CUBOID_ASSET_COLOR = (0.78, 0.05, 0.02)
+SMART_TARGET_CUBOID_ROUGHNESS = 0.55
+
+SO101_ROBOT_MATERIAL_AUTO = "auto"
+SO101_ROBOT_MATERIAL_ASSET = "asset"
+SO101_ROBOT_MATERIAL_REAL_WHITE = "real-white"
+SO101_ROBOT_MATERIAL_CHOICES = (
+    SO101_ROBOT_MATERIAL_AUTO,
+    SO101_ROBOT_MATERIAL_ASSET,
+    SO101_ROBOT_MATERIAL_REAL_WHITE,
+)
+SO101_REAL_WHITE_DIFFUSE_COLOR = (1.0, 1.0, 1.0)
+SO101_PRINTED_MATERIAL_SHADER_PATH_RE = re.compile(
+    r"^/World/envs/env_[^/]+/Robot/Looks/material_a_3d_printed/Shader$"
+)
+SO101_PRINTED_MATERIAL_DIFFUSE_INPUT = "inputs:diffuse_color_constant"
 
 # 让 Python 可以 import 同目录的 wire.py。
 if str(SCRIPT_DIR) not in sys.path:
@@ -132,8 +150,10 @@ for package_path in reversed(LEISAAC_ISAACLAB_PACKAGES):
 # Isaac runner 通过它向 GR00T bridge 发送 observation，并等待 action。
 from action_chunk import action_chunk_length, slice_action_step  # noqa: E402
 from action_timing import resolve_env_steps_per_policy_action  # noqa: E402
+import contact_probe  # noqa: E402
 from pose_math import compose_pose_delta, quat_wxyz_to_rot6d  # noqa: E402
 import scene_profiles  # noqa: E402
+from so101_eval_cameras import configure_so101_eval_cameras  # noqa: E402
 from so101_joint_units import (  # noqa: E402
     SO101_ARM_UNITS_DEGREES,
     SO101_ARM_UNITS_LEROBOT_MOTOR,
@@ -341,6 +361,48 @@ def resolve_camera_mapping(args: argparse.Namespace, env: Any) -> tuple[str, dic
     return profile, mapping
 
 
+def apply_injected_camera_mapping(
+    args: argparse.Namespace,
+    physical_mapping: dict[str, str],
+) -> dict[str, str]:
+    """Apply injected-camera defaults while allowing an explicit slot permutation.
+
+    ``physical_mapping`` records what each live Isaac camera physically is.  An
+    explicitly supplied ``--isaac-*-camera-key`` may permute those live keys to
+    reproduce a checkpoint whose prepared dataset used mislabeled semantic
+    slots.  It may not select a camera that the injection did not create, nor
+    reuse one live camera for multiple model inputs.
+    """
+
+    camera_arg_names = {
+        "top": "isaac_front_camera_key",
+        "left": "isaac_left_camera_key",
+        "wrist": "isaac_wrist_camera_key",
+    }
+    available_keys = set(physical_mapping.values())
+    selected_mapping: dict[str, str] = {}
+
+    for role, default_observation_key in physical_mapping.items():
+        arg_name = camera_arg_names[role]
+        configured_key = getattr(args, arg_name)
+        observation_key = configured_key or default_observation_key
+        if observation_key not in available_keys:
+            raise ValueError(
+                f"Injected SO101 eval camera role {role!r} requested {observation_key!r}, "
+                f"but the injected layout only exposes {sorted(available_keys)!r}"
+            )
+        setattr(args, arg_name, observation_key)
+        selected_mapping[role] = observation_key
+
+    if len(set(selected_mapping.values())) != len(selected_mapping):
+        raise ValueError(
+            "Injected SO101 eval camera roles must use distinct live observation keys; "
+            f"selected mapping={selected_mapping}"
+        )
+
+    return selected_mapping
+
+
 def active_camera_mapping(
     policy_schema: str,
     camera_layout: str,
@@ -520,16 +582,31 @@ def add_smart_target_cfg(
     scene_usd_path: Path,
     target_pos: tuple[float, float, float] | None,
     cuboid_size: tuple[float, float, float],
+    red24_material: str = scene_profiles.RED24_MATERIAL_ASSET,
 ) -> None:
     """Register SmartTask's target object without modifying the LeIsaac source tree."""
 
     if target_asset == "scene":
+        if red24_material == scene_profiles.RED24_MATERIAL_REAL_RED:
+            raise ValueError(
+                "Cannot apply --red24-material real-red when --smart-target-asset scene: "
+                "the runner does not own that scene target's spawn material. Use an explicit "
+                "--scene-profile or a runner-owned cuboid/USD target."
+            )
         return
+    if red24_material not in scene_profiles.RED24_MATERIAL_CHOICES:
+        raise ValueError(
+            f"unknown red 2x4 material {red24_material!r}; "
+            f"expected one of {scene_profiles.RED24_MATERIAL_CHOICES}"
+        )
 
     import isaaclab.sim as sim_utils
     from isaaclab.assets import RigidObjectCfg
 
     if target_asset == "cuboid":
+        diffuse_color = SMART_TARGET_CUBOID_ASSET_COLOR
+        if red24_material == scene_profiles.RED24_MATERIAL_REAL_RED:
+            diffuse_color = scene_profiles.REAL_RED24_DIFFUSE_COLOR
         spawn_cfg = sim_utils.CuboidCfg(
             size=cuboid_size,
             rigid_props=sim_utils.RigidBodyPropertiesCfg(max_depenetration_velocity=1.0),
@@ -537,8 +614,8 @@ def add_smart_target_cfg(
             collision_props=sim_utils.CollisionPropertiesCfg(),
             physics_material=sim_utils.RigidBodyMaterialCfg(static_friction=0.9, dynamic_friction=0.7),
             visual_material=sim_utils.PreviewSurfaceCfg(
-                diffuse_color=(0.78, 0.05, 0.02),
-                roughness=0.55,
+                diffuse_color=diffuse_color,
+                roughness=SMART_TARGET_CUBOID_ROUGHNESS,
             ),
         )
     else:
@@ -549,11 +626,18 @@ def add_smart_target_cfg(
             target_usd_path = target_usd_path.resolve()
         if not target_usd_path.exists():
             raise FileNotFoundError(f"--smart-target-asset USD path does not exist: {target_usd_path}")
+        spawn_kwargs: dict[str, Any] = {}
+        if red24_material == scene_profiles.RED24_MATERIAL_REAL_RED:
+            spawn_kwargs["visual_material"] = sim_utils.PreviewSurfaceCfg(
+                diffuse_color=scene_profiles.REAL_RED24_DIFFUSE_COLOR,
+                roughness=scene_profiles.REAL_RED24_ROUGHNESS,
+            )
         spawn_cfg = sim_utils.UsdFileCfg(
             usd_path=str(target_usd_path),
             rigid_props=sim_utils.RigidBodyPropertiesCfg(max_depenetration_velocity=1.0),
             mass_props=sim_utils.MassPropertiesCfg(mass=SMART_TARGET_CUBOID_MASS),
             collision_props=sim_utils.CollisionPropertiesCfg(),
+            **spawn_kwargs,
         )
 
     pos, rot = smart_target_pose_from_scene(scene_usd_path, target_pos)
@@ -570,7 +654,8 @@ def add_smart_target_cfg(
         "[runner] SmartTask target cfg "
         f"key={SMART_TARGET_OBJECT_KEY} source={target_asset} prim_path={target_prim_path} "
         f"init_pos={tuple(round(float(v), 4) for v in pos)} "
-        f"cuboid_size={tuple(round(float(v), 4) for v in cuboid_size)}",
+        f"cuboid_size={tuple(round(float(v), 4) for v in cuboid_size)} "
+        f"red24_material={red24_material}",
         flush=True,
     )
 
@@ -596,6 +681,45 @@ def validate_scene_profile_asset_args(args: argparse.Namespace) -> None:
             "--scene-profile owns its LEGO assets and poses; do not combine an explicit profile "
             "with --smart-target-* legacy overrides"
         )
+
+
+RED24_MATERIAL_AUTO = "auto"
+
+
+def resolve_so101_robot_material(
+    requested_material: str,
+    checkpoint_arm_units: str,
+) -> str:
+    """Match SO101 robot appearance to real- versus sim-data checkpoints."""
+
+    if requested_material == SO101_ROBOT_MATERIAL_AUTO:
+        if checkpoint_arm_units == SO101_ARM_UNITS_DEGREES:
+            return SO101_ROBOT_MATERIAL_REAL_WHITE
+        return SO101_ROBOT_MATERIAL_ASSET
+    if requested_material not in SO101_ROBOT_MATERIAL_CHOICES:
+        raise ValueError(
+            f"unknown SO101 robot material {requested_material!r}; expected "
+            f"{SO101_ROBOT_MATERIAL_CHOICES}"
+        )
+    return requested_material
+
+
+def resolve_red24_material(
+    requested_material: str,
+    checkpoint_arm_units: str,
+) -> str:
+    """Resolve the real-data red 2x4 override without changing sim checkpoints."""
+
+    if requested_material == RED24_MATERIAL_AUTO:
+        if checkpoint_arm_units == SO101_ARM_UNITS_DEGREES:
+            return scene_profiles.RED24_MATERIAL_REAL_RED
+        return scene_profiles.RED24_MATERIAL_ASSET
+    if requested_material not in scene_profiles.RED24_MATERIAL_CHOICES:
+        raise ValueError(
+            f"unknown red 2x4 material {requested_material!r}; expected "
+            f"{(RED24_MATERIAL_AUTO, *scene_profiles.RED24_MATERIAL_CHOICES)}"
+        )
+    return requested_material
 
 
 def install_scene_profile_patch(args: argparse.Namespace) -> Path:
@@ -627,10 +751,12 @@ def install_scene_profile_patch(args: argparse.Namespace) -> Path:
             env_cfg,
             args.scene_profile,
             lego_asset_dir,
+            red24_material=args.red24_material_resolved,
         )
         print(
             f"[runner] scene profile objects={list(added_keys)} tray_active="
-            f"{scene_profiles.get_scene_profile(args.scene_profile).tray_active}",
+            f"{scene_profiles.get_scene_profile(args.scene_profile).tray_active} "
+            f"red24_material={args.red24_material_resolved}",
             flush=True,
         )
         return result
@@ -674,6 +800,11 @@ def install_smart_task_asset_patch(args: argparse.Namespace) -> Path | None:
                 "legacy LeIsaac-SO101-SmartTask-v0 scene. The selected task must own its scene "
                 "and target assets."
             )
+        if args.red24_material_resolved == scene_profiles.RED24_MATERIAL_REAL_RED:
+            raise ValueError(
+                "Cannot apply --red24-material real-red to a task-owned task-default scene. "
+                "Use an explicit --scene-profile whose red 2x4 material the runner controls."
+            )
         print(
             f"[runner] selected task owns its scene and target assets: task={args.task!r}",
             flush=True,
@@ -698,6 +829,7 @@ def install_smart_task_asset_patch(args: argparse.Namespace) -> Path | None:
             scene_usd_path,
             target_pos,
             cuboid_size,
+            args.red24_material_resolved,
         )
         return result
 
@@ -711,7 +843,8 @@ def install_smart_task_asset_patch(args: argparse.Namespace) -> Path | None:
     print(
         "[runner] legacy SmartTask asset patch "
         f"scene_usd={scene_usd_path} target_asset={target_asset} "
-        f"target_prim_path={args.smart_target_prim_path}",
+        f"target_prim_path={args.smart_target_prim_path} "
+        f"red24_material={args.red24_material_resolved}",
         flush=True,
     )
     return scene_usd_path
@@ -899,10 +1032,12 @@ def so101_new_embodiment_action_to_leisaac_tensor(
     fallback_joint: torch.Tensor,
     arm_target_scale: float = 1.0,
     max_arm_step_rad: float | None = None,
+    max_gripper_step_rad: float | None = None,
     gripper_min: float | None = None,
     gripper_max: float | None = None,
     runtime_joint_limits: torch.Tensor | np.ndarray | None = None,
     checkpoint_arm_units: str = SO101_ARM_UNITS_LEROBOT_MOTOR,
+    diagnostics_out: dict[str, Any] | None = None,
 ) -> torch.Tensor:
     """Convert decoded absolute dataset actions to safe Isaac radian targets."""
 
@@ -947,6 +1082,7 @@ def so101_new_embodiment_action_to_leisaac_tensor(
         arm_units=checkpoint_arm_units,
         arm_target_scale=arm_target_scale,
         max_arm_step_rad=max_arm_step_rad,
+        max_gripper_step_rad=max_gripper_step_rad,
         runtime_joint_limits_rad=runtime_limits_np,
     )
     if diagnostics["dataset_limit_clipped"]:
@@ -964,8 +1100,31 @@ def so101_new_embodiment_action_to_leisaac_tensor(
             f"applied={diagnostics['applied_arm_delta_rad'].round(4).tolist()}",
             flush=True,
         )
+    if diagnostics["gripper_step_clipped"]:
+        print(
+            "[runner] SO101 safety limited per-policy-action gripper radians "
+            f"requested={diagnostics['requested_gripper_delta_rad']:.4f} "
+            f"applied={diagnostics['applied_gripper_delta_rad']:.4f}",
+            flush=True,
+        )
     if diagnostics["runtime_limit_clipped"]:
         print("[runner] SO101 safety clipped command to Isaac runtime joint limits", flush=True)
+    if diagnostics_out is not None:
+        diagnostics_out.update(
+            {
+                "gripper_step_clipped": bool(diagnostics["gripper_step_clipped"]),
+                "current_gripper_rad": float(current_rad[5]),
+                "absolute_gripper_target_rad": float(
+                    diagnostics["absolute_target_rad"][5]
+                ),
+                "requested_gripper_delta_rad": float(
+                    diagnostics["requested_gripper_delta_rad"]
+                ),
+                "applied_gripper_delta_rad": float(
+                    diagnostics["applied_gripper_delta_rad"]
+                ),
+            }
+        )
 
     return torch.from_numpy(command[None, :]).to(env_device)
 
@@ -1035,6 +1194,7 @@ def action_step_to_leisaac_tensor(
     env_device: str,
     policy_obs: dict[str, torch.Tensor],
     so101_runtime_joint_limits: torch.Tensor | None,
+    diagnostics_out: dict[str, Any] | None = None,
 ) -> torch.Tensor:
     """Slice and convert one policy action according to the selected route."""
 
@@ -1047,9 +1207,11 @@ def action_step_to_leisaac_tensor(
             checkpoint_arm_units=args.so101_checkpoint_arm_units,
             arm_target_scale=args.so101_arm_target_scale,
             max_arm_step_rad=args.so101_max_arm_step_rad,
+            max_gripper_step_rad=args.so101_max_gripper_step_rad,
             gripper_min=args.so101_gripper_min,
             gripper_max=args.so101_gripper_max,
             runtime_joint_limits=so101_runtime_joint_limits,
+            diagnostics_out=diagnostics_out,
         )
 
     if args.control_mode == "eef":
@@ -1132,6 +1294,178 @@ def get_usd_stage(env: Any) -> Any | None:
         return omni.usd.get_context().get_stage()
     except Exception:  # noqa: BLE001 - debug helper should be best-effort.
         return None
+
+
+def apply_so101_robot_material(
+    env: Any,
+    resolved_material: str,
+    *,
+    requested_material: str | None = None,
+    stage: Any | None = None,
+    expected_shader_count: int | None = None,
+) -> dict[str, Any]:
+    """Apply the real-robot white plastic color as a process-local USD opinion.
+
+    The SO101 asset uses a dedicated ``material_a_3d_printed`` OmniPBR shader
+    for its yellow printed structure and a separate ``material_sts3215`` shader
+    for the dark motors.  Editing only the former's diffuse input keeps motor
+    appearance, geometry, collision, mass, and articulation properties intact.
+
+    All target shaders are validated before any input is authored so a missing
+    or unexpectedly duplicated material fails without leaving a partial
+    override in the live stage.
+    """
+
+    if requested_material is None:
+        requested_material = resolved_material
+    summary: dict[str, Any] = {
+        "requested": requested_material,
+        "resolved": resolved_material,
+        "applied": False,
+        "expected_shader_count": 0,
+        "matched_shader_paths": [],
+        "diffuse_color_before": {},
+        "diffuse_color_after": {},
+        "rerender_on_reset": False,
+    }
+
+    if resolved_material == SO101_ROBOT_MATERIAL_ASSET:
+        print(
+            "[runner] SO101 robot material "
+            f"requested={requested_material} resolved={resolved_material}; "
+            "preserving authored USD appearance",
+            flush=True,
+        )
+        return summary
+    if resolved_material != SO101_ROBOT_MATERIAL_REAL_WHITE:
+        raise ValueError(
+            "SO101 robot material must be resolved before stage application; "
+            f"got {resolved_material!r}"
+        )
+
+    if stage is None:
+        stage = get_usd_stage(env)
+    if stage is None:
+        raise RuntimeError(
+            "--so101-robot-material real-white could not resolve the live USD stage"
+        )
+
+    if expected_shader_count is None:
+        expected_shader_count = int(getattr(env, "num_envs", 1))
+    expected_shader_count = int(expected_shader_count)
+    if expected_shader_count < 1:
+        raise ValueError(
+            "expected SO101 printed-material shader count must be positive; "
+            f"got {expected_shader_count}"
+        )
+    summary["expected_shader_count"] = expected_shader_count
+
+    matched_prims: list[tuple[str, Any]] = []
+    for prim in stage.Traverse():
+        prim_path_value = prim.GetPath()
+        prim_path = getattr(prim_path_value, "pathString", str(prim_path_value))
+        if SO101_PRINTED_MATERIAL_SHADER_PATH_RE.fullmatch(prim_path):
+            matched_prims.append((prim_path, prim))
+
+    matched_paths = [path for path, _ in matched_prims]
+    summary["matched_shader_paths"] = matched_paths
+    if len(matched_prims) != expected_shader_count:
+        raise RuntimeError(
+            "--so101-robot-material real-white expected exactly one printed-material "
+            f"shader per environment: expected={expected_shader_count} "
+            f"matched={len(matched_prims)} paths={matched_paths}"
+        )
+
+    validated_inputs: list[tuple[str, Any, tuple[float, float, float]]] = []
+    for prim_path, prim in matched_prims:
+        if prim.GetTypeName() != "Shader":
+            raise RuntimeError(
+                "SO101 printed-material path is not a USD Shader: "
+                f"path={prim_path} type={prim.GetTypeName()!r}"
+            )
+        diffuse_attr = prim.GetAttribute(SO101_PRINTED_MATERIAL_DIFFUSE_INPUT)
+        attr_is_valid = diffuse_attr is not None and (
+            not hasattr(diffuse_attr, "IsValid") or diffuse_attr.IsValid()
+        )
+        if not attr_is_valid:
+            raise RuntimeError(
+                "SO101 printed-material shader is missing OmniPBR input "
+                f"{SO101_PRINTED_MATERIAL_DIFFUSE_INPUT!r}: path={prim_path}"
+            )
+        raw_color = diffuse_attr.Get()
+        try:
+            before_color = tuple(float(component) for component in raw_color)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "SO101 printed-material diffuse input is not a numeric color3: "
+                f"path={prim_path} value={raw_color!r}"
+            ) from exc
+        if len(before_color) != 3 or not all(np.isfinite(before_color)):
+            raise RuntimeError(
+                "SO101 printed-material diffuse input is not a finite color3: "
+                f"path={prim_path} value={before_color!r}"
+            )
+        validated_inputs.append((prim_path, diffuse_attr, before_color))
+
+    env_cfg = getattr(env, "cfg", None)
+    if env_cfg is None:
+        raise RuntimeError(
+            "--so101-robot-material real-white requires env.cfg so the first "
+            "policy camera frame can be rerendered"
+        )
+    # ManagerBasedEnv.reset() renders RTX sensors before computing its returned
+    # observation when this flag is true.  Since this material opinion is
+    # authored before the runner's first reset(), the first policy frame cannot
+    # reuse the yellow frame rendered during environment construction.
+    env_cfg.rerender_on_reset = True
+
+    for prim_path, diffuse_attr, _ in validated_inputs:
+        if diffuse_attr.Set(SO101_REAL_WHITE_DIFFUSE_COLOR) is False:
+            raise RuntimeError(
+                f"failed to author SO101 real-white diffuse input at {prim_path}"
+            )
+
+    after_colors: dict[str, list[float]] = {}
+    before_colors: dict[str, list[float]] = {}
+    changed = False
+    for prim_path, diffuse_attr, before_color in validated_inputs:
+        after_color = tuple(float(component) for component in diffuse_attr.Get())
+        if len(after_color) != 3 or not np.allclose(
+            after_color,
+            SO101_REAL_WHITE_DIFFUSE_COLOR,
+            rtol=0.0,
+            atol=1e-6,
+        ):
+            raise RuntimeError(
+                "SO101 real-white diffuse input did not persist: "
+                f"path={prim_path} after={after_color!r}"
+            )
+        before_colors[prim_path] = list(before_color)
+        after_colors[prim_path] = list(after_color)
+        changed = changed or not np.allclose(
+            before_color,
+            after_color,
+            rtol=0.0,
+            atol=1e-6,
+        )
+
+    summary.update(
+        {
+            "applied": True,
+            "changed": bool(changed),
+            "diffuse_color_before": before_colors,
+            "diffuse_color_after": after_colors,
+            "rerender_on_reset": True,
+        }
+    )
+    print(
+        "[runner] SO101 robot material "
+        f"requested={requested_material} resolved={resolved_material} "
+        f"shader_paths={matched_paths} before={before_colors} after={after_colors}; "
+        "material_sts3215 and physics unchanged; rerender_on_reset=True",
+        flush=True,
+    )
+    return summary
 
 
 def usd_world_pose(stage: Any, prim_path: str) -> tuple[np.ndarray, np.ndarray] | None:
@@ -1353,6 +1687,7 @@ def smart_task_metrics(env: Any, robot_kind: str, target_object_name: str) -> di
     - `gripper`：SO101 gripper joint 当前值，或 Franka finger 平均开口。
 
     这些不是严格成功判据，只是帮助我们观察动作有没有朝正确方向发展。
+    这里保留原来的三个纯标量字段，避免破坏既有 JSONL 分析脚本。
     """
 
     lego = env.scene[target_object_name]
@@ -1373,6 +1708,27 @@ def smart_task_metrics(env: Any, robot_kind: str, target_object_name: str) -> di
         "lego_z_minus_base": float((lego_pos[2] - base_z).detach().cpu()),
         "jaw_to_lego": float(torch.linalg.vector_norm(lego_pos - jaw_pos).detach().cpu()),
         "gripper": float(gripper.detach().cpu()),
+    }
+
+
+def smart_task_spatial_metrics(env: Any, target_object_name: str) -> dict[str, Any]:
+    """Return additive XYZ diagnostics without changing legacy metric fields.
+
+    `jaw_minus_lego_w_m` uses the Isaac world frame and is signed: positive Z
+    means the jaw frame is above the LEGO root.  Recording both absolute
+    positions distinguishes jaw motion from an object that was pushed away.
+    """
+
+    lego_pos = env.scene[target_object_name].data.root_pos_w[0]
+    jaw_pos = env.scene["ee_frame"].data.target_pos_w[0, 1]
+    jaw_minus_lego = jaw_pos - lego_pos
+    return {
+        "lego_pos_w_m": lego_pos.detach().cpu().tolist(),
+        "jaw_pos_w_m": jaw_pos.detach().cpu().tolist(),
+        "jaw_minus_lego_w_m": jaw_minus_lego.detach().cpu().tolist(),
+        "jaw_to_lego_xy_m": float(
+            torch.linalg.vector_norm(jaw_minus_lego[:2]).detach().cpu()
+        ),
     }
 
 
@@ -1409,6 +1765,225 @@ def summarize_action(action: dict[str, np.ndarray]) -> str:
         else:
             parts.append(f"{key}: shape={tuple(value.shape)} empty")
     return "; ".join(parts)
+
+
+def write_action_trace_record(trace_file: Any | None, record: dict[str, Any]) -> None:
+    """Write one flush-safe JSONL record when action tracing is enabled."""
+
+    if trace_file is None:
+        return
+    trace_file.write(json.dumps(record, ensure_ascii=False, allow_nan=False) + "\n")
+    trace_file.flush()
+
+
+def read_contact_probe_sample(
+    env: Any,
+    sensor_names: tuple[str, ...],
+) -> dict[str, Any]:
+    """Return pairwise PhysX contact data plus mesh-derived fingertip keypoints."""
+
+    sample = contact_probe.read_contact_probe(env, sensor_names)
+    sample["tip_points"] = contact_probe.read_so101_tip_points(
+        env.scene["robot"]
+    )
+    return sample
+
+
+def settle_environment_at_reset_pose(
+    env: Any,
+    policy_obs: dict[str, Any],
+    *,
+    env_steps: int,
+    robot_kind: str,
+    target_object_name: str,
+    contact_sensor_names: tuple[str, ...] = (),
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Advance physics before the first policy observation while holding reset joints.
+
+    ``--warmup-frames`` only fills the temporal image buffer; it does not call
+    ``env.step()``.  Dynamic scene objects therefore need an explicit settling
+    phase when their authored root pose starts above the support surface.
+    The returned records make that state transition visible in the JSONL trace.
+    """
+
+    if env_steps <= 0:
+        return policy_obs, []
+    if "joint_pos" not in policy_obs:
+        raise KeyError("settling requires policy observation key 'joint_pos'")
+
+    hold_command = policy_obs["joint_pos"].detach().clone()
+    records: list[dict[str, Any]] = []
+    for env_step_index in range(1, env_steps + 1):
+        obs, _, terminated, timed_out, _ = env.step(hold_command)
+        policy_obs = obs["policy"]
+        record: dict[str, Any] = {
+            "env_step_index": env_step_index,
+            "joint_pos_rad": tensor_first_row(policy_obs["joint_pos"]).tolist(),
+            "metrics_after": smart_task_metrics(
+                env,
+                robot_kind,
+                target_object_name,
+            ),
+            "spatial_metrics_after": smart_task_spatial_metrics(
+                env,
+                target_object_name,
+            ),
+            "terminated": bool(terminated[0]),
+            "timed_out": bool(timed_out[0]),
+        }
+        if contact_sensor_names:
+            record["contact_probe_after"] = read_contact_probe_sample(
+                env,
+                contact_sensor_names,
+            )
+        records.append(record)
+    return policy_obs, records
+
+
+def restore_robot_frame0_after_settle(
+    env: Any,
+    reset_joint_pos: Any,
+    *,
+    target_object_name: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Restore the exact reset robot state without advancing settled objects.
+
+    Holding the reset action while the target falls can still leave a small
+    gravity-induced articulation error.  Teleport only the robot back to the
+    saved frame-0 joint state, synchronize the action/actuator targets, then
+    forward and render without a physics integration step.  The target rigid
+    body must remain unchanged across this operation.
+    """
+
+    robot = env.scene["robot"]
+    target = env.scene[target_object_name]
+    target_state_before = target.data.root_state_w.detach().clone()
+    joint_pos_before = robot.data.joint_pos.detach().clone()
+    zero_joint_vel = reset_joint_pos.new_zeros(reset_joint_pos.shape)
+
+    robot.write_joint_state_to_sim(reset_joint_pos, zero_joint_vel)
+    env.action_manager.process_action(reset_joint_pos)
+    env.action_manager.apply_action()
+    robot.set_joint_velocity_target(zero_joint_vel)
+    env.scene.write_data_to_sim()
+
+    # The simulation timestamp does not advance during ``forward()``.  Reset
+    # sensor caches so the next policy observation reflects the teleported
+    # robot pose rather than the final settle-step render.
+    reset_sensor_names: list[str] = []
+    for sensor_name, sensor in env.scene.sensors.items():
+        sensor.reset()
+        reset_sensor_names.append(sensor_name)
+
+    env.sim.forward()
+    if env.sim.has_rtx_sensors():
+        env.sim.render()
+    observations = env.observation_manager.compute(update_history=True)
+    policy_obs = observations["policy"]
+
+    target_state_after = target.data.root_state_w.detach().clone()
+    target_state_delta = float(
+        (target_state_after - target_state_before).abs().max().item()
+    )
+    joint_error = float(
+        (robot.data.joint_pos - reset_joint_pos).abs().max().item()
+    )
+    joint_velocity_max = float(robot.data.joint_vel.abs().max().item())
+    if target_state_delta > 1.0e-7:
+        raise RuntimeError(
+            "Restoring the robot frame-0 pose changed the settled target state: "
+            f"max_abs_delta={target_state_delta:.9g}"
+        )
+    if joint_error > 1.0e-6:
+        raise RuntimeError(
+            "Robot frame-0 restoration did not reach the requested joint state: "
+            f"max_abs_error_rad={joint_error:.9g}"
+        )
+
+    return policy_obs, {
+        "method": "robot_joint_state_teleport_without_physics_step",
+        "joint_pos_before_restore_rad": tensor_first_row(joint_pos_before).tolist(),
+        "joint_pos_requested_rad": tensor_first_row(reset_joint_pos).tolist(),
+        "joint_pos_after_restore_rad": tensor_first_row(robot.data.joint_pos).tolist(),
+        "joint_max_abs_error_rad": joint_error,
+        "joint_velocity_max_abs_rad_s": joint_velocity_max,
+        "target_root_state_before_restore": tensor_first_row(
+            target_state_before
+        ).tolist(),
+        "target_root_state_after_restore": tensor_first_row(
+            target_state_after
+        ).tolist(),
+        "target_root_state_max_abs_delta": target_state_delta,
+        "sensors_reset": reset_sensor_names,
+    }
+
+
+def set_human_viewport_camera(
+    camera_path: str,
+    *,
+    stage: Any | None = None,
+    viewport: Any | None = None,
+) -> str:
+    """Select one live USD camera only for the interactive human viewport.
+
+    This function deliberately receives neither policy observations nor the
+    semantic camera mapping.  It does not enable viewport capture.  Optional
+    ``stage`` and ``viewport`` arguments keep the validation independently
+    testable without booting Isaac Sim.
+
+    Returns:
+        The previously active viewport camera path.
+    """
+
+    if stage is None:
+        import omni.usd
+
+        usd_context = omni.usd.get_context()
+        stage = usd_context.get_stage() if usd_context is not None else None
+    if stage is None:
+        raise RuntimeError(
+            f"--viewport-camera-path cannot resolve the live USD stage: {camera_path}"
+        )
+
+    camera_prim = stage.GetPrimAtPath(camera_path)
+    if camera_prim is None or not camera_prim.IsValid():
+        raise ValueError(
+            f"--viewport-camera-path does not resolve to a live USD prim: {camera_path}"
+        )
+    if camera_prim.GetTypeName() != "Camera":
+        raise ValueError(
+            "--viewport-camera-path must resolve to a USD Camera prim: "
+            f"path={camera_path} type={camera_prim.GetTypeName()!r}"
+        )
+
+    if viewport is None:
+        import omni.kit.viewport.utility as viewport_utils
+
+        viewport = viewport_utils.get_active_viewport()
+    if viewport is None:
+        raise RuntimeError(
+            "--viewport-camera-path requires an active interactive viewport; "
+            "run with --no-headless"
+        )
+
+    previous_path_value = getattr(viewport, "camera_path", "")
+    previous_path = getattr(previous_path_value, "pathString", str(previous_path_value))
+    viewport.set_active_camera(camera_path)
+    active_path_value = getattr(viewport, "camera_path", "")
+    active_path = getattr(active_path_value, "pathString", str(active_path_value))
+    if active_path != camera_path:
+        raise RuntimeError(
+            "active viewport rejected --viewport-camera-path: "
+            f"requested={camera_path} active={active_path}"
+        )
+
+    print(
+        "[runner] human viewport camera changed "
+        f"from={previous_path} to={active_path}; "
+        "policy camera mapping unchanged; video capture not enabled",
+        flush=True,
+    )
+    return previous_path
 
 
 def start_viewport_video_capture(args: argparse.Namespace, total_frames: int) -> Any | None:
@@ -1468,8 +2043,21 @@ def start_viewport_video_capture(args: argparse.Namespace, total_frames: int) ->
         capture_name = args.capture_name or f"{args.robot}_{args.control_mode}_{timestamp}"
 
         options = CaptureOptions()
-        # 当前 viewport 使用的 camera path。通常是用户在 viewport 中正在看的相机。
-        options.camera = viewport.camera_path.pathString
+        # By default record the active human-facing viewport.  An explicit
+        # camera path makes evidence reproducible and lets multi-object runs
+        # use the same top camera that is fed to the policy, rather than a
+        # viewport angle that may crop some assets.
+        capture_camera_path = args.capture_camera_path or viewport.camera_path.pathString
+        if args.capture_camera_path is not None:
+            import omni.usd
+
+            stage = omni.usd.get_context().get_stage()
+            camera_prim = stage.GetPrimAtPath(capture_camera_path) if stage is not None else None
+            if camera_prim is None or not camera_prim.IsValid():
+                raise ValueError(
+                    f"--capture-camera-path does not resolve to a live USD prim: {capture_camera_path}"
+                )
+        options.camera = capture_camera_path
         options.output_folder = str(capture_dir)
         options.file_name = capture_name
         options.file_type = ".mp4"
@@ -1504,6 +2092,7 @@ def start_viewport_video_capture(args: argparse.Namespace, total_frames: int) ->
         print(
             "[runner] viewport capture started "
             f"output={capture_dir / (capture_name + '.mp4')} "
+            f"camera={capture_camera_path} "
             f"frames={options.end_frame} fps={options.fps:g} "
             f"resolution={options.res_width}x{options.res_height} "
             f"bitrate={args.capture_bitrate_mbps:g}Mbps",
@@ -1620,6 +2209,14 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--inject-so101-eval-cameras",
+        action="store_true",
+        help=(
+            "Process-locally add the fixed top/left cameras required by dual/triple "
+            "SO101 checkpoint evaluation without modifying the LeIsaac checkout."
+        ),
+    )
+    parser.add_argument(
         "--isaac-exterior-camera-key",
         default=None,
         help="Isaac obs['policy'] key for OXE/DROID exterior_image_1_left.",
@@ -1657,8 +2254,29 @@ def parse_args() -> argparse.Namespace:
         default=scene_profiles.TASK_DEFAULT_SCENE_PROFILE,
         help=(
             "Deployment-time object layout and profile-owned target/configured-success behavior, independent of "
-            "Gym task registration: tray-red24, table-red24, or multi-lego-tray. "
-            "task-default keeps the selected task scene."
+            "Gym task registration. See scene_profiles.SCENE_PROFILE_CHOICES for the complete "
+            "supported set; task-default keeps the selected task scene."
+        ),
+    )
+    parser.add_argument(
+        "--red24-material",
+        choices=(RED24_MATERIAL_AUTO, *scene_profiles.RED24_MATERIAL_CHOICES),
+        default=RED24_MATERIAL_AUTO,
+        help=(
+            "Visual material for managed red 2x4 LEGO assets. auto selects pure "
+            "real-red for degree-unit real-data checkpoints and preserves the "
+            "authored asset material for LeRobot-motor-unit sim checkpoints."
+        ),
+    )
+    parser.add_argument(
+        "--so101-robot-material",
+        choices=SO101_ROBOT_MATERIAL_CHOICES,
+        default=SO101_ROBOT_MATERIAL_AUTO,
+        help=(
+            "SO101 printed-structure appearance. auto selects real-white for "
+            "degree-unit real-data checkpoints and preserves the authored yellow "
+            "asset for LeRobot-motor-unit sim checkpoints. real-white changes only "
+            "material_a_3d_printed; motor material and physics remain unchanged."
         ),
     )
 
@@ -1765,6 +2383,26 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--so101-max-gripper-step-rad",
+        type=float,
+        default=0.0,
+        help=(
+            "Maximum gripper-joint change in Isaac radians per policy action, "
+            "measured from the current simulated joint. The command may be held "
+            "for multiple env steps. Use 0 to disable."
+        ),
+    )
+    parser.add_argument(
+        "--so101-gripper-effort-limit-sim",
+        type=float,
+        default=None,
+        help=(
+            "Optional fixed PhysX effort limit for the SO101 gripper joint. "
+            "Setting this disables LeIsaac's mass-based dynamic effort reset so "
+            "the limit remains explicit and reproducible."
+        ),
+    )
+    parser.add_argument(
         "--so101-gripper-min",
         type=float,
         default=None,
@@ -1775,6 +2413,16 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=None,
         help="Optional upper clamp in the checkpoint gripper's LeRobot [0,100] range.",
+    )
+    parser.add_argument(
+        "--dynamic-reset-gripper-effort-limit",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Override LeIsaac's dynamic SO101 gripper effort-limit reset. "
+            "Use --no-dynamic-reset-gripper-effort-limit to test whether contact-time "
+            "command tracking is being suppressed; omit to preserve the task config."
+        ),
     )
 
     # 请求 GR00T 的次数。每次请求会返回一个 action chunk。
@@ -1853,6 +2501,16 @@ def parse_args() -> argparse.Namespace:
         default=0.0,
         help="Keep Isaac Sim open for this many seconds after the run, useful with --no-headless.",
     )
+    parser.add_argument(
+        "--viewport-camera-path",
+        default=None,
+        help=(
+            "Live USD Camera prim shown only in the interactive human viewport after reset. "
+            "This does not change policy observation camera keys and does not record video. "
+            "Requires --no-headless; example physical-left path: "
+            "/World/envs/env_0/Scene/camera_left_xform/camera_left."
+        ),
+    )
 
     # 只构造 observation 并请求 GR00T，不执行动作。
     parser.add_argument("--dry-run", action="store_true", help="Build and send one obs, but do not step actions.")
@@ -1871,6 +2529,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--capture-name", default=None, help="Output mp4 stem. Default: robot_controlmode_timestamp.")
     parser.add_argument("--capture-width", type=int, default=960)
     parser.add_argument("--capture-height", type=int, default=540)
+    parser.add_argument(
+        "--capture-camera-path",
+        default=None,
+        help=(
+            "Optional live USD camera prim used only for the evidence video. "
+            "The policy observation mapping is unchanged. Default: active viewport camera."
+        ),
+    )
     parser.add_argument("--capture-fps", type=float, default=15.0)
     parser.add_argument("--capture-bitrate-mbps", type=float, default=2.0)
     parser.add_argument(
@@ -1899,6 +2565,34 @@ def parse_args() -> argparse.Namespace:
         "--debug-camera-frame-dir",
         default=None,
         help="Optional directory for saving current policy camera1/camera2/camera3 frames as png.",
+    )
+    parser.add_argument(
+        "--action-trace-jsonl",
+        default=None,
+        help=(
+            "Optional JSONL output path for decoded action chunks, applied commands, "
+            "post-call joint states, and SmartTask metrics."
+        ),
+    )
+    parser.add_argument(
+        "--settle-env-steps",
+        type=int,
+        default=0,
+        help=(
+            "Advance this many physics/environment steps after reset while holding the "
+            "reset joint pose, then build the first policy observation. Defaults to 0 "
+            "for backward compatibility; use this when spawned dynamic objects must "
+            "fall onto their support surface before evaluation."
+        ),
+    )
+    parser.add_argument(
+        "--contact-probe",
+        action="store_true",
+        help=(
+            "Enable opt-in gripper/jaw contact sensors against the selected target and "
+            "record per-physics-substep force, point, normal, and separation data in "
+            "--action-trace-jsonl."
+        ),
     )
 
     args = parser.parse_args()
@@ -1955,6 +2649,35 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("--so101-arm-target-scale must be finite and within [0, 1]")
     if not np.isfinite(args.so101_max_arm_step_rad) or args.so101_max_arm_step_rad < 0.0:
         raise ValueError("--so101-max-arm-step-rad must be finite and non-negative")
+    if (
+        not np.isfinite(args.so101_max_gripper_step_rad)
+        or args.so101_max_gripper_step_rad < 0.0
+    ):
+        raise ValueError(
+            "--so101-max-gripper-step-rad must be finite and non-negative"
+        )
+    if args.so101_gripper_effort_limit_sim is not None and (
+        not np.isfinite(args.so101_gripper_effort_limit_sim)
+        or args.so101_gripper_effort_limit_sim <= 0.0
+    ):
+        raise ValueError(
+            "--so101-gripper-effort-limit-sim must be finite and positive"
+        )
+    if (
+        args.so101_gripper_effort_limit_sim is not None
+        and args.dynamic_reset_gripper_effort_limit is True
+    ):
+        raise ValueError(
+            "--so101-gripper-effort-limit-sim cannot be combined with "
+            "--dynamic-reset-gripper-effort-limit"
+        )
+    if (
+        args.so101_max_gripper_step_rad > 0.0
+        or args.so101_gripper_effort_limit_sim is not None
+    ) and not is_so101_finetuned_joint_route(args):
+        raise ValueError(
+            "SO101 gripper step/effort limits require the finetuned SO101 joint route"
+        )
     for flag, value in (
         ("--so101-gripper-min", args.so101_gripper_min),
         ("--so101-gripper-max", args.so101_gripper_max),
@@ -1973,12 +2696,37 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("--policy-action-hz must be finite and positive")
     if args.warmup_frames < 0:
         raise ValueError("--warmup-frames must be non-negative")
+    if args.settle_env_steps < 0:
+        raise ValueError("--settle-env-steps must be non-negative")
+    if args.settle_env_steps and (
+        args.deployment_mode != "so101-finetuned"
+        or args.robot != "so101"
+        or args.control_mode != "joint"
+    ):
+        raise ValueError(
+            "--settle-env-steps currently requires SO101 finetuned joint control"
+        )
+    if args.contact_probe and args.action_trace_jsonl is None:
+        raise ValueError("--contact-probe requires --action-trace-jsonl")
+    if args.contact_probe and (
+        args.deployment_mode != "so101-finetuned" or args.robot != "so101"
+    ):
+        raise ValueError(
+            "--contact-probe currently requires the SO101 finetuned deployment route"
+        )
     if not np.isfinite(args.timeout_s) or args.timeout_s <= 0.0:
         raise ValueError("--timeout-s must be finite and positive")
     if not np.isfinite(args.render_sleep_s) or args.render_sleep_s < 0.0:
         raise ValueError("--render-sleep-s must be finite and non-negative")
     if not np.isfinite(args.keep_open_s) or args.keep_open_s < 0.0:
         raise ValueError("--keep-open-s must be finite and non-negative")
+    if args.viewport_camera_path is not None and args.headless:
+        raise ValueError("--viewport-camera-path requires --no-headless")
+    if args.viewport_camera_path is not None and args.capture_video:
+        raise ValueError(
+            "--viewport-camera-path is human-view-only and cannot be combined with "
+            "--capture-video"
+        )
     if args.capture_width < 1 or args.capture_height < 1:
         raise ValueError("--capture-width and --capture-height must be positive")
     if not np.isfinite(args.capture_fps) or args.capture_fps <= 0.0:
@@ -2014,6 +2762,19 @@ def parse_args() -> argparse.Namespace:
             raise ValueError("--policy-schema so101-new-embodiment currently requires --control-mode joint")
     if args.debug_cameras_only:
         args.debug_cameras = True
+    args.red24_material_resolved = resolve_red24_material(
+        args.red24_material,
+        args.so101_checkpoint_arm_units,
+    )
+    args.so101_robot_material_resolved = resolve_so101_robot_material(
+        args.so101_robot_material,
+        args.so101_checkpoint_arm_units,
+    )
+    if (
+        args.so101_robot_material_resolved == SO101_ROBOT_MATERIAL_REAL_WHITE
+        and args.robot != "so101"
+    ):
+        raise ValueError("--so101-robot-material real-white requires --robot so101")
     return args
 
 
@@ -2157,15 +2918,6 @@ def apply_so101_initial_pose(
     return pose
 
 
-def configure_so101_initial_pose(
-    env_cfg: Any,
-    args: argparse.Namespace,
-) -> dict[str, Any] | None:
-    """Resolve and apply the SO101 pose; retained as a unit-testable helper."""
-
-    return apply_so101_initial_pose(env_cfg, resolve_so101_initial_pose(args))
-
-
 def configure_so101_absolute_joint_actions(
     env_cfg: Any,
     args: argparse.Namespace,
@@ -2199,6 +2951,95 @@ def configure_so101_absolute_joint_actions(
         flush=True,
     )
     return True
+
+
+def configure_so101_gripper_effort_limit(
+    env_cfg: Any,
+    args: argparse.Namespace,
+) -> dict[str, float] | None:
+    """Apply one explicit gripper effort limit before ``gym.make()``."""
+
+    requested = args.so101_gripper_effort_limit_sim
+    if requested is None:
+        return None
+    if not is_so101_finetuned_joint_route(args):
+        raise ValueError(
+            "--so101-gripper-effort-limit-sim requires the finetuned SO101 joint route"
+        )
+
+    try:
+        actuator_cfg = env_cfg.scene.robot.actuators["sts3215-gripper"]
+    except (AttributeError, KeyError, TypeError) as exc:
+        raise ValueError(
+            "Selected SO101 env cfg does not expose the sts3215-gripper actuator"
+        ) from exc
+    if not hasattr(actuator_cfg, "effort_limit_sim"):
+        raise TypeError(
+            "SO101 sts3215-gripper actuator must expose effort_limit_sim"
+        )
+
+    previous = actuator_cfg.effort_limit_sim
+    actuator_cfg.effort_limit_sim = float(requested)
+    env_cfg.dynamic_reset_gripper_effort_limit = False
+    summary = {
+        "previous_effort_limit_sim": float(previous),
+        "requested_effort_limit_sim": float(requested),
+    }
+    print(
+        "[runner] SO101 explicit gripper effort limit "
+        f"previous={summary['previous_effort_limit_sim']:.6g} "
+        f"requested={summary['requested_effort_limit_sim']:.6g} "
+        "dynamic_reset=False",
+        flush=True,
+    )
+    return summary
+
+
+def validate_so101_gripper_effort_limit(
+    env: Any,
+    args: argparse.Namespace,
+) -> float | None:
+    """Verify the explicit gripper effort limit reached the live articulation."""
+
+    requested = args.so101_gripper_effort_limit_sim
+    if requested is None:
+        return None
+    if env.cfg.dynamic_reset_gripper_effort_limit:
+        raise RuntimeError(
+            "Explicit SO101 gripper effort limit requires dynamic reset to remain disabled"
+        )
+
+    robot_data = env.scene["robot"].data
+    joint_names = tuple(robot_data.joint_names)
+    try:
+        gripper_joint_id = joint_names.index("gripper")
+    except ValueError as exc:
+        raise RuntimeError(
+            f"Live SO101 articulation has no gripper joint: names={joint_names}"
+        ) from exc
+
+    limits = robot_data.joint_effort_limits
+    if (
+        limits.ndim != 2
+        or limits.shape[0] < 1
+        or limits.shape[1] <= gripper_joint_id
+    ):
+        raise RuntimeError(
+            "SO101 joint_effort_limits does not cover the gripper joint: "
+            f"gripper_joint_id={gripper_joint_id} "
+            f"got {tuple(limits.shape)}"
+        )
+    actual = float(limits[0, gripper_joint_id].detach().cpu())
+    if not np.isclose(actual, requested, atol=1e-6, rtol=0.0):
+        raise RuntimeError(
+            "SO101 gripper effort limit did not reach the live articulation: "
+            f"requested={requested} actual={actual}"
+        )
+    print(
+        f"[runner] SO101 live gripper effort limit verified={actual:.6g}",
+        flush=True,
+    )
+    return actual
 
 
 def validate_so101_absolute_joint_actions(
@@ -2343,9 +3184,26 @@ def main() -> None:
 
     # 读取所选 task 的 env config。Gym ID 只代表注册存在；entry-point 缺类时
     # parse_env_cfg 仍会失败，所以这里先打印完整异常并正常关闭 SimulationApp。
+    contact_sensor_names: tuple[str, ...] = ()
     try:
         smart_scene_usd_path = install_smart_task_asset_patch(args)
         env_cfg = parse_env_cfg(args.task, device=args.device, num_envs=1)
+        if args.inject_so101_eval_cameras:
+            if args.deployment_mode != "so101-finetuned" or args.robot != "so101":
+                raise ValueError(
+                    "--inject-so101-eval-cameras requires the SO101 finetuned deployment route"
+                )
+            physical_camera_mapping = configure_so101_eval_cameras(env_cfg, args.camera_layout)
+            selected_camera_mapping = apply_injected_camera_mapping(
+                args,
+                physical_camera_mapping,
+            )
+            print(
+                "[runner] injected SO101 eval cameras "
+                f"physical_mapping={physical_camera_mapping} "
+                f"model_slot_mapping={selected_camera_mapping}",
+                flush=True,
+            )
         scene_profile_target = scene_profiles.resolve_scene_profile_target(
             args.scene_profile,
             args.target_object_key,
@@ -2360,6 +3218,19 @@ def main() -> None:
         else:
             configured_target_object_name = target_name_from_env_cfg(env_cfg)
         args.instruction = resolve_task_instruction(args.instruction, env_cfg, args.task)
+        if args.contact_probe:
+            contact_sensor_names = (
+                contact_probe.configure_so101_target_contact_probe(
+                    env_cfg,
+                    configured_target_object_name,
+                )
+            )
+            print(
+                "[runner] contact probe configured "
+                f"target={configured_target_object_name} "
+                f"sensors={contact_sensor_names}",
+                flush=True,
+            )
     except Exception as exc:
         print(
             f"[runner] task setup failed for {args.task!r}: {type(exc).__name__}: {exc}",
@@ -2371,6 +3242,7 @@ def main() -> None:
         simulation_app.close()
         raise
 
+    gripper_effort_cfg_summary: dict[str, float] | None = None
     try:
         if smart_scene_usd_path is not None and hasattr(env_cfg.scene, "scene"):
             env_cfg.scene.scene.spawn.usd_path = str(smart_scene_usd_path)
@@ -2385,6 +3257,19 @@ def main() -> None:
         env_cfg.use_teleop_device(teleop_device)
         configure_so101_absolute_joint_actions(env_cfg, args)
         apply_so101_initial_pose(env_cfg, configured_initial_pose)
+        gripper_effort_cfg_summary = configure_so101_gripper_effort_limit(
+            env_cfg,
+            args,
+        )
+        if args.dynamic_reset_gripper_effort_limit is not None:
+            env_cfg.dynamic_reset_gripper_effort_limit = (
+                args.dynamic_reset_gripper_effort_limit
+            )
+            print(
+                "[runner] dynamic gripper effort-limit reset override="
+                f"{env_cfg.dynamic_reset_gripper_effort_limit}",
+                flush=True,
+            )
 
         env_cfg.seed = args.seed
 
@@ -2416,9 +3301,27 @@ def main() -> None:
     # 下一个 shell prompt，看起来像“窗口无报错自动关闭”。
     print(f"[runner] creating Isaac env via gym.make(task={args.task!r})", flush=True)
     env = None
+    so101_robot_material_summary: dict[str, Any] = {
+        "requested": args.so101_robot_material,
+        "resolved": args.so101_robot_material_resolved,
+        "applied": False,
+        "reason": f"robot={args.robot}",
+    }
+    live_gripper_effort_limit_sim = None
     try:
         env = gym.make(args.task, cfg=env_cfg).unwrapped
         validate_so101_absolute_joint_actions(env, args)
+        live_gripper_effort_limit_sim = validate_so101_gripper_effort_limit(
+            env,
+            args,
+        )
+        if args.robot == "so101":
+            so101_robot_material_summary = apply_so101_robot_material(
+                env,
+                args.so101_robot_material_resolved,
+                requested_material=args.so101_robot_material,
+                expected_shader_count=int(getattr(env, "num_envs", 1)),
+            )
     except Exception as exc:
         print(
             f"[runner] env creation/validation failed: {type(exc).__name__}: {exc}",
@@ -2439,6 +3342,7 @@ def main() -> None:
     # 相机历史缓存，用于构造 GR00T 的两帧 video 输入。
     history = FrameHistory(horizon=max(args.warmup_frames, 2))
     capture_instance = None
+    action_trace_file = None
 
     try:
         print(
@@ -2480,6 +3384,8 @@ def main() -> None:
         for role, observation_key in camera_mapping.items():
             groot_key = oxe_video_keys[role] if args.policy_schema == "oxe" else role
             print(f"[runner] Isaac obs['policy'][{observation_key!r}] -> GR00T video.{groot_key}", flush=True)
+        if args.viewport_camera_path is not None:
+            set_human_viewport_camera(args.viewport_camera_path)
         print(f"[runner] target object={target_object_name}", flush=True)
         target_asset = env.scene[target_object_name]
         target_cfg = getattr(target_asset, "cfg", None)
@@ -2490,6 +3396,106 @@ def main() -> None:
             f"root_pos_w={format_vec(tensor_first_row(target_asset.data.root_pos_w))}",
             flush=True,
         )
+
+        pre_settle_metrics = smart_task_metrics(
+            env,
+            args.robot,
+            target_object_name,
+        )
+        pre_settle_spatial_metrics = smart_task_spatial_metrics(
+            env,
+            target_object_name,
+        )
+        settle_step_metrics: list[dict[str, Any]] = []
+        settle_pose_restore: dict[str, Any] | None = None
+        if args.settle_env_steps:
+            reset_joint_pos = policy_obs["joint_pos"].detach().clone()
+            print(
+                "[runner] settling dynamic scene before first policy observation "
+                f"env_steps={args.settle_env_steps} physics_dt_s={float(env.physics_dt):.8g}",
+                flush=True,
+            )
+            policy_obs, settle_step_metrics = settle_environment_at_reset_pose(
+                env,
+                policy_obs,
+                env_steps=args.settle_env_steps,
+                robot_kind=args.robot,
+                target_object_name=target_object_name,
+                contact_sensor_names=contact_sensor_names,
+            )
+            policy_obs, settle_pose_restore = restore_robot_frame0_after_settle(
+                env,
+                reset_joint_pos,
+                target_object_name=target_object_name,
+            )
+            print(
+                "[runner] settle complete "
+                f"target_root_pos_w={format_vec(tensor_first_row(target_asset.data.root_pos_w))} "
+                "robot_frame0_restore_max_error_rad="
+                f"{settle_pose_restore['joint_max_abs_error_rad']:.3g}",
+                flush=True,
+            )
+
+        if args.action_trace_jsonl is not None:
+            action_trace_path = Path(args.action_trace_jsonl).expanduser()
+            if not action_trace_path.is_absolute():
+                action_trace_path = SCRIPT_DIR / action_trace_path
+            action_trace_path = action_trace_path.resolve()
+            action_trace_path.parent.mkdir(parents=True, exist_ok=True)
+            action_trace_file = action_trace_path.open("w", encoding="utf-8")
+            print(f"[runner] action trace JSONL={action_trace_path}", flush=True)
+            write_action_trace_record(
+                action_trace_file,
+                {
+                    "type": "run_config",
+                    "instruction": args.instruction,
+                    "camera_layout": args.camera_layout,
+                    "camera_mapping": camera_mapping,
+                    "checkpoint_arm_units": args.so101_checkpoint_arm_units,
+                    "red24_material_requested": args.red24_material,
+                    "red24_material_resolved": args.red24_material_resolved,
+                    "so101_robot_material_requested": args.so101_robot_material,
+                    "so101_robot_material_resolved": args.so101_robot_material_resolved,
+                    "so101_robot_material_application": so101_robot_material_summary,
+                    "seed": args.seed,
+                    "action_horizon": args.action_horizon,
+                    "max_policy_calls": args.max_policy_calls,
+                    "arm_target_scale": args.so101_arm_target_scale,
+                    "max_arm_step_rad": args.so101_max_arm_step_rad,
+                    "max_gripper_step_rad": args.so101_max_gripper_step_rad,
+                    "gripper_effort_limit_sim_requested": (
+                        args.so101_gripper_effort_limit_sim
+                    ),
+                    "gripper_effort_limit_cfg": gripper_effort_cfg_summary,
+                    "gripper_effort_limit_sim_live": (
+                        live_gripper_effort_limit_sim
+                    ),
+                    "settle_env_steps": args.settle_env_steps,
+                    "physics_dt_s": float(env.physics_dt),
+                    "contact_probe_enabled": bool(args.contact_probe),
+                    "dynamic_reset_gripper_effort_limit": (
+                        env.cfg.dynamic_reset_gripper_effort_limit
+                    ),
+                    "pre_settle_metrics": pre_settle_metrics,
+                    "pre_settle_spatial_metrics": pre_settle_spatial_metrics,
+                    "settle_step_metrics": settle_step_metrics,
+                    "settle_pose_restore": settle_pose_restore,
+                    "initial_joint_pos_rad": tensor_first_row(policy_obs["joint_pos"]).tolist(),
+                    "initial_metrics": smart_task_metrics(env, args.robot, target_object_name),
+                    "initial_spatial_metrics": smart_task_spatial_metrics(
+                        env,
+                        target_object_name,
+                    ),
+                    "initial_contact_probe": (
+                        read_contact_probe_sample(
+                            env,
+                            contact_sensor_names,
+                        )
+                        if contact_sensor_names
+                        else None
+                    ),
+                },
+            )
 
         if args.debug_cameras:
             debug_frame_dir = args.debug_camera_frame_dir
@@ -2579,8 +3585,32 @@ def main() -> None:
                 )
             print(f"[runner] action summary: {summarize_action(action)}", flush=True)
 
+            trace_record = {
+                "type": "policy_call",
+                "call_index": call_idx + 1,
+                "joint_pos_before_rad": tensor_first_row(policy_obs["joint_pos"]).tolist(),
+                "metrics_before": smart_task_metrics(env, args.robot, target_object_name),
+                "spatial_metrics_before": smart_task_spatial_metrics(
+                    env,
+                    target_object_name,
+                ),
+                "decoded_dataset_action": {
+                    key: np.asarray(value).tolist() for key, value in sorted(action.items())
+                },
+                "applied_commands_rad": [],
+                "executed_step_metrics": [],
+            }
+
             if args.dry_run:
                 print_metrics(env, "dry-run", args.robot, target_object_name)
+                trace_record["executed_action_steps"] = 0
+                trace_record["joint_pos_after_rad"] = tensor_first_row(policy_obs["joint_pos"]).tolist()
+                trace_record["metrics_after"] = smart_task_metrics(env, args.robot, target_object_name)
+                trace_record["spatial_metrics_after"] = smart_task_spatial_metrics(
+                    env,
+                    target_object_name,
+                )
+                write_action_trace_record(action_trace_file, trace_record)
                 continue
 
             # 决定这个 chunk 执行多少步。
@@ -2610,6 +3640,7 @@ def main() -> None:
 
             # 内层循环：逐步执行 action chunk。
             for step_idx in range(num_action_steps):
+                conversion_diagnostics: dict[str, Any] = {}
                 command = action_step_to_leisaac_tensor(
                     args,
                     action,
@@ -2617,6 +3648,10 @@ def main() -> None:
                     env.device,
                     policy_obs,
                     so101_runtime_joint_limits,
+                    conversion_diagnostics,
+                )
+                trace_record["applied_commands_rad"].append(
+                    command.detach().cpu().numpy()[0].tolist()
                 )
 
                 # 只在每个 chunk 的第一步打印 command，避免日志过大。
@@ -2626,7 +3661,9 @@ def main() -> None:
                 # Zero-order hold: one policy action represents one policy period.
                 # For the 30 Hz SO101 data and 60 Hz env this sends the same target
                 # through two env.step() calls instead of time-compressing the chunk.
-                for _ in range(env_steps_per_policy_action):
+                env_steps_executed = 0
+                env_substep_contact_metrics: list[dict[str, Any]] = []
+                for env_substep_index in range(1, env_steps_per_policy_action + 1):
                     # LeIsaac 原本会根据 gripper 距离物体动态调整 effort limit。
                     # 因为我们绕开了 LeIsaac 的 teleop loop，所以这里手动调用一次。
                     if env.cfg.dynamic_reset_gripper_effort_limit:
@@ -2635,7 +3672,28 @@ def main() -> None:
                     # 真正把保持中的 action target 送进 IsaacLab env。
                     # 返回值：obs, reward, terminated, timed_out, info。
                     obs, _, terminated, timed_out, _ = env.step(command)
+                    env_steps_executed += 1
                     policy_obs = obs["policy"]
+
+                    if contact_sensor_names:
+                        env_substep_contact_metrics.append(
+                            {
+                                "env_substep_index": env_substep_index,
+                                "contact_probe_after": read_contact_probe_sample(
+                                    env,
+                                    contact_sensor_names,
+                                ),
+                                "spatial_metrics_after": smart_task_spatial_metrics(
+                                    env,
+                                    target_object_name,
+                                ),
+                                "gripper_rad_after": float(
+                                    env.scene["robot"].data.joint_pos[0, -1]
+                                    .detach()
+                                    .cpu()
+                                ),
+                            }
+                        )
 
                     # 用每个 env step 的新 observation 更新相机历史。
                     build_observation(policy_obs, history, args.instruction, args.robot, camera_mapping)
@@ -2656,11 +3714,38 @@ def main() -> None:
                     if args.render_sleep_s > 0:
                         time.sleep(args.render_sleep_s)
 
+                if action_trace_file is not None:
+                    trace_record["executed_step_metrics"].append(
+                        {
+                            "action_step_index": step_idx + 1,
+                            "env_steps_executed": env_steps_executed,
+                            "metrics_after": smart_task_metrics(
+                                env,
+                                args.robot,
+                                target_object_name,
+                            ),
+                            "spatial_metrics_after": smart_task_spatial_metrics(
+                                env,
+                                target_object_name,
+                            ),
+                            "conversion_diagnostics": conversion_diagnostics,
+                            "env_substep_contact_metrics": env_substep_contact_metrics,
+                        }
+                    )
+
                 if stop_run:
                     break
 
             print(f"[runner] latest joint_pos values={tensor_values(policy_obs['joint_pos'])}", flush=True)
             print_metrics(env, f"after policy call {call_idx + 1}", args.robot, target_object_name)
+            trace_record["executed_action_steps"] = len(trace_record["applied_commands_rad"])
+            trace_record["joint_pos_after_rad"] = tensor_first_row(policy_obs["joint_pos"]).tolist()
+            trace_record["metrics_after"] = smart_task_metrics(env, args.robot, target_object_name)
+            trace_record["spatial_metrics_after"] = smart_task_spatial_metrics(
+                env,
+                target_object_name,
+            )
+            write_action_trace_record(action_trace_file, trace_record)
 
             if stop_run:
                 break
@@ -2669,9 +3754,14 @@ def main() -> None:
         keep_open(simulation_app, env, args.keep_open_s)
 
     finally:
-        # 无论正常结束还是异常退出，都关闭 env 和 Isaac app。
-        env.close()
-        simulation_app.close()
+        try:
+            if action_trace_file is not None:
+                action_trace_file.close()
+        finally:
+            # Trace finalization errors must not strand an Isaac env or
+            # SimulationApp process.
+            env.close()
+            simulation_app.close()
 
 
 if __name__ == "__main__":
