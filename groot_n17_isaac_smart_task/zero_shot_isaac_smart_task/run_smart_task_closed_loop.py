@@ -3753,6 +3753,13 @@ def main() -> None:
         wait_for_viewport_video_capture(capture_instance, simulation_app, env, args.capture_wait_timeout_s)
         keep_open(simulation_app, env, args.keep_open_s)
 
+    except Exception:
+        # Isaac SimulationApp.close() may terminate the process before Python
+        # prints an uncaught exception. Emit it while the app is still alive so
+        # bridge/protocol failures remain visible in the rollout log.
+        print("[runner] closed-loop execution failed:", flush=True)
+        traceback.print_exc()
+        raise
     finally:
         try:
             if action_trace_file is not None:
