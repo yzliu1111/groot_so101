@@ -2,39 +2,56 @@
 
 本目录直接使用 LeRobot 的：
 
-- `SO101Follower` 读取校准后的 6D 电机位置和腕部相机；
+- `SO101Follower` 读取校准后的 6D 电机位置和 wrist-only / dual / triple 相机；
 - GR00T N1.7 policy / processor 加载原始 NVIDIA checkpoint；
 - `SO101Follower.send_action()` 下发绝对电机位置目标。
 
-当前入口只支持 wrist-only checkpoint。默认是 **dry-run**：会连接真机、读取相机和
-电机、执行模型推理，但不会发送电机目标。
+当前入口覆盖 `outputs/aws-0715` 下全部 5 个 checkpoint。默认是 **dry-run**：会连接
+真机、读取相机和电机、执行模型推理，但不会发送电机目标。
+
+## aws-0715 运行档案（不可混用）
+
+| profile | checkpoint | 布局 | 模型角色 <- 历史相机槽 | arm 单位 |
+|---|---|---|---|---|
+| `real001` | real001 checkpoint-10000 | wrist-only | `wrist <- camera1` | degrees |
+| `real003` | real003 checkpoint-10000 | triple | `top <- camera2, left <- camera1, wrist <- camera3` | degrees |
+| `real007` | real007 checkpoint-9000 | triple | `top <- camera3, left <- camera2, wrist <- camera1` | degrees |
+| `sim002` | sim002 checkpoint-10000 | wrist-only | `wrist <- camera1` | LeRobot motor units |
+| `sim004` | 历史目录 sim_run_003 checkpoint-7500 | triple | `top <- camera3, left <- camera2, wrist <- camera1` | LeRobot motor units |
+
+`real003` 的排列是 prepared checkpoint 的历史 slot 语义，不是通用 triple 排列。程序中的
+profile 会同时选择 checkpoint、布局、动作单位、默认 instruction 和相机重排。
+
+代码也支持不属于这 5 个 profile 的通用 `dual` 布局：`top + wrist`。但 aws-0715 当前
+5 个 checkpoint 里没有 dual 权重。
 
 ## 最快验证卡
 
 目标不是第一轮就做完整评测，而是用最短路径回答两个问题：
 
-1. LeRobot 能否在目标机读取 SO101 + wrist camera，并让 checkpoint 返回合法 action？
+1. LeRobot 能否在目标机读取 SO101 + 该 checkpoint 要求的全部相机，并返回合法 action？
 2. 这个 action 能否在真机上按正确方向执行，并完成一次已训练任务？
 
 ### 终端 0：一次性变量
 
-下面只需要替换 `SMART_PROJECT`、`ROBOT_PORT`、`ROBOT_ID` 和 `WRIST_CAMERA`：
+下面只需要替换 `SMART_PROJECT`、`ROBOT_PORT`、`ROBOT_ID` 和相机设备：
 
 ```bash
 export SMART_PROJECT=/home/guest1/smart_project
 export PYTHON=/home/guest1/miniforge3/envs/lerobot/bin/python
 export LEROBOT_BIN=/home/guest1/miniforge3/envs/lerobot/bin
 
-export CHECKPOINT="$SMART_PROJECT/outputs/aws-0715/groot_so101_synthetic_finetune/aws_real_run_001_wrist_pick/aws_real_so101_run_001_wrist_pick/checkpoint-10000"
 export DEPLOY="$SMART_PROJECT/experiments/groot_n17_isaac_smart_task/real_robot_lerobot_groot/run_so101_groot_real.py"
 export RUN_DIR="$SMART_PROJECT/experiments/groot_n17_isaac_smart_task/real_robot_lerobot_groot/runs/$(date +%Y%m%d_%H%M%S)"
 
 export ROBOT_PORT=/dev/ttyACM0
 export ROBOT_ID=so101_follower_arm
-export WRIST_CAMERA=/dev/v4l/by-id/REPLACE_WITH_REAL_CAMERA
+export CAMERA1=/dev/v4l/by-id/REPLACE_CAMERA1
+export CAMERA2=/dev/v4l/by-id/REPLACE_CAMERA2
+export CAMERA3=/dev/v4l/by-id/REPLACE_CAMERA3
 
 mkdir -p "$RUN_DIR"
-test -d "$CHECKPOINT" && test -f "$DEPLOY" && test -x "$PYTHON"
+test -d "$SMART_PROJECT/outputs/aws-0715" && test -f "$DEPLOY" && test -x "$PYTHON"
 ```
 
 最后一条命令退出码为 `0` 才继续。
@@ -46,19 +63,21 @@ test -d "$CHECKPOINT" && test -f "$DEPLOY" && test -x "$PYTHON"
 "$LEROBOT_BIN/lerobot-find-cameras" opencv
 ```
 
-把结果填回终端 0 的 `ROBOT_PORT` 和 `WRIST_CAMERA`。优先使用稳定的
+把结果填回终端 0 的 `ROBOT_PORT` 和 `CAMERA1/2/3`。这里的 camera1/2/3 必须对应
+训练数据中的历史相机槽，不是随便编号。优先使用稳定的
 `/dev/v4l/by-id/...`，不要依赖重启后可能变化的 `/dev/video0` 编号。
 
 ### 第一次：dry-run，不动机器人
 
 ```bash
 "$PYTHON" "$DEPLOY" \
-  --checkpoint "$CHECKPOINT" \
-  --checkpoint-arm-units degrees \
+  --aws-profile real003 \
+  --smart-project "$SMART_PROJECT" \
   --robot-port "$ROBOT_PORT" \
   --robot-id "$ROBOT_ID" \
-  --wrist-camera "$WRIST_CAMERA" \
-  --instruction "pick up block" \
+  --camera1 "$CAMERA1" \
+  --camera2 "$CAMERA2" \
+  --camera3 "$CAMERA3" \
   --parameter-dtype fp32 \
   --max-policy-calls 1 \
   --trace-jsonl "$RUN_DIR/dry_run.jsonl"
@@ -88,12 +107,13 @@ wc -l "$RUN_DIR/dry_run.jsonl"
 
 ```bash
 "$PYTHON" "$DEPLOY" \
-  --checkpoint "$CHECKPOINT" \
-  --checkpoint-arm-units degrees \
+  --aws-profile real003 \
+  --smart-project "$SMART_PROJECT" \
   --robot-port "$ROBOT_PORT" \
   --robot-id "$ROBOT_ID" \
-  --wrist-camera "$WRIST_CAMERA" \
-  --instruction "pick up block" \
+  --camera1 "$CAMERA1" \
+  --camera2 "$CAMERA2" \
+  --camera3 "$CAMERA3" \
   --parameter-dtype fp32 \
   --max-policy-calls 1 \
   --action-horizon 16 \

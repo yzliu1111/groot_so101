@@ -33,6 +33,12 @@ if str(SCRIPT_DIR) not in sys.path:
 
 from wire import recv_message, send_message  # noqa: E402
 
+CAMERA_LAYOUTS = {
+    "wrist-only": ("wrist",),
+    "dual": ("top", "wrist"),
+    "triple": ("top", "left", "wrist"),
+}
+
 
 def _seed_inference(seed: int | None) -> None:
     if seed is None:
@@ -46,14 +52,17 @@ def _seed_inference(seed: int | None) -> None:
     print(f"[lerobot-bridge] inference seed: {seed}", flush=True)
 
 
-def _flatten_observation(observation: dict[str, Any]) -> dict[str, Any]:
+def _flatten_observation(
+    observation: dict[str, Any],
+    video_keys: tuple[str, ...],
+) -> dict[str, Any]:
     """Translate the existing bridge schema to LeRobot's flat observation keys."""
 
     video = observation["video"]
     state = observation["state"]
     language = observation["language"]
-    if tuple(video) != ("wrist",):
-        raise ValueError(f"sim002 LeRobot bridge expects only video.wrist, got {list(video)}")
+    if set(video) != set(video_keys):
+        raise ValueError(f"expected video keys {list(video_keys)}, got {list(video)}")
 
     arm = np.asarray(state["single_arm"], dtype=np.float32)
     gripper = np.asarray(state["gripper"], dtype=np.float32)
@@ -70,27 +79,34 @@ def _flatten_observation(observation: dict[str, Any]) -> dict[str, Any]:
     # The existing runner already adds a batch/time axis for NVIDIA GR00T.
     # LeRobot's online preprocessor owns the batch axis, so pass one HWC frame
     # and one 6-D state vector here.
-    wrist = np.asarray(video["wrist"])
-    if wrist.ndim == 5 and wrist.shape[:2] == (1, 1):
-        wrist = wrist[0, 0]
-    elif wrist.ndim == 4 and wrist.shape[0] == 1:
-        wrist = wrist[0]
-    if wrist.ndim != 3 or wrist.shape[-1] != 3:
-        raise ValueError(f"expected wrist HWC RGB image, got {wrist.shape}")
-
-    return {
-        "observation.images.wrist": torch.from_numpy(
-            np.ascontiguousarray(wrist.transpose(2, 0, 1))
-        ),
+    result = {
         "observation.state": torch.from_numpy(
             np.concatenate((arm[0, 0], gripper[0, 0]), axis=0)
         ),
         "task": str(task[0][0]),
     }
+    for key in video_keys:
+        image = np.asarray(video[key])
+        if image.ndim == 5 and image.shape[:2] == (1, 1):
+            image = image[0, 0]
+        elif image.ndim == 4 and image.shape[0] == 1:
+            image = image[0]
+        if image.ndim != 3 or image.shape[-1] != 3:
+            raise ValueError(f"expected {key} HWC RGB image, got {image.shape}")
+        result[f"observation.images.{key}"] = torch.from_numpy(
+            np.ascontiguousarray(image.transpose(2, 0, 1))
+        )
+    return result
 
 
 class LeRobotGrootPolicy:
-    def __init__(self, checkpoint: Path, device: str, parameter_dtype: str) -> None:
+    def __init__(
+        self,
+        checkpoint: Path,
+        device: str,
+        parameter_dtype: str,
+        camera_layout: str = "wrist-only",
+    ) -> None:
         from lerobot.configs import FeatureType, PolicyFeature
         from lerobot.policies.groot.configuration_groot import GrootConfig
         from lerobot.policies.groot.modeling_groot import GrootPolicy
@@ -99,11 +115,17 @@ class LeRobotGrootPolicy:
         )
         from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
 
+        self.video_keys = CAMERA_LAYOUTS[camera_layout]
         config = GrootConfig(
             base_model_path=str(checkpoint),
             embodiment_tag="new_embodiment",
             input_features={
-                f"{OBS_IMAGES}.wrist": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 480, 640)),
+                **{
+                    f"{OBS_IMAGES}.{key}": PolicyFeature(
+                        type=FeatureType.VISUAL, shape=(3, 480, 640)
+                    )
+                    for key in self.video_keys
+                },
                 OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(6,)),
             },
             output_features={
@@ -142,7 +164,7 @@ class LeRobotGrootPolicy:
         self, observation: dict[str, Any], _options: Any = None
     ) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
         started = time.perf_counter()
-        batch = self.preprocessor(_flatten_observation(observation))
+        batch = self.preprocessor(_flatten_observation(observation, self.video_keys))
         raw_chunk = self.policy.predict_action_chunk(batch)
         # Relative arm actions must be decoded as one chunk against the state
         # captured by this preprocessor call. Never queue raw relative actions.
@@ -177,9 +199,13 @@ def serve(args: argparse.Namespace) -> None:
         Path(args.model_path).expanduser().resolve(),
         args.device,
         args.parameter_dtype,
+        args.camera_layout,
     )
     modality = {
-        "video": {"delta_indices": [0], "modality_keys": ["wrist"]},
+        "video": {
+            "delta_indices": [0],
+            "modality_keys": list(CAMERA_LAYOUTS[args.camera_layout]),
+        },
         "state": {"delta_indices": [0], "modality_keys": ["single_arm", "gripper"]},
         "action": {
             "delta_indices": list(range(16)),
@@ -198,7 +224,7 @@ def serve(args: argparse.Namespace) -> None:
         "backend": "lerobot",
     }
     print("[lerobot-bridge] policy loaded", flush=True)
-    print("[lerobot-bridge] camera layout: wrist-only", flush=True)
+    print(f"[lerobot-bridge] camera layout: {args.camera_layout}", flush=True)
     print(f"[lerobot-bridge] modality: {modality}", flush=True)
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
@@ -215,7 +241,7 @@ def serve(args: argparse.Namespace) -> None:
                     if endpoint == "ping":
                         response = {
                             "ok": True,
-                            "camera_layout": "wrist-only",
+                            "camera_layout": args.camera_layout,
                             "modality": modality,
                             "action_decoding": action_decoding,
                         }
@@ -261,6 +287,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--camera-layout", choices=tuple(CAMERA_LAYOUTS), default="wrist-only")
     parser.add_argument(
         "--parameter-dtype",
         choices=("fp32", "bf16"),
