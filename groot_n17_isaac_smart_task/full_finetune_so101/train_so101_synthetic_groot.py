@@ -232,6 +232,48 @@ def _validate_so101_schema(info: dict[str, Any], *, context: Path) -> None:
         raise ValueError(f"Expected a positive finite dataset fps, got {fps!r}: {context}")
 
 
+def _validate_camera_layout_matches_source(
+    info: dict[str, Any],
+    *,
+    video_key_map: dict[str, str],
+    camera_layout: str,
+    context: Path,
+) -> None:
+    """Require the training layout to consume every source video camera exactly once."""
+
+    features = info.get("features", {})
+    source_video_keys = {
+        key
+        for key, feature in features.items()
+        if isinstance(feature, dict) and feature.get("dtype") == "video"
+    }
+    expected_layout_by_count = {
+        1: "wrist-only",
+        2: "dual",
+        3: "triple",
+    }
+    expected_layout = expected_layout_by_count.get(len(source_video_keys))
+    if expected_layout is None:
+        raise ValueError(
+            f"Expected 1, 2, or 3 video cameras, got {len(source_video_keys)} "
+            f"({sorted(source_video_keys)!r}): {context}"
+        )
+    if camera_layout != expected_layout:
+        raise ValueError(
+            "Camera layout must match source camera count so training cannot silently "
+            f"drop a view: source={context} cameras={sorted(source_video_keys)!r} "
+            f"requires --camera-layout {expected_layout}, got {camera_layout!r}"
+        )
+
+    selected_video_keys = set(video_key_map.values())
+    if selected_video_keys != source_video_keys:
+        raise ValueError(
+            "Camera role mapping must use every source video exactly once: "
+            f"source={context} available={sorted(source_video_keys)!r} "
+            f"selected={sorted(selected_video_keys)!r}"
+        )
+
+
 def _load_groot_lerobot_converter(groot_root: Path) -> Any:
     """Load Isaac-GR00T's official LeRobot v3 -> v2 conversion helpers."""
 
@@ -274,6 +316,11 @@ def _load_episode_records(dataset_path: Path) -> list[dict[str, Any]]:
 def _load_tasks(dataset_path: Path, instruction_override: str | None) -> list[dict[str, Any]]:
     table = pq.read_table(dataset_path / "meta" / "tasks.parquet")
     rows = table.to_pylist()
+    if instruction_override and len(rows) > 1:
+        raise ValueError(
+            f"--instruction would collapse {len(rows)} distinct task rows into one label for "
+            f"multi-task dataset {dataset_path}. Preserve the source task text instead."
+        )
     tasks: list[dict[str, Any]] = []
     seen_task_indices: set[int] = set()
 
@@ -462,6 +509,18 @@ def _validate_prepared_dataset(dataset_path: Path, video_key_map: dict[str, str]
     tasks = _load_jsonl(tasks_path)
     if not tasks:
         raise ValueError(f"Prepared dataset has no tasks: {tasks_path}")
+    task_by_index: dict[int, str] = {}
+    for task in tasks:
+        try:
+            task_index = int(task["task_index"])
+            task_text = str(task["task"]).strip()
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid task metadata in {tasks_path}: {task!r}") from exc
+        if task_index < 0 or not task_text or task_index in task_by_index:
+            raise ValueError(f"Invalid or duplicate task metadata in {tasks_path}: {task!r}")
+        if task_text in task_by_index.values():
+            raise ValueError(f"Duplicate task text in {tasks_path}: {task_text!r}")
+        task_by_index[task_index] = task_text
     if info.get("total_tasks") != len(tasks):
         raise ValueError(
             f"Prepared total_tasks mismatch in {info_path}: "
@@ -489,6 +548,15 @@ def _validate_prepared_dataset(dataset_path: Path, video_key_map: dict[str, str]
             raise ValueError(f"Duplicate episode_index {episode_index} in {episodes_path}")
         episode_indices.add(episode_index)
         total_frames += episode_length
+        episode_tasks = {str(task).strip() for task in episode.get("tasks", [])}
+        if not episode_tasks or "" in episode_tasks:
+            raise ValueError(f"Prepared episode has no valid tasks: {episode!r}")
+        unknown_episode_tasks = episode_tasks - set(task_by_index.values())
+        if unknown_episode_tasks:
+            raise ValueError(
+                f"Prepared episode {episode_index} references unknown tasks: "
+                f"{sorted(unknown_episode_tasks)!r}"
+            )
 
         episode_chunk = episode_index // chunks_size
         data_path = dataset_path / V21_DATA_PATH.format(
@@ -497,11 +565,44 @@ def _validate_prepared_dataset(dataset_path: Path, video_key_map: dict[str, str]
         )
         if not data_path.is_file() or data_path.stat().st_size == 0:
             raise FileNotFoundError(f"Prepared episode parquet is missing or empty: {data_path}")
-        parquet_rows = pq.ParquetFile(data_path).metadata.num_rows
+        episode_table = pq.read_table(
+            data_path,
+            columns=["episode_index", "frame_index", "task_index"],
+        )
+        parquet_rows = episode_table.num_rows
         if parquet_rows != episode_length:
             raise ValueError(
                 f"Prepared episode row count mismatch: {data_path} "
                 f"metadata_length={episode_length} parquet_rows={parquet_rows}"
+            )
+        parquet_episode_indices = {
+            int(value) for value in episode_table["episode_index"].to_pylist()
+        }
+        parquet_frame_indices = [
+            int(value) for value in episode_table["frame_index"].to_pylist()
+        ]
+        parquet_task_indices = {
+            int(value) for value in episode_table["task_index"].to_pylist()
+        }
+        unknown_task_indices = parquet_task_indices - set(task_by_index)
+        if parquet_episode_indices != {episode_index}:
+            raise ValueError(
+                f"Prepared episode_index mismatch in {data_path}: "
+                f"{sorted(parquet_episode_indices)!r}"
+            )
+        if parquet_frame_indices != list(range(episode_length)):
+            raise ValueError(f"Prepared frame_index gap in {data_path}")
+        if unknown_task_indices:
+            raise ValueError(
+                f"Prepared task_index is unknown in {data_path}: "
+                f"{sorted(unknown_task_indices)!r}"
+            )
+        parquet_task_texts = {task_by_index[index] for index in parquet_task_indices}
+        if parquet_task_texts != episode_tasks:
+            raise ValueError(
+                f"Prepared task text/index mismatch in {data_path}: "
+                f"parquet={sorted(parquet_task_texts)!r} "
+                f"episode={sorted(episode_tasks)!r}"
             )
 
         for video_key in dict.fromkeys(video_key_map.values()):
@@ -517,6 +618,10 @@ def _validate_prepared_dataset(dataset_path: Path, video_key_map: dict[str, str]
         raise ValueError(
             f"Prepared total_episodes mismatch in {info_path}: "
             f"info={info.get('total_episodes')!r} episodes={len(episodes)}"
+        )
+    if episode_indices != set(range(len(episodes))):
+        raise ValueError(
+            f"Prepared episode_index must be contiguous from zero: {episodes_path}"
         )
     if info.get("total_frames") != total_frames:
         raise ValueError(
@@ -834,21 +939,185 @@ def generate_stats(
     groot_root: Path,
     modality_config_path: Path,
     dry_run: bool,
+    force: bool,
 ) -> None:
-    _run(
-        [
-            sys.executable,
-            "gr00t/data/stats.py",
-            "--dataset-path",
-            str(dataset_path),
-            "--embodiment-tag",
-            "NEW_EMBODIMENT",
-            "--modality-config-path",
-            str(modality_config_path),
-        ],
-        cwd=groot_root,
-        dry_run=dry_run,
+    stats_paths = [
+        dataset_path / "meta" / "stats.json",
+        dataset_path / "meta" / "relative_stats.json",
+    ]
+    backups: list[tuple[Path, Path]] = []
+    if force:
+        if dry_run:
+            raise ValueError("--force-stats cannot be combined with --dry-run")
+        for stats_path in stats_paths:
+            backup_path = stats_path.with_name(f".{stats_path.name}.aws-recompute-backup")
+            if backup_path.exists():
+                raise FileExistsError(
+                    f"Unresolved stats backup exists: {backup_path}. Restore or remove it "
+                    "after checking the previous stats failure."
+                )
+            if stats_path.exists():
+                if not stats_path.is_file() or stats_path.is_symlink():
+                    raise ValueError(f"Stats cache must be a regular file: {stats_path}")
+                stats_path.replace(backup_path)
+                backups.append((stats_path, backup_path))
+                print(f"[stats] isolated stale cache: {stats_path} -> {backup_path}")
+
+    command = [
+        sys.executable,
+        "gr00t/data/stats.py",
+        "--dataset-path",
+        str(dataset_path),
+        "--embodiment-tag",
+        "NEW_EMBODIMENT",
+        "--modality-config-path",
+        str(modality_config_path),
+    ]
+    try:
+        _run(command, cwd=groot_root, dry_run=dry_run)
+        if not dry_run:
+            missing = [path for path in stats_paths if not path.is_file()]
+            if missing:
+                raise FileNotFoundError(f"Stats generation did not create: {missing}")
+    except BaseException:
+        for stats_path, backup_path in backups:
+            if stats_path.exists():
+                stats_path.unlink()
+            if backup_path.exists():
+                backup_path.replace(stats_path)
+        raise
+    else:
+        for _, backup_path in backups:
+            backup_path.unlink()
+
+
+def _relative_stats_worst_span_ratio(dataset_path: Path) -> dict[str, Any]:
+    """Return the relative-action entry most distorted by full-range outliers."""
+    stats_path = dataset_path / "meta" / "relative_stats.json"
+    if not stats_path.is_file():
+        raise FileNotFoundError(
+            f"Relative-action statistics are missing: {stats_path}. "
+            "Run stats generation before training."
+        )
+
+    payload = json.loads(stats_path.read_text())
+    worst: dict[str, Any] | None = None
+    required_keys = ("min", "max", "q01", "q99")
+    for group_name, group_stats in payload.items():
+        if not isinstance(group_stats, dict) or not all(
+            key in group_stats for key in required_keys
+        ):
+            continue
+        rows = zip(*(group_stats[key] for key in required_keys), strict=True)
+        for horizon_index, (mins, maxs, q01s, q99s) in enumerate(rows):
+            values = zip(mins, maxs, q01s, q99s, strict=True)
+            for joint_index, (minimum, maximum, q01, q99) in enumerate(values):
+                full_span = float(maximum) - float(minimum)
+                central_span = float(q99) - float(q01)
+                if full_span < 0 or central_span < 0:
+                    raise ValueError(
+                        f"Invalid relative stats ordering in {stats_path}: "
+                        f"group={group_name} horizon={horizon_index} joint={joint_index}"
+                    )
+                ratio = full_span / max(central_span, 1e-8)
+                if group_name == "single_arm" and joint_index < 5:
+                    joint_name = SO101_JOINT_NAMES[joint_index]
+                elif group_name == "gripper" and joint_index == 0:
+                    joint_name = SO101_JOINT_NAMES[5]
+                else:
+                    joint_name = f"{group_name}[{joint_index}]"
+                candidate = {
+                    "group": group_name,
+                    "horizon_index": horizon_index,
+                    "joint_index": joint_index,
+                    "joint_name": joint_name,
+                    "minimum": float(minimum),
+                    "maximum": float(maximum),
+                    "q01": float(q01),
+                    "q99": float(q99),
+                    "ratio": ratio,
+                    "stats_path": stats_path,
+                }
+                if worst is None or ratio > worst["ratio"]:
+                    worst = candidate
+
+    if worst is None:
+        raise ValueError(f"No usable relative-action groups found in {stats_path}")
+    return worst
+
+
+def audit_relative_stats(
+    dataset_path: Path,
+    *,
+    max_span_ratio: float,
+    allow_outliers: bool,
+) -> None:
+    worst = _relative_stats_worst_span_ratio(dataset_path)
+    print(
+        "[preflight] relative stats "
+        f"dataset={dataset_path} group={worst['group']} "
+        f"horizon={worst['horizon_index']} joint={worst['joint_name']} "
+        f"full=[{worst['minimum']:.6g}, {worst['maximum']:.6g}] "
+        f"q01/q99=[{worst['q01']:.6g}, {worst['q99']:.6g}] "
+        f"span_ratio={worst['ratio']:.3f} limit={max_span_ratio:.3f}"
     )
+    if worst["ratio"] <= max_span_ratio:
+        return
+
+    message = (
+        "Relative-action full min/max are dominated by a small tail: "
+        f"span ratio {worst['ratio']:.3f} exceeds {max_span_ratio:.3f} at "
+        f"{worst['stats_path']} group={worst['group']} "
+        f"horizon={worst['horizon_index']} joint={worst['joint_name']}. "
+        "GR00T N1.7 currently replaces percentile action bounds with these full "
+        "relative min/max values, so a low normalized loss can hide poor physical "
+        "precision. Inspect reset-boundary action/state gaps before spending a full run."
+    )
+    if not allow_outliers:
+        raise ValueError(
+            message
+            + " Pass --allow-relative-stats-outliers only after explicitly accepting "
+            "the full-range normalization."
+        )
+    print(f"[warning] {message}")
+
+
+def _color_jitter_cli_args(enabled: bool) -> list[str]:
+    # Passing nothing (or None) does not disable augmentation: the N1.7 processor
+    # loader then inherits the base checkpoint's non-zero ColorJitter defaults.
+    # An explicit all-zero mapping is the portable no-op override.
+    params = {
+        "brightness": 0.3 if enabled else 0.0,
+        "contrast": 0.4 if enabled else 0.0,
+        "saturation": 0.5 if enabled else 0.0,
+        "hue": 0.08 if enabled else 0.0,
+    }
+    args = ["--color-jitter-params"]
+    for name, value in params.items():
+        args.extend([name, str(value)])
+    return args
+
+
+def _validate_new_run_dir(
+    output_dir: Path,
+    experiment_name: str | None,
+    *,
+    allow_existing: bool,
+) -> Path:
+    run_dir = output_dir.resolve()
+    if experiment_name:
+        run_dir /= experiment_name
+    if run_dir.exists() and any(run_dir.iterdir()) and not allow_existing:
+        raise FileExistsError(
+            f"Training run directory is not empty: {run_dir}. Use a unique --output-dir "
+            "and --experiment-name so checkpoint lineage cannot be overwritten. Pass "
+            "--allow-existing-run-dir only for a deliberately reviewed reuse."
+        )
+    return run_dir
+
+
+def _should_audit_relative_stats(args: argparse.Namespace) -> bool:
+    return not args.dry_run and (not args.prepare_only or not args.skip_stats)
 
 
 def launch_finetune(
@@ -885,26 +1154,15 @@ def launch_finetune(
         str(args.gradient_accumulation_steps),
         "--dataloader-num-workers",
         str(args.dataloader_num_workers),
+        "--state-dropout-prob",
+        str(args.state_dropout_prob),
     ]
 
     if args.experiment_name:
         cmd.extend(["--experiment-name", args.experiment_name])
     if args.use_wandb:
         cmd.append("--use-wandb")
-    if args.color_jitter:
-        cmd.extend(
-            [
-                "--color-jitter-params",
-                "brightness",
-                "0.3",
-                "contrast",
-                "0.4",
-                "saturation",
-                "0.5",
-                "hue",
-                "0.08",
-            ]
-        )
+    cmd.extend(_color_jitter_cli_args(args.color_jitter))
 
     _run(cmd, cwd=args.groot_root.resolve(), dry_run=args.dry_run)
 
@@ -926,6 +1184,17 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Directory to recursively scan for LeRobot v3 datasets. Repeat to mix "
             "task folders such as dataset/custom/pick_only/* and dataset/custom/place_only/*."
+        ),
+    )
+    parser.add_argument(
+        "--prepared-dataset",
+        action="append",
+        type=Path,
+        default=None,
+        help=(
+            "Exact prepared LeRobot v2.1 dataset path. Repeat for a homogeneous mixture. "
+            "This is the preferred AWS training input after prepared data is uploaded; "
+            "it requires --skip-prepare and cannot be combined with source selectors."
         ),
     )
     parser.add_argument(
@@ -973,10 +1242,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--camera-layout",
         choices=("wrist-only", "dual", "triple"),
-        default="dual",
+        required=True,
         help=(
             "wrist-only maps only the wrist camera; dual maps front/top + wrist; "
-            "triple maps front/top + left + wrist. Non-dual prepared datasets get a layout suffix."
+            "triple maps front/top + left + wrist. The layout must consume all source "
+            "video cameras: one camera requires wrist-only, two require dual, and three "
+            "require triple. Non-dual prepared datasets get a layout suffix."
         ),
     )
     parser.add_argument(
@@ -988,6 +1259,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--force-prepare", action="store_true")
     parser.add_argument("--skip-prepare", action="store_true")
     parser.add_argument("--skip-stats", action="store_true")
+    parser.add_argument(
+        "--force-stats",
+        action="store_true",
+        help=(
+            "Temporarily isolate stats.json and relative_stats.json so GR00T must "
+            "recompute them; restore the old files automatically if generation fails."
+        ),
+    )
     parser.add_argument("--prepare-only", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--num-gpus", type=int, default=1)
@@ -1000,8 +1279,51 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save-total-limit", type=int, default=5)
     parser.add_argument("--experiment-name", default="so101_smart_task_synthetic")
     parser.add_argument("--use-wandb", action="store_true")
-    parser.add_argument("--no-color-jitter", dest="color_jitter", action="store_false")
-    parser.set_defaults(color_jitter=True)
+    jitter_group = parser.add_mutually_exclusive_group()
+    jitter_group.add_argument(
+        "--color-jitter",
+        dest="color_jitter",
+        action="store_true",
+        help="Enable N1.7's strong non-zero ColorJitter augmentation.",
+    )
+    jitter_group.add_argument(
+        "--no-color-jitter",
+        dest="color_jitter",
+        action="store_false",
+        help=(
+            "Disable ColorJitter with an explicit all-zero override instead of "
+            "silently inheriting the base checkpoint defaults."
+        ),
+    )
+    parser.set_defaults(color_jitter=False)
+    parser.add_argument(
+        "--state-dropout-prob",
+        type=float,
+        default=0.0,
+        help=(
+            "State dropout probability passed to N1.7. The upstream processor and "
+            "model both apply it independently, so the SO101-safe default is 0."
+        ),
+    )
+    parser.add_argument(
+        "--max-relative-stats-span-ratio",
+        type=float,
+        default=5.0,
+        help=(
+            "Fail when full relative-action range divided by q01-q99 range exceeds "
+            "this value. This catches reset-boundary outliers that compress control."
+        ),
+    )
+    parser.add_argument(
+        "--allow-relative-stats-outliers",
+        action="store_true",
+        help="Acknowledge and allow a relative-stats span-ratio preflight failure.",
+    )
+    parser.add_argument(
+        "--allow-existing-run-dir",
+        action="store_true",
+        help="Allow a non-empty output_dir/experiment_name after manually reviewing lineage.",
+    )
     return parser.parse_args()
 
 
@@ -1025,6 +1347,19 @@ def _validate_args(args: argparse.Namespace) -> None:
         )
     if not math.isfinite(args.learning_rate) or args.learning_rate <= 0:
         raise ValueError(f"--learning-rate must be positive and finite, got {args.learning_rate}")
+    if not math.isfinite(args.state_dropout_prob) or not 0 <= args.state_dropout_prob <= 1:
+        raise ValueError(
+            "--state-dropout-prob must be finite and between 0 and 1, "
+            f"got {args.state_dropout_prob}"
+        )
+    if (
+        not math.isfinite(args.max_relative_stats_span_ratio)
+        or args.max_relative_stats_span_ratio <= 1
+    ):
+        raise ValueError(
+            "--max-relative-stats-span-ratio must be finite and greater than 1, "
+            f"got {args.max_relative_stats_span_ratio}"
+        )
     if args.max_episodes is not None and args.max_episodes <= 0:
         raise ValueError(f"--max-episodes must be positive, got {args.max_episodes}")
     if args.instruction is not None and not args.instruction.strip():
@@ -1036,6 +1371,17 @@ def _validate_args(args: argparse.Namespace) -> None:
         )
     if args.force_prepare and args.skip_prepare:
         raise ValueError("--force-prepare and --skip-prepare cannot be used together")
+    if args.force_stats and args.skip_stats:
+        raise ValueError("--force-stats and --skip-stats cannot be used together")
+    if args.force_stats and args.dry_run:
+        raise ValueError("--force-stats cannot be combined with --dry-run")
+    if args.prepared_dataset:
+        if args.source_dataset or args.source_root:
+            raise ValueError(
+                "--prepared-dataset cannot be combined with --source-dataset or --source-root"
+            )
+        if not args.skip_prepare:
+            raise ValueError("--prepared-dataset requires --skip-prepare")
     if args.skip_prepare and args.max_episodes is not None:
         raise ValueError("--max-episodes has no effect with --skip-prepare")
     if args.skip_prepare and args.instruction is not None:
@@ -1049,6 +1395,13 @@ def _validate_args(args: argparse.Namespace) -> None:
 def main() -> None:
     args = parse_args()
     _validate_args(args)
+    if not args.prepare_only and not args.dry_run:
+        run_dir = _validate_new_run_dir(
+            args.output_dir,
+            args.experiment_name,
+            allow_existing=args.allow_existing_run_dir,
+        )
+        print(f"[preflight] new training run directory: {run_dir}")
     video_key_map, modality_config_path = _camera_layout_settings(
         args.camera_layout,
         args.top_camera_key,
@@ -1059,32 +1412,52 @@ def main() -> None:
     print(f"[config] camera_layout: {args.camera_layout}")
     for groot_key, dataset_key in video_key_map.items():
         print(f"[config] dataset {dataset_key} -> GR00T video.{groot_key}")
-    source_specs = _resolve_source_datasets(args)
-    if len(source_specs) > 1 and not args.allow_multiple_datasets:
-        selected = "\n".join(f"  - {source_path}" for source_path, _ in source_specs)
-        raise ValueError(
-            "Multiple source datasets were selected. The wrapper cannot infer whether their "
-            "action/state values are degrees, LeRobot motor units, or another coordinate system. "
-            "Verify that all selected datasets use the same coordinate system, then rerun with "
-            f"--allow-multiple-datasets. Selected datasets:\n{selected}"
-        )
-
-    prepared_paths: list[Path] = []
-    prepared_root = args.prepared_root.resolve()
-    for source_path, prepared_relative_path in source_specs:
-        prepared_path = prepared_root / prepared_relative_path
-        _validate_prepared_output_path(prepared_path, prepared_root)
-        if not args.skip_prepare:
-            prepare_dataset(
-                source_path,
-                prepared_path,
-                groot_root=args.groot_root.resolve(),
-                video_key_map=video_key_map,
-                instruction_override=args.instruction,
-                force=args.force_prepare,
-                max_episodes=args.max_episodes,
+    prepared_paths: list[Path]
+    if args.prepared_dataset:
+        prepared_paths = [path.expanduser().resolve() for path in args.prepared_dataset]
+        if len(set(prepared_paths)) != len(prepared_paths):
+            raise ValueError(f"Duplicate --prepared-dataset paths: {prepared_paths}")
+        if len(prepared_paths) > 1 and not args.allow_multiple_datasets:
+            selected = "\n".join(f"  - {path}" for path in prepared_paths)
+            raise ValueError(
+                "Multiple prepared datasets were selected. Verify that all of them use the "
+                "same action/state coordinate system, then rerun with "
+                f"--allow-multiple-datasets. Selected datasets:\n{selected}"
             )
-        prepared_paths.append(prepared_path)
+    else:
+        source_specs = _resolve_source_datasets(args)
+        for source_path, _ in source_specs:
+            _validate_camera_layout_matches_source(
+                _load_info(source_path),
+                video_key_map=video_key_map,
+                camera_layout=args.camera_layout,
+                context=source_path,
+            )
+        if len(source_specs) > 1 and not args.allow_multiple_datasets:
+            selected = "\n".join(f"  - {source_path}" for source_path, _ in source_specs)
+            raise ValueError(
+                "Multiple source datasets were selected. The wrapper cannot infer whether their "
+                "action/state values are degrees, LeRobot motor units, or another coordinate system. "
+                "Verify that all selected datasets use the same coordinate system, then rerun with "
+                f"--allow-multiple-datasets. Selected datasets:\n{selected}"
+            )
+
+        prepared_paths = []
+        prepared_root = args.prepared_root.resolve()
+        for source_path, prepared_relative_path in source_specs:
+            prepared_path = prepared_root / prepared_relative_path
+            _validate_prepared_output_path(prepared_path, prepared_root)
+            if not args.skip_prepare:
+                prepare_dataset(
+                    source_path,
+                    prepared_path,
+                    groot_root=args.groot_root.resolve(),
+                    video_key_map=video_key_map,
+                    instruction_override=args.instruction,
+                    force=args.force_prepare,
+                    max_episodes=args.max_episodes,
+                )
+            prepared_paths.append(prepared_path)
 
     for prepared_path in prepared_paths:
         _validate_prepared_dataset(prepared_path, video_key_map)
@@ -1096,6 +1469,18 @@ def main() -> None:
                 args.groot_root.resolve(),
                 modality_config_path,
                 args.dry_run,
+                args.force_stats,
+            )
+
+    # A stats-only run is also a preflight: freshly generated relative stats must
+    # pass before the dataset is considered ready. A conversion-only run uses
+    # --prepare-only --skip-stats and therefore cannot audit stats yet.
+    if _should_audit_relative_stats(args):
+        for prepared_path in prepared_paths:
+            audit_relative_stats(
+                prepared_path,
+                max_span_ratio=args.max_relative_stats_span_ratio,
+                allow_outliers=args.allow_relative_stats_outliers,
             )
 
     if args.prepare_only:

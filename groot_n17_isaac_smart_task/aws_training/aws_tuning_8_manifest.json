@@ -1,0 +1,241 @@
+{
+  "schema_version": 1,
+  "name": "aws-third-training-20260804",
+  "expected_dataset_count": 8,
+  "groot_commit": "9c7e746b2cd37a810070a98ef41d290a07e806c2",
+  "base_model_path": "nvidia/GR00T-N1.7-3B",
+  "base_model_revision": "2fc962b973bccdd5d8ce4f67cc63b264d6886495",
+  "defaults": {
+    "global_batch_size": 32,
+    "gradient_accumulation_steps": 1,
+    "learning_rate": 0.0001,
+    "dataloader_num_workers": 4,
+    "state_dropout_prob": 0.0,
+    "color_jitter": false
+  },
+  "datasets": [
+    {
+      "id": "real001",
+      "domain": "real-degrees",
+      "raw_source": "dataset/aws_tuning/1_real_pick_wrist/20260624_pickupblock_randomposition_wristonly_ep50",
+      "training_source": "dataset/aws_tuning/1_real_pick_wrist/20260624_pickupblock_randomposition_wristonly_ep50",
+      "prepared_root": "outputs/groot_so101_synthetic_datasets/aws_third_training_20260804/real001",
+      "prepared_dataset": "outputs/groot_so101_synthetic_datasets/aws_third_training_20260804/real001/20260624_pickupblock_randomposition_wristonly_ep50_wrist_only",
+      "expected_prepared_content_sha256": "824cfdf7035be93d8bd746e1674dd32ec9bb5eb642c6e4708ae16e779c5133f5",
+      "camera_layout": "wrist-only",
+      "camera_roles": {
+        "wrist": "observation.images.camera1"
+      },
+      "max_steps": 10000,
+      "save_steps": 2500,
+      "save_total_limit": 4,
+      "expected_raw": {
+        "episodes": 50,
+        "frames": 22492,
+        "task_episode_counts": {"pick up block": 50}
+      }
+    },
+    {
+      "id": "sim002",
+      "domain": "sim-lerobot-motor-units",
+      "raw_source": "dataset/aws_tuning/2_sim_pick_wrist/pick_camera1_notray_50_0625_1320",
+      "training_source": "dataset/aws_tuning/2_sim_pick_wrist/pick_camera1_notray_50_0625_1320",
+      "prepared_root": "outputs/groot_so101_synthetic_datasets/aws_third_training_20260804/sim002",
+      "prepared_dataset": "outputs/groot_so101_synthetic_datasets/aws_third_training_20260804/sim002/pick_camera1_notray_50_0625_1320_wrist_only",
+      "expected_prepared_content_sha256": "5bd9623a419f71ddefba71ccac6a185305093fd81bb84653ed0f2eab2d39c7f5",
+      "camera_layout": "wrist-only",
+      "camera_roles": {
+        "wrist": "observation.images.camera1"
+      },
+      "max_steps": 10000,
+      "save_steps": 2500,
+      "save_total_limit": 4,
+      "expected_raw": {
+        "episodes": 50,
+        "frames": 6533,
+        "task_episode_counts": {"pick up block": 50}
+      }
+    },
+    {
+      "id": "real003",
+      "domain": "real-degrees",
+      "raw_source": "dataset/aws_tuning/3_real_pick_notray/20260604_ep50_random_002",
+      "training_source": "outputs/groot_so101_cleaned_source_datasets/real003_drop_ep0_v3",
+      "prepared_root": "outputs/groot_so101_synthetic_datasets/aws_third_training_20260804/real003",
+      "prepared_dataset": "outputs/groot_so101_synthetic_datasets/aws_third_training_20260804/real003/real003_drop_ep0_v3_triple",
+      "expected_prepared_content_sha256": "deecb5b58723446dfd8daa942f6d772ff84f28531085f4f4fb78ed820fc240e6",
+      "camera_layout": "triple",
+      "camera_roles": {
+        "top": "observation.images.camera3",
+        "left": "observation.images.camera1",
+        "wrist": "observation.images.camera2"
+      },
+      "max_steps": 10000,
+      "save_steps": 2500,
+      "save_total_limit": 4,
+      "removed_raw_episodes": [0],
+      "known_risks": [
+        "left/camera1 has measured temporal stutter; retained because this formal run is triple"
+      ],
+      "expected_raw": {
+        "episodes": 50,
+        "frames": 22460,
+        "task_episode_counts": {"pick up block": 50}
+      },
+      "expected_training": {
+        "episodes": 49,
+        "frames": 22010,
+        "task_episode_counts": {"pick up block": 49}
+      }
+    },
+    {
+      "id": "sim004",
+      "domain": "sim-lerobot-motor-units",
+      "raw_source": "dataset/aws_tuning/4_sim_pick_notray/so101_test_lego_pick",
+      "training_source": "dataset/aws_tuning/4_sim_pick_notray/so101_test_lego_pick",
+      "prepared_root": "outputs/groot_so101_synthetic_datasets/aws_third_training_20260804/sim004",
+      "prepared_dataset": "outputs/groot_so101_synthetic_datasets/aws_third_training_20260804/sim004/so101_test_lego_pick_triple",
+      "expected_prepared_content_sha256": "c9c3ad0df6905a3c5f6599fbff848f867da1d2c212c33a02c44674ad021a75e0",
+      "camera_layout": "triple",
+      "camera_roles": {
+        "top": "observation.images.front",
+        "left": "observation.images.left",
+        "wrist": "observation.images.wrist"
+      },
+      "instruction_override": "pick up block",
+      "instruction_override_reason": "raw task says red cube into box, but all episodes show LEGO pick/lift with no box",
+      "max_steps": 10000,
+      "save_steps": 2500,
+      "save_total_limit": 4,
+      "expected_raw": {
+        "episodes": 49,
+        "frames": 10975,
+        "task_episode_counts": {
+          "pick up the red cube and place it into the box.": 49
+        }
+      }
+    },
+    {
+      "id": "sim005",
+      "domain": "sim-lerobot-motor-units",
+      "raw_source": "dataset/aws_tuning/5_sim_pick_notray_mimic/20260611_pickplace_madeInIssac_merged_002",
+      "training_source": "dataset/aws_tuning/5_sim_pick_notray_mimic/20260611_pickplace_madeInIssac_merged_002",
+      "prepared_root": "outputs/groot_so101_synthetic_datasets/aws_third_training_20260804/sim005",
+      "prepared_dataset": "outputs/groot_so101_synthetic_datasets/aws_third_training_20260804/sim005/20260611_pickplace_madeInIssac_merged_002_triple",
+      "expected_prepared_content_sha256": "2f80a6248ef04962ca74c747ca0f2bf913bf8e95daefa57221d74ac951695dca",
+      "camera_layout": "triple",
+      "camera_roles": {
+        "top": "observation.images.camera1",
+        "left": "observation.images.camera2",
+        "wrist": "observation.images.camera3"
+      },
+      "max_steps": 10000,
+      "save_steps": 2500,
+      "save_total_limit": 4,
+      "expected_raw": {
+        "episodes": 100,
+        "frames": 17771,
+        "task_episode_counts": {"pick up block": 100}
+      }
+    },
+    {
+      "id": "real006",
+      "domain": "real-degrees",
+      "raw_source": "dataset/aws_tuning/6_real_2block/20260616_pickplace_multi_block_ep100",
+      "training_source": "outputs/groot_so101_cleaned_source_datasets/real006_drop_ep0_100_v3",
+      "prepared_root": "outputs/groot_so101_synthetic_datasets/aws_third_training_20260804/real006",
+      "prepared_dataset": "outputs/groot_so101_synthetic_datasets/aws_third_training_20260804/real006/real006_drop_ep0_100_v3_triple",
+      "expected_prepared_content_sha256": "45ef55dc747a45bfdb11e01ca0eb2d2260ef73bc3034326fbf1eb431cec37b13",
+      "camera_layout": "triple",
+      "camera_roles": {
+        "top": "observation.images.camera3",
+        "left": "observation.images.camera1",
+        "wrist": "observation.images.camera2"
+      },
+      "removed_raw_episodes": [0, 100],
+      "max_steps": 15000,
+      "save_steps": 3000,
+      "save_total_limit": 5,
+      "expected_raw": {
+        "episodes": 200,
+        "frames": 179562,
+        "task_episode_counts": {
+          "pick up the red block and place it on the tray": 100,
+          "pick up the blue block and place it on the tray": 100
+        }
+      },
+      "expected_training": {
+        "episodes": 198,
+        "frames": 177764,
+        "task_episode_counts": {
+          "pick up the red block and place it on the tray": 99,
+          "pick up the blue block and place it on the tray": 99
+        }
+      }
+    },
+    {
+      "id": "real007",
+      "domain": "real-degrees",
+      "raw_source": "dataset/aws_tuning/7_real_3block/20260617_pickplace_3blocks_multi_ep100",
+      "training_source": "outputs/groot_so101_cleaned_source_datasets/real007_drop_ep0_53_100_121_200_211_v3",
+      "prepared_root": "outputs/groot_so101_synthetic_datasets/aws_third_training_20260804/real007",
+      "prepared_dataset": "outputs/groot_so101_synthetic_datasets/aws_third_training_20260804/real007/real007_drop_ep0_53_100_121_200_211_v3_triple",
+      "expected_prepared_content_sha256": "714ab7a2298a41a22579a8a54def4e635b00cdfed3b2684455ac9cfbf8b15f66",
+      "camera_layout": "triple",
+      "camera_roles": {
+        "top": "observation.images.camera3",
+        "left": "observation.images.camera1",
+        "wrist": "observation.images.camera2"
+      },
+      "removed_raw_episodes": [0, 53, 100, 121, 200, 211],
+      "max_steps": 15000,
+      "save_steps": 3000,
+      "save_total_limit": 5,
+      "expected_raw": {
+        "episodes": 300,
+        "frames": 269153,
+        "task_episode_counts": {
+          "pick up the blue block and place it on the tray": 100,
+          "pick up the red block and place it on the tray": 100,
+          "pick up the small red block and place it on the tray": 100
+        }
+      },
+      "expected_training": {
+        "episodes": 294,
+        "frames": 263763,
+        "task_episode_counts": {
+          "pick up the blue block and place it on the tray": 98,
+          "pick up the red block and place it on the tray": 98,
+          "pick up the small red block and place it on the tray": 98
+        }
+      }
+    },
+    {
+      "id": "sim008",
+      "domain": "sim-lerobot-motor-units",
+      "raw_source": "dataset/aws_tuning/8_sim_3block/merged_3tasks",
+      "training_source": "dataset/aws_tuning/8_sim_3block/merged_3tasks",
+      "prepared_root": "outputs/groot_so101_synthetic_datasets/aws_third_training_20260804/sim008",
+      "prepared_dataset": "outputs/groot_so101_synthetic_datasets/aws_third_training_20260804/sim008/merged_3tasks_triple",
+      "expected_prepared_content_sha256": "0d8a48426d55add8fde156ab0d002b755d693d888bac420489d53f51380601a0",
+      "camera_layout": "triple",
+      "camera_roles": {
+        "top": "observation.images.camera3",
+        "left": "observation.images.camera1",
+        "wrist": "observation.images.camera2"
+      },
+      "max_steps": 10000,
+      "save_steps": 2500,
+      "save_total_limit": 4,
+      "expected_raw": {
+        "episodes": 287,
+        "frames": 61146,
+        "task_episode_counts": {
+          "pick up the blue block and place it on the tray": 91,
+          "pick up the red block and place it on the tray": 101,
+          "pick up the small red block and place it on the tray": 95
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,534 @@
+#!/usr/bin/env bash
+
+# Single AWS H100 entrypoint for the manifest-driven SO101 training batch.
+#
+# The default deployment layout is intentionally rooted on the DLAMI NVMe disk:
+#
+#   /opt/dlami/nvme/smart_project
+#   /opt/dlami/nvme/Isaac-GR00T
+#   /opt/dlami/nvme/cache/{huggingface,uv,xdg}
+#
+# Override AWS_STORAGE_ROOT (and, only when necessary, the more specific path
+# variables below) before invoking this script.  Preflight still requires the
+# project data, caches, and training outputs to resolve onto that storage
+# root's mount and checks the real available space there.
+
+set -Eeuo pipefail
+
+readonly GROOT_COMMIT="9c7e746b2cd37a810070a98ef41d290a07e806c2"
+readonly UV_VERSION="0.11.29"
+readonly BASE_MODEL="nvidia/GR00T-N1.7-3B"
+readonly BASE_MODEL_REVISION="2fc962b973bccdd5d8ce4f67cc63b264d6886495"
+
+AWS_STORAGE_ROOT="${AWS_STORAGE_ROOT:-/opt/dlami/nvme}"
+SMART_PROJECT="${SMART_PROJECT:-$AWS_STORAGE_ROOT/smart_project}"
+GROOT_ROOT="${GROOT_ROOT:-$AWS_STORAGE_ROOT/Isaac-GR00T}"
+AWS_PREPARED_ROOT="$SMART_PROJECT/outputs"
+TRAIN_OUTPUT_ROOT="${TRAIN_OUTPUT_ROOT:-$SMART_PROJECT/outputs/groot_so101_synthetic_finetune}"
+HF_HOME="${HF_HOME:-$AWS_STORAGE_ROOT/cache/huggingface}"
+UV_CACHE_DIR="${UV_CACHE_DIR:-$AWS_STORAGE_ROOT/cache/uv}"
+UV_PYTHON_INSTALL_DIR="${UV_PYTHON_INSTALL_DIR:-$AWS_STORAGE_ROOT/cache/uv-python}"
+XDG_CACHE_HOME="${XDG_CACHE_HOME:-$AWS_STORAGE_ROOT/cache/xdg}"
+TORCH_HOME="${TORCH_HOME:-$AWS_STORAGE_ROOT/cache/torch}"
+TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-$AWS_STORAGE_ROOT/cache/torchinductor}"
+TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-$AWS_STORAGE_ROOT/cache/triton}"
+TMPDIR="${TMPDIR:-$AWS_STORAGE_ROOT/tmp}"
+UV_INSTALL_DIR="$AWS_STORAGE_ROOT/bin"
+UV_BIN="$UV_INSTALL_DIR/uv"
+AWS_MIN_FREE_GIB="${AWS_MIN_FREE_GIB:-2500}"
+BASE_MODEL_PATH=""
+
+AWS_TRAINING_REL="experiments/groot_n17_isaac_smart_task/aws_training"
+FULL_FINETUNE_REL="experiments/groot_n17_isaac_smart_task/full_finetune_so101"
+BATCH_SCRIPT="$SMART_PROJECT/$AWS_TRAINING_REL/aws_training_batch.py"
+TRAIN_WRAPPER="$SMART_PROJECT/$FULL_FINETUNE_REL/train_so101_synthetic_groot.py"
+MANIFEST="$SMART_PROJECT/$AWS_TRAINING_REL/aws_tuning_8_manifest.json"
+GROOT_PYTHON="$GROOT_ROOT/.venv/bin/python"
+AWS_DATA_PYTHON="$GROOT_PYTHON"
+
+export AWS_STORAGE_ROOT SMART_PROJECT GROOT_ROOT AWS_PREPARED_ROOT TRAIN_OUTPUT_ROOT
+export HF_HOME UV_CACHE_DIR UV_PYTHON_INSTALL_DIR XDG_CACHE_HOME TORCH_HOME TORCHINDUCTOR_CACHE_DIR
+export TRITON_CACHE_DIR TMPDIR AWS_DATA_PYTHON
+
+log() {
+    printf '[aws-pipeline] %s\n' "$*"
+}
+
+die() {
+    printf '[aws-pipeline] ERROR: %s\n' "$*" >&2
+    exit 1
+}
+
+on_error() {
+    local exit_code=$?
+    printf '[aws-pipeline] ERROR: command failed at line %s (exit=%s)\n' \
+        "${BASH_LINENO[0]}" "$exit_code" >&2
+    exit "$exit_code"
+}
+trap on_error ERR
+
+usage() {
+    cat <<'EOF'
+Usage:
+  aws_training_pipeline.sh bootstrap
+  aws_training_pipeline.sh auth
+  aws_training_pipeline.sh preflight
+  aws_training_pipeline.sh audit    [all|DATASET_ID ...] [-- batch options]
+  aws_training_pipeline.sh prepare  [all|DATASET_ID ...] [-- batch options]
+  aws_training_pipeline.sh verify   [all|DATASET_ID ...] [-- batch options]
+  aws_training_pipeline.sh stats    [all|DATASET_ID ...] [-- batch options]
+  aws_training_pipeline.sh dry-run  [all|DATASET_ID ...] [-- batch options]
+  aws_training_pipeline.sh smoke    [all|DATASET_ID ...] [-- batch options]
+  aws_training_pipeline.sh train    [all|DATASET_ID ...] [-- batch options]
+
+Examples:
+  ./aws_training_pipeline.sh audit all --deep-video
+  ./aws_training_pipeline.sh stats real003 --run-tag aws-third-real003
+  ./aws_training_pipeline.sh smoke real003 --run-tag aws-third-real003
+  ./aws_training_pipeline.sh train all --run-tag aws-third-20260804
+
+Environment overrides:
+  AWS_STORAGE_ROOT   Production storage root (default /opt/dlami/nvme)
+  SMART_PROJECT      Synced project root below that storage root
+  GROOT_ROOT         Exact Isaac-GR00T checkout
+  TRAIN_OUTPUT_ROOT  Checkpoint output root
+  HF_HOME            Hugging Face cache
+  UV_CACHE_DIR       uv cache
+  UV_PYTHON_INSTALL_DIR  uv-managed Python storage
+  XDG_CACHE_HOME     compiler/runtime cache
+  AWS_MIN_FREE_GIB   Required free space on the production mount (default 2500)
+
+Raw and prepared manifest paths remain below SMART_PROJECT; they are intentionally
+not independently overridable. Other path overrides do not bypass storage validation.
+The standalone `--` separator is optional and is removed before forwarding.
+EOF
+}
+
+require_command() {
+    command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
+}
+
+assert_known_host() {
+    [[ "$(uname -s)" == "Linux" ]] || die "expected Linux, got $(uname -s)"
+    [[ "$(uname -m)" == "x86_64" ]] || die "expected x86_64, got $(uname -m)"
+    [[ -r /etc/os-release ]] || die "/etc/os-release is missing"
+
+    local os_id os_version
+    os_id="$(sed -n 's/^ID=//p' /etc/os-release | tr -d '"')"
+    os_version="$(sed -n 's/^VERSION_ID=//p' /etc/os-release | tr -d '"')"
+    [[ "$os_id" == "ubuntu" ]] || die "expected Ubuntu, got ID=$os_id"
+    [[ "$os_version" == "24.04" ]] || \
+        die "expected the validated Ubuntu 24.04 DLAMI, got VERSION_ID=$os_version"
+    log "host: Ubuntu $os_version x86_64"
+}
+
+detect_cuda_home() {
+    local candidate
+    if [[ -n "${CUDA_HOME:-}" ]]; then
+        candidate="$CUDA_HOME"
+    elif [[ -x /usr/local/cuda-13.2/bin/nvcc ]]; then
+        candidate=/usr/local/cuda-13.2
+    elif [[ -x /usr/local/cuda/bin/nvcc ]]; then
+        candidate=/usr/local/cuda
+    else
+        die "CUDA toolkit not found; use a CUDA DLAMI. This script will not install or downgrade the driver/toolkit"
+    fi
+    [[ -x "$candidate/bin/nvcc" ]] || die "CUDA_HOME has no executable nvcc: $candidate"
+    CUDA_HOME="$(realpath -e "$candidate")"
+    export CUDA_HOME
+    case ":$PATH:" in
+        *":$CUDA_HOME/bin:"*) ;;
+        *) export PATH="$CUDA_HOME/bin:$PATH" ;;
+    esac
+    case ":${LD_LIBRARY_PATH:-}:" in
+        *":$CUDA_HOME/lib64:"*) ;;
+        *) export LD_LIBRARY_PATH="$CUDA_HOME/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" ;;
+    esac
+    log "CUDA_HOME=$CUDA_HOME"
+}
+
+sudo_prefix() {
+    if [[ "$(id -u)" -eq 0 ]]; then
+        return 0
+    fi
+    command -v sudo >/dev/null 2>&1 || die "bootstrap needs root or sudo for apt packages"
+    printf '%s' sudo
+}
+
+bootstrap() {
+    assert_known_host
+    require_command nvidia-smi
+    detect_cuda_home
+
+    [[ -d "$AWS_STORAGE_ROOT" ]] || \
+        die "production storage root does not exist: $AWS_STORAGE_ROOT"
+    [[ -w "$AWS_STORAGE_ROOT" ]] || \
+        die "production storage root is not writable by $(id -un): $AWS_STORAGE_ROOT"
+    [[ -d "$SMART_PROJECT" ]] || \
+        die "sync the project to $SMART_PROJECT before bootstrap"
+    [[ -f "$BATCH_SCRIPT" && -f "$TRAIN_WRAPPER" && -f "$MANIFEST" ]] || \
+        die "AWS training batch/manifest or shared full-finetune wrapper is missing"
+
+    local sudo_cmd
+    sudo_cmd="$(sudo_prefix)"
+    if [[ -n "$sudo_cmd" ]]; then
+        "$sudo_cmd" apt-get update
+        "$sudo_cmd" apt-get install -y --no-install-recommends \
+            ca-certificates curl git git-lfs ffmpeg libaio-dev build-essential rsync tmux
+    else
+        apt-get update
+        apt-get install -y --no-install-recommends \
+            ca-certificates curl git git-lfs ffmpeg libaio-dev build-essential rsync tmux
+    fi
+    git lfs install --skip-repo
+
+    mkdir -p \
+        "$TRAIN_OUTPUT_ROOT" "$HF_HOME" "$UV_CACHE_DIR" "$XDG_CACHE_HOME" \
+        "$TORCH_HOME" "$TORCHINDUCTOR_CACHE_DIR" "$TRITON_CACHE_DIR" \
+        "$TMPDIR" "$UV_INSTALL_DIR" "$UV_PYTHON_INSTALL_DIR"
+
+    if [[ -e "$GROOT_ROOT" && ! -d "$GROOT_ROOT/.git" ]]; then
+        die "GROOT_ROOT exists but is not a Git checkout: $GROOT_ROOT"
+    fi
+    if [[ ! -d "$GROOT_ROOT/.git" ]]; then
+        log "cloning Isaac-GR00T without deployment/evaluation submodules"
+        GIT_LFS_SKIP_SMUDGE=1 git clone --filter=blob:none \
+            https://github.com/NVIDIA/Isaac-GR00T.git "$GROOT_ROOT"
+    fi
+
+    if [[ -n "$(git -C "$GROOT_ROOT" status --porcelain --untracked-files=no)" ]]; then
+        die "Isaac-GR00T has tracked local changes; refusing to switch commits: $GROOT_ROOT"
+    fi
+    git -C "$GROOT_ROOT" fetch origin "$GROOT_COMMIT"
+    GIT_LFS_SKIP_SMUDGE=1 git -C "$GROOT_ROOT" checkout --detach "$GROOT_COMMIT"
+    [[ "$(git -C "$GROOT_ROOT" rev-parse HEAD)" == "$GROOT_COMMIT" ]] || \
+        die "failed to select pinned Isaac-GR00T commit $GROOT_COMMIT"
+
+    log "installing exact uv $UV_VERSION into $UV_INSTALL_DIR"
+    curl -LsSf "https://astral.sh/uv/$UV_VERSION/install.sh" | \
+        env UV_INSTALL_DIR="$UV_INSTALL_DIR" UV_NO_MODIFY_PATH=1 sh
+    [[ -x "$UV_BIN" ]] || die "uv installer did not create $UV_BIN"
+    [[ "$("$UV_BIN" --version)" == "uv $UV_VERSION" ]] || \
+        die "expected uv $UV_VERSION, got $("$UV_BIN" --version)"
+    log "uv=$("$UV_BIN" --version)"
+
+    (
+        cd "$GROOT_ROOT"
+        "$UV_BIN" sync --frozen --python 3.12
+    )
+    [[ -x "$GROOT_PYTHON" ]] || die "GR00T Python was not created: $GROOT_PYTHON"
+    "$GROOT_PYTHON" -c "import gr00t; print('GR00T import OK')"
+
+    log "bootstrap PASS"
+    log "next: $0 auth"
+    log "then: $0 preflight"
+}
+
+huggingface_auth() {
+    [[ -x "$GROOT_ROOT/.venv/bin/hf" ]] || die "run bootstrap first; hf CLI is missing"
+    mkdir -p "$HF_HOME"
+    assert_path_on_production_storage "Hugging Face token store" "$HF_HOME"
+    log "Hugging Face token store=$HF_HOME"
+    "$GROOT_ROOT/.venv/bin/hf" auth login
+}
+
+assert_path_on_production_storage() {
+    local label="$1"
+    local path="$2"
+    local storage_real path_real storage_mount path_mount
+
+    [[ -e "$path" ]] || die "$label path does not exist: $path"
+    storage_real="$(realpath -e "$AWS_STORAGE_ROOT")"
+    path_real="$(realpath -e "$path")"
+    case "$path_real" in
+        "$storage_real"|"$storage_real"/*) ;;
+        *) die "$label resolves outside AWS_STORAGE_ROOT: $path_real (root=$storage_real)" ;;
+    esac
+
+    storage_mount="$(findmnt -n -o TARGET -T "$storage_real")"
+    path_mount="$(findmnt -n -o TARGET -T "$path_real")"
+    [[ -n "$storage_mount" && "$path_mount" == "$storage_mount" ]] || \
+        die "$label is not on production mount $storage_mount: path=$path_real mount=$path_mount"
+    log "$label=$path_real mount=$path_mount"
+}
+
+check_storage() {
+    require_command realpath
+    require_command findmnt
+    [[ "$AWS_MIN_FREE_GIB" =~ ^[1-9][0-9]*$ ]] || \
+        die "AWS_MIN_FREE_GIB must be a positive integer, got $AWS_MIN_FREE_GIB"
+
+    assert_path_on_production_storage "project" "$SMART_PROJECT"
+    assert_path_on_production_storage "Isaac-GR00T checkout" "$GROOT_ROOT"
+    assert_path_on_production_storage "prepared data" "$AWS_PREPARED_ROOT"
+    assert_path_on_production_storage "training output" "$TRAIN_OUTPUT_ROOT"
+    assert_path_on_production_storage "Hugging Face cache" "$HF_HOME"
+    assert_path_on_production_storage "uv cache" "$UV_CACHE_DIR"
+    assert_path_on_production_storage "uv Python installs" "$UV_PYTHON_INSTALL_DIR"
+    assert_path_on_production_storage "XDG cache" "$XDG_CACHE_HOME"
+    assert_path_on_production_storage "torch cache" "$TORCH_HOME"
+    assert_path_on_production_storage "torchinductor cache" "$TORCHINDUCTOR_CACHE_DIR"
+    assert_path_on_production_storage "triton cache" "$TRITON_CACHE_DIR"
+    assert_path_on_production_storage "temporary files" "$TMPDIR"
+
+    local available_kib required_kib
+    available_kib="$(df -Pk "$TRAIN_OUTPUT_ROOT" | awk 'NR == 2 {print $4}')"
+    [[ "$available_kib" =~ ^[0-9]+$ ]] || die "could not read free space for $TRAIN_OUTPUT_ROOT"
+    required_kib=$((AWS_MIN_FREE_GIB * 1024 * 1024))
+    (( available_kib >= required_kib )) || \
+        die "insufficient production storage: available=$((available_kib / 1024 / 1024))GiB required=${AWS_MIN_FREE_GIB}GiB"
+    log "storage free=$((available_kib / 1024 / 1024))GiB required=${AWS_MIN_FREE_GIB}GiB"
+}
+
+check_gpu_and_system_runtime() {
+    require_command nvidia-smi
+    require_command ffmpeg
+    require_command grep
+    detect_cuda_home
+
+    local -a gpu_rows
+    mapfile -t gpu_rows < <(
+        nvidia-smi --query-gpu=name,memory.total,driver_version \
+            --format=csv,noheader,nounits
+    )
+    [[ "${#gpu_rows[@]}" -eq 1 ]] || \
+        die "expected exactly one H100, found ${#gpu_rows[@]} GPUs: ${gpu_rows[*]}"
+    [[ "${gpu_rows[0]}" == *H100* ]] || die "expected H100, got: ${gpu_rows[0]}"
+    log "gpu=${gpu_rows[0]}"
+
+    local ffmpeg_line ffmpeg_major
+    ffmpeg_line="$(ffmpeg -version 2>&1 | sed -n '1p')"
+    ffmpeg_major="$(sed -E 's/^ffmpeg version ([0-9]+).*/\1/' <<<"$ffmpeg_line")"
+    [[ "$ffmpeg_major" =~ ^[0-9]+$ ]] || die "cannot parse FFmpeg version: $ffmpeg_line"
+    (( ffmpeg_major >= 4 && ffmpeg_major <= 7 )) || \
+        die "torchcodec requires FFmpeg major 4-7, got: $ffmpeg_line"
+    local ffmpeg_decoders
+    ffmpeg_decoders="$(ffmpeg -hide_banner -decoders 2>&1)"
+    grep -qi av1 <<<"$ffmpeg_decoders" || die "FFmpeg has no AV1 decoder"
+    log "$ffmpeg_line"
+    "$CUDA_HOME/bin/nvcc" --version | sed -n '/release/p'
+}
+
+check_groot_runtime() {
+    [[ -d "$GROOT_ROOT/.git" ]] || die "Isaac-GR00T checkout missing: $GROOT_ROOT"
+    [[ "$(git -C "$GROOT_ROOT" rev-parse HEAD)" == "$GROOT_COMMIT" ]] || \
+        die "Isaac-GR00T must be exactly $GROOT_COMMIT; got $(git -C "$GROOT_ROOT" rev-parse HEAD)"
+    [[ -z "$(git -C "$GROOT_ROOT" status --porcelain --untracked-files=all)" ]] || \
+        die "Isaac-GR00T worktree is dirty; formal stats/train require exact pinned code"
+    [[ -x "$GROOT_PYTHON" ]] || die "GR00T Python missing: $GROOT_PYTHON"
+    [[ -x "$UV_BIN" ]] || die "pinned uv missing: $UV_BIN"
+    [[ "$("$UV_BIN" --version)" == "uv $UV_VERSION" ]] || \
+        die "expected uv $UV_VERSION, got $("$UV_BIN" --version)"
+    log "Isaac-GR00T commit=$GROOT_COMMIT"
+
+    "$GROOT_PYTHON" - <<'PY'
+import sys
+import deepspeed
+import flash_attn
+import pyarrow
+import torch
+import torchcodec
+import transformers
+import triton
+import gr00t  # noqa: F401
+
+expected = {
+    "torch": "2.9.0+cu128",
+    "torch_cuda": "12.8",
+    "torchcodec": "0.8.0",
+    "triton": "3.5.0",
+    "deepspeed": "0.17.6",
+    "flash_attn": "2.8.3",
+    "transformers": "4.57.3",
+    "pyarrow": "23.0.1",
+}
+actual = {
+    "torch": torch.__version__,
+    "torch_cuda": torch.version.cuda,
+    "torchcodec": torchcodec.__version__,
+    "triton": triton.__version__,
+    "deepspeed": deepspeed.__version__,
+    "flash_attn": flash_attn.__version__,
+    "transformers": transformers.__version__,
+    "pyarrow": pyarrow.__version__,
+}
+assert sys.version_info[:2] == (3, 12), sys.version
+assert actual == expected, {"expected": expected, "actual": actual}
+assert torch.cuda.is_available(), "torch.cuda.is_available() is false"
+assert "H100" in torch.cuda.get_device_name(0), torch.cuda.get_device_name(0)
+print("python=", sys.version.split()[0])
+print("versions=", actual)
+print("torch_gpu=", torch.cuda.get_device_name(0))
+
+compiled = torch.compile(lambda x: torch.sin(x) + 1)
+value = compiled(torch.randn(1024, device="cuda"))
+torch.cuda.synchronize()
+assert torch.isfinite(value).all()
+print("torch.compile OK")
+PY
+
+    local sample_video
+    sample_video="${AWS_PREFLIGHT_VIDEO:-}"
+    if [[ -z "$sample_video" ]]; then
+        sample_video="$(find "$AWS_PREPARED_ROOT" -type f -name '*.mp4' -print -quit)"
+    fi
+    [[ -n "$sample_video" && -f "$sample_video" ]] || \
+        die "no prepared MP4 found for torchcodec decode under $AWS_PREPARED_ROOT"
+    "$GROOT_PYTHON" - "$sample_video" <<'PY'
+from pathlib import Path
+import sys
+import torch
+from torchcodec.decoders import VideoDecoder
+
+path = Path(sys.argv[1])
+decoder = VideoDecoder(str(path))
+assert len(decoder) > 0, path
+frame = decoder[0]
+assert frame.ndim == 3 and frame.dtype == torch.uint8, (path, frame.shape, frame.dtype)
+print(f"torchcodec decode OK path={path} frames={len(decoder)} shape={tuple(frame.shape)}")
+PY
+}
+
+check_pipeline_contract() {
+    [[ -f "$BATCH_SCRIPT" ]] || die "batch runner missing: $BATCH_SCRIPT"
+    [[ -f "$TRAIN_WRAPPER" ]] || die "training wrapper missing: $TRAIN_WRAPPER"
+    [[ -f "$MANIFEST" ]] || die "training manifest missing: $MANIFEST"
+    [[ -f "$GROOT_ROOT/gr00t/experiment/launch_finetune.py" ]] || \
+        die "upstream launch_finetune.py missing"
+
+    local manifest_commit
+    manifest_commit="$(
+        "$GROOT_PYTHON" -c \
+            'import json,sys; print(json.load(open(sys.argv[1]))["groot_commit"])' \
+            "$MANIFEST"
+    )"
+    [[ "$manifest_commit" == "$GROOT_COMMIT" ]] || \
+        die "manifest commit $manifest_commit does not match environment commit $GROOT_COMMIT"
+
+    local manifest_model_revision
+    manifest_model_revision="$(
+        "$GROOT_PYTHON" -c \
+            'import json,sys; print(json.load(open(sys.argv[1]))["base_model_revision"])' \
+            "$MANIFEST"
+    )"
+    [[ "$manifest_model_revision" == "$BASE_MODEL_REVISION" ]] || \
+        die "manifest model revision $manifest_model_revision does not match $BASE_MODEL_REVISION"
+
+    local help_output
+    help_output="$(
+        "$GROOT_PYTHON" "$GROOT_ROOT/gr00t/experiment/launch_finetune.py" --help 2>&1
+    )"
+    grep -q -- '--state-dropout-prob' <<<"$help_output" || \
+        die "upstream launch_finetune.py lacks --state-dropout-prob"
+    grep -q -- '--color-jitter-params' <<<"$help_output" || \
+        die "upstream launch_finetune.py lacks --color-jitter-params"
+    "$GROOT_PYTHON" "$BATCH_SCRIPT" --help >/dev/null
+    "$GROOT_PYTHON" "$BATCH_SCRIPT" verify all \
+        --manifest "$MANIFEST" >/dev/null
+    "$GROOT_PYTHON" "$BATCH_SCRIPT" dry-run all \
+        --manifest "$MANIFEST" \
+        --data-python "$AWS_DATA_PYTHON" \
+        --groot-root "$GROOT_ROOT" \
+        --groot-python "$GROOT_PYTHON" \
+        --output-root "$TRAIN_OUTPUT_ROOT" \
+        --run-tag preflight-contract >/dev/null
+    log "all eight prepared dataset contracts OK"
+    log "pipeline contract OK"
+}
+
+check_huggingface_access() {
+    BASE_MODEL_PATH="$("$GROOT_PYTHON" - "$BASE_MODEL" "$BASE_MODEL_REVISION" <<'PY'
+from huggingface_hub import HfApi, snapshot_download
+from pathlib import Path
+import sys
+
+repo_id = sys.argv[1]
+revision = sys.argv[2]
+info = HfApi().model_info(repo_id, revision=revision)
+if info.sha != revision:
+    raise RuntimeError(f"Hugging Face revision mismatch: expected={revision} actual={info.sha}")
+path = snapshot_download(repo_id=repo_id, revision=revision)
+print(Path(path).resolve())
+PY
+    )"
+    [[ -d "$BASE_MODEL_PATH" ]] || die "pinned base-model snapshot missing: $BASE_MODEL_PATH"
+    assert_path_on_production_storage "base model" "$BASE_MODEL_PATH"
+    log "Hugging Face model=$BASE_MODEL revision=$BASE_MODEL_REVISION path=$BASE_MODEL_PATH"
+}
+
+preflight() {
+    assert_known_host
+    check_storage
+    check_gpu_and_system_runtime
+    check_groot_runtime
+    check_pipeline_contract
+    check_huggingface_access
+    log "preflight PASS"
+}
+
+forward_batch() {
+    local action="$1"
+    shift
+
+    local -a forwarded=()
+    local separator_removed=0
+    local argument
+    for argument in "$@"; do
+        if [[ "$argument" == "--" && "$separator_removed" -eq 0 ]]; then
+            separator_removed=1
+            continue
+        fi
+        forwarded+=("$argument")
+    done
+
+    # A real smoke or training run may not bypass the production preflight.
+    if [[ "$action" == "stats" || "$action" == "smoke" || "$action" == "train" ]]; then
+        preflight
+    fi
+
+    [[ -x "$GROOT_PYTHON" ]] || die "run bootstrap first; missing $GROOT_PYTHON"
+    [[ -f "$BATCH_SCRIPT" ]] || die "batch runner missing: $BATCH_SCRIPT"
+    local -a model_args=()
+    if [[ "$action" == "smoke" || "$action" == "train" ]]; then
+        model_args=(--base-model-path "$BASE_MODEL_PATH")
+    fi
+    exec "$GROOT_PYTHON" "$BATCH_SCRIPT" "$action" \
+        "${forwarded[@]}" \
+        "${model_args[@]}" \
+        --manifest "$MANIFEST" \
+        --data-python "$AWS_DATA_PYTHON" \
+        --groot-root "$GROOT_ROOT" \
+        --groot-python "$GROOT_PYTHON" \
+        --output-root "$TRAIN_OUTPUT_ROOT"
+}
+
+main() {
+    local command="${1:-}"
+    case "$command" in
+        bootstrap)
+            [[ "$#" -eq 1 ]] || die "bootstrap takes no positional arguments"
+            bootstrap
+            ;;
+        auth)
+            [[ "$#" -eq 1 ]] || die "auth takes no positional arguments"
+            huggingface_auth
+            ;;
+        preflight)
+            [[ "$#" -eq 1 ]] || die "preflight takes no positional arguments"
+            preflight
+            ;;
+        audit|prepare|verify|stats|dry-run|smoke|train)
+            shift
+            forward_batch "$command" "$@"
+            ;;
+        -h|--help|help|"")
+            usage
+            ;;
+        *)
+            usage >&2
+            die "unknown command: $command"
+            ;;
+    esac
+}
+
+main "$@"
