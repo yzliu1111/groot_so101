@@ -137,6 +137,13 @@ run_groot_python() {
         PYTHONNOUSERSITE=1 "$GROOT_PYTHON" "$@"
 }
 
+find_first_prepared_video() {
+    local prepared_root="$1"
+    # SMART_PROJECT/outputs is deliberately a command-line symlink. -H follows
+    # that entry link without following symlinks nested inside prepared data.
+    find -H "$prepared_root" -type f -name '*.mp4' -print -quit
+}
+
 uv_version_matches() {
     local output="$1"
     local command_name actual_version ignored_suffix
@@ -576,6 +583,7 @@ check_storage() {
 check_gpu_and_system_runtime() {
     require_command nvidia-smi
     require_command ffmpeg
+    require_command find
     require_command grep
     detect_cuda_home
 
@@ -677,7 +685,7 @@ PY
     local sample_video
     sample_video="${AWS_PREFLIGHT_VIDEO:-}"
     if [[ -z "$sample_video" ]]; then
-        sample_video="$(find "$AWS_PREPARED_ROOT" -type f -name '*.mp4' -print -quit)"
+        sample_video="$(find_first_prepared_video "$AWS_PREPARED_ROOT")"
     fi
     [[ -n "$sample_video" && -f "$sample_video" ]] || \
         die "no prepared MP4 found for torchcodec decode under $AWS_PREPARED_ROOT"

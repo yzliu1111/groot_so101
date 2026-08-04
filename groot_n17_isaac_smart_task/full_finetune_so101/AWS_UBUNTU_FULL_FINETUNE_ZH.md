@@ -224,6 +224,7 @@ checkpoint、optimizer 和 trainer state，不要把“允许非空目录”当�
 | 找不到 pyarrow/GR00T 包 | 必须使用 `.venv/bin/python`，不能把符号链接 resolve 成裸 Python |
 | uv 不是 0.11.29 | 重新运行 `bootstrap`；脚本会装到 NVMe 并精确校验 |
 | FFmpeg/torchcodec 不能解 AV1 | 使用 Ubuntu 24.04 的 FFmpeg 4–7 包；先通过实际视频 decode |
+| 明明有 MP4 但 preflight 报 `no prepared MP4` | 项目 `outputs` 是软链接；更新 pipeline。脚本使用 `find -H` 跟随入口链接，但不会跟随 prepared 内部链接 |
 | CUDA 13+ / PTX 门禁失败 | 记录完整 traceback 和 `nvcc/torch/triton`；清掉旧 `.pth`/手改 venv 后重跑 `bootstrap`，不要执行 2.7/3.3.1 历史补丁 |
 | Hugging Face 403/404 | 执行 `./aws_training_pipeline.sh auth` 并确认模型访问权限 |
 | NVMe 空间不足 | 扩大 volume，或明确降低保留量并逐 run 上传；不要写 root filesystem |

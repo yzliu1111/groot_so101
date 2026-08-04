@@ -212,6 +212,59 @@ class AwsTrainingPipelinePathTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_preflight_video_discovery_follows_outputs_entry_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            physical_outputs = root / "physical-outputs"
+            video = physical_outputs / "dataset" / "videos" / "episode_000000.mp4"
+            video.parent.mkdir(parents=True)
+            video.write_bytes(b"test-video")
+            outputs_link = root / "outputs"
+            outputs_link.symlink_to(physical_outputs, target_is_directory=True)
+            script = (
+                'source "$1" help >/dev/null; '
+                'find_first_prepared_video "$2"'
+            )
+            result = subprocess.run(
+                ["bash", "-c", script, "bash", str(PIPELINE), str(outputs_link)],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout.strip(),
+            str(outputs_link / "dataset" / "videos" / "episode_000000.mp4"),
+        )
+
+    def test_preflight_video_discovery_does_not_follow_nested_symlinks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            physical_outputs = root / "physical-outputs"
+            physical_outputs.mkdir()
+            external = root / "external"
+            external.mkdir()
+            (external / "outside.mp4").write_bytes(b"outside")
+            (physical_outputs / "nested-link").symlink_to(
+                external, target_is_directory=True
+            )
+            outputs_link = root / "outputs"
+            outputs_link.symlink_to(physical_outputs, target_is_directory=True)
+            script = (
+                'source "$1" help >/dev/null; '
+                'find_first_prepared_video "$2"'
+            )
+            result = subprocess.run(
+                ["bash", "-c", script, "bash", str(PIPELINE), str(outputs_link)],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "")
+
     def test_paths_discovers_project_from_script_not_local_cwd(self) -> None:
         result = _run_pipeline(PIPELINE, "paths")
         self.assertEqual(result.returncode, 0, result.stderr)
