@@ -2,16 +2,15 @@
 
 # Single AWS H100 entrypoint for the manifest-driven SO101 training batch.
 #
-# The default deployment layout is intentionally rooted on the DLAMI NVMe disk:
+# The repository may be checked out anywhere. The one project-local storage
+# link is deliberately simple:
 #
-#   /opt/dlami/nvme/smart_project
-#   /opt/dlami/nvme/Isaac-GR00T
-#   /opt/dlami/nvme/cache/{huggingface,uv,xdg}
+#   $SMART_PROJECT/outputs -> $AWS_OUTPUTS_TARGET
+#   default target: /opt/dlami/nvme/smart_project_outputs
 #
-# Override AWS_STORAGE_ROOT (and, only when necessary, the more specific path
-# variables below) before invoking this script.  Preflight still requires the
-# project data, caches, and training outputs to resolve onto that storage
-# root's mount and checks the real available space there.
+# GR00T, caches and temporary files use direct paths below AWS_STORAGE_ROOT, so
+# no second project symlink is needed. This script never formats or mounts a
+# block device.
 
 set -Eeuo pipefail
 
@@ -20,10 +19,15 @@ readonly UV_VERSION="0.11.29"
 readonly BASE_MODEL="nvidia/GR00T-N1.7-3B"
 readonly BASE_MODEL_REVISION="2fc962b973bccdd5d8ce4f67cc63b264d6886495"
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+DETECTED_SMART_PROJECT="$(cd -- "$SCRIPT_DIR/../../.." && pwd -P)"
 AWS_STORAGE_ROOT="${AWS_STORAGE_ROOT:-/opt/dlami/nvme}"
-SMART_PROJECT="${SMART_PROJECT:-$AWS_STORAGE_ROOT/smart_project}"
+CONFIGURED_SMART_PROJECT="${SMART_PROJECT:-}"
+SMART_PROJECT="$DETECTED_SMART_PROJECT"
+AWS_OUTPUTS_TARGET="${AWS_OUTPUTS_TARGET:-$AWS_STORAGE_ROOT/smart_project_outputs}"
 GROOT_ROOT="${GROOT_ROOT:-$AWS_STORAGE_ROOT/Isaac-GR00T}"
 AWS_PREPARED_ROOT="$SMART_PROJECT/outputs"
+AWS_TUNING_PREPARED_TARGET="$AWS_OUTPUTS_TARGET/groot_so101_synthetic_datasets/aws_third_training_20260804"
 TRAIN_OUTPUT_ROOT="${TRAIN_OUTPUT_ROOT:-$SMART_PROJECT/outputs/groot_so101_synthetic_finetune}"
 HF_HOME="${HF_HOME:-$AWS_STORAGE_ROOT/cache/huggingface}"
 UV_CACHE_DIR="${UV_CACHE_DIR:-$AWS_STORAGE_ROOT/cache/uv}"
@@ -32,21 +36,21 @@ XDG_CACHE_HOME="${XDG_CACHE_HOME:-$AWS_STORAGE_ROOT/cache/xdg}"
 TORCH_HOME="${TORCH_HOME:-$AWS_STORAGE_ROOT/cache/torch}"
 TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-$AWS_STORAGE_ROOT/cache/torchinductor}"
 TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-$AWS_STORAGE_ROOT/cache/triton}"
-TMPDIR="${TMPDIR:-$AWS_STORAGE_ROOT/tmp}"
+TMPDIR="$AWS_STORAGE_ROOT/tmp"
 UV_INSTALL_DIR="$AWS_STORAGE_ROOT/bin"
 UV_BIN="$UV_INSTALL_DIR/uv"
 AWS_MIN_FREE_GIB="${AWS_MIN_FREE_GIB:-2500}"
 BASE_MODEL_PATH=""
 
-AWS_TRAINING_REL="experiments/groot_n17_isaac_smart_task/aws_training"
-FULL_FINETUNE_REL="experiments/groot_n17_isaac_smart_task/full_finetune_so101"
-BATCH_SCRIPT="$SMART_PROJECT/$AWS_TRAINING_REL/aws_training_batch.py"
-TRAIN_WRAPPER="$SMART_PROJECT/$FULL_FINETUNE_REL/train_so101_synthetic_groot.py"
-MANIFEST="$SMART_PROJECT/$AWS_TRAINING_REL/aws_tuning_8_manifest.json"
+FULL_FINETUNE_DIR="$SCRIPT_DIR/../full_finetune_so101"
+BATCH_SCRIPT="$SCRIPT_DIR/aws_training_batch.py"
+TRAIN_WRAPPER="$FULL_FINETUNE_DIR/train_so101_synthetic_groot.py"
+MANIFEST="$SCRIPT_DIR/aws_tuning_8_manifest.json"
 GROOT_PYTHON="$GROOT_ROOT/.venv/bin/python"
 AWS_DATA_PYTHON="$GROOT_PYTHON"
 
-export AWS_STORAGE_ROOT SMART_PROJECT GROOT_ROOT AWS_PREPARED_ROOT TRAIN_OUTPUT_ROOT
+export AWS_STORAGE_ROOT AWS_OUTPUTS_TARGET SMART_PROJECT
+export GROOT_ROOT AWS_PREPARED_ROOT TRAIN_OUTPUT_ROOT
 export HF_HOME UV_CACHE_DIR UV_PYTHON_INSTALL_DIR XDG_CACHE_HOME TORCH_HOME TORCHINDUCTOR_CACHE_DIR
 export TRITON_CACHE_DIR TMPDIR AWS_DATA_PYTHON
 
@@ -70,6 +74,8 @@ trap on_error ERR
 usage() {
     cat <<'EOF'
 Usage:
+  aws_training_pipeline.sh paths
+  aws_training_pipeline.sh storage-link
   aws_training_pipeline.sh bootstrap
   aws_training_pipeline.sh auth
   aws_training_pipeline.sh preflight
@@ -82,14 +88,17 @@ Usage:
   aws_training_pipeline.sh train    [all|DATASET_ID ...] [-- batch options]
 
 Examples:
+  AWS_STORAGE_ROOT=/mnt/aws-training ./aws_training_pipeline.sh paths
+  AWS_STORAGE_ROOT=/mnt/aws-training ./aws_training_pipeline.sh storage-link
   ./aws_training_pipeline.sh audit all --deep-video
-  ./aws_training_pipeline.sh stats real003 --run-tag aws-third-real003
-  ./aws_training_pipeline.sh smoke real003 --run-tag aws-third-real003
-  ./aws_training_pipeline.sh train all --run-tag aws-third-20260804
+  ./aws_training_pipeline.sh stats real003 --run-tag aws-third-20260804-real003
+  ./aws_training_pipeline.sh smoke real003 --run-tag aws-third-20260804-real003
+  ./aws_training_pipeline.sh train real003 --run-tag aws-third-20260804-real003
 
 Environment overrides:
-  AWS_STORAGE_ROOT   Production storage root (default /opt/dlami/nvme)
-  SMART_PROJECT      Synced project root below that storage root
+  AWS_STORAGE_ROOT   Already-mounted non-root data volume (DLAMI default /opt/dlami/nvme)
+  AWS_OUTPUTS_TARGET Physical outputs directory (default /opt/dlami/nvme/smart_project_outputs)
+  SMART_PROJECT      Optional consistency check; must resolve to this script's project root
   GROOT_ROOT         Exact Isaac-GR00T checkout
   TRAIN_OUTPUT_ROOT  Checkpoint output root
   HF_HOME            Hugging Face cache
@@ -98,14 +107,174 @@ Environment overrides:
   XDG_CACHE_HOME     compiler/runtime cache
   AWS_MIN_FREE_GIB   Required free space on the production mount (default 2500)
 
-Raw and prepared manifest paths remain below SMART_PROJECT; they are intentionally
-not independently overridable. Other path overrides do not bypass storage validation.
-The standalone `--` separator is optional and is removed before forwarding.
+The script discovers SMART_PROJECT from its own location, so the AWS checkout path
+does not need to match the local workstation. Run storage-link once before uploading
+prepared data or running bootstrap. It creates only SMART_PROJECT/outputs; GR00T and
+caches use direct paths below AWS_STORAGE_ROOT. The script does not run mkfs or mount.
+Other path overrides do not bypass storage validation. The standalone `--` separator
+is optional and is removed before forwarding.
 EOF
 }
 
 require_command() {
     command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
+}
+
+validate_project_layout() {
+    require_command realpath
+    [[ -d "$SMART_PROJECT" ]] || die "project root does not exist: $SMART_PROJECT"
+
+    if [[ -n "$CONFIGURED_SMART_PROJECT" ]]; then
+        [[ -d "$CONFIGURED_SMART_PROJECT" ]] || \
+            die "configured SMART_PROJECT does not exist: $CONFIGURED_SMART_PROJECT"
+        local configured_project
+        configured_project="$(realpath -e "$CONFIGURED_SMART_PROJECT")"
+        [[ "$configured_project" == "$DETECTED_SMART_PROJECT" ]] || \
+            die "SMART_PROJECT must resolve to the project containing this script: configured=$configured_project detected=$DETECTED_SMART_PROJECT"
+    fi
+
+    [[ -f "$BATCH_SCRIPT" && -f "$TRAIN_WRAPPER" && -f "$MANIFEST" ]] || \
+        die "AWS training batch/manifest or shared full-finetune wrapper is missing"
+}
+
+show_paths() {
+    printf 'SMART_PROJECT=%s\n' "$SMART_PROJECT"
+    printf 'AWS_STORAGE_ROOT=%s\n' "$AWS_STORAGE_ROOT"
+    printf 'AWS_OUTPUTS_LINK=%s\n' "$AWS_PREPARED_ROOT"
+    printf 'AWS_OUTPUTS_TARGET=%s\n' "$AWS_OUTPUTS_TARGET"
+    printf 'AWS_TUNING_PREPARED_TARGET=%s\n' "$AWS_TUNING_PREPARED_TARGET"
+    printf 'GROOT_ROOT=%s\n' "$GROOT_ROOT"
+    printf 'TRAIN_OUTPUT_ROOT=%s\n' "$TRAIN_OUTPUT_ROOT"
+    printf 'HF_HOME=%s\n' "$HF_HOME"
+    printf 'UV_CACHE_DIR=%s\n' "$UV_CACHE_DIR"
+    printf 'TORCH_HOME=%s\n' "$TORCH_HOME"
+    printf 'TORCHINDUCTOR_CACHE_DIR=%s\n' "$TORCHINDUCTOR_CACHE_DIR"
+    printf 'TRITON_CACHE_DIR=%s\n' "$TRITON_CACHE_DIR"
+    printf 'TMPDIR=%s\n' "$TMPDIR"
+}
+
+assert_dedicated_storage_mount() {
+    require_command realpath
+    require_command findmnt
+    [[ -d "$AWS_STORAGE_ROOT" ]] || \
+        die "AWS_STORAGE_ROOT does not exist; mount the large volume first: $AWS_STORAGE_ROOT"
+    [[ -w "$AWS_STORAGE_ROOT" ]] || \
+        die "AWS_STORAGE_ROOT is not writable by $(id -un): $AWS_STORAGE_ROOT"
+
+    local storage_real storage_device root_device storage_mount
+    storage_real="$(realpath -e "$AWS_STORAGE_ROOT")"
+    storage_device="$(findmnt -n -o MAJ:MIN -T "$storage_real")"
+    root_device="$(findmnt -n -o MAJ:MIN -T /)"
+    storage_mount="$(findmnt -n -o TARGET -T "$storage_real")"
+    [[ -n "$storage_device" && -n "$root_device" && -n "$storage_mount" ]] || \
+        die "cannot identify storage/root mounts with findmnt"
+    [[ "$storage_device" != "$root_device" ]] || \
+        die "AWS_STORAGE_ROOT is still on the root filesystem ($storage_device, mount=$storage_mount). Mount the large data volume and point AWS_STORAGE_ROOT at it before any setup."
+    log "production storage=$storage_real mount=$storage_mount device=$storage_device root_device=$root_device"
+}
+
+assert_outputs_target_disjoint() {
+    local project_real target_real
+    project_real="$(realpath -e "$SMART_PROJECT")"
+    target_real="$(realpath -m "$AWS_OUTPUTS_TARGET")"
+    case "$target_real" in
+        "$project_real"|"$project_real"/*)
+            die "AWS_OUTPUTS_TARGET must be outside the project checkout: target=$target_real project=$project_real"
+            ;;
+    esac
+    case "$project_real" in
+        "$target_real"|"$target_real"/*)
+            die "project checkout must not be inside AWS_OUTPUTS_TARGET: project=$project_real target=$target_real"
+            ;;
+    esac
+}
+
+check_available_storage() {
+    require_command df
+    require_command awk
+    [[ "$AWS_MIN_FREE_GIB" =~ ^[1-9][0-9]*$ ]] || \
+        die "AWS_MIN_FREE_GIB must be a positive integer, got $AWS_MIN_FREE_GIB"
+
+    local available_kib required_kib
+    available_kib="$(df -Pk "$AWS_STORAGE_ROOT" | awk 'NR == 2 {print $4}')"
+    [[ "$available_kib" =~ ^[0-9]+$ ]] || \
+        die "could not read free space for $AWS_STORAGE_ROOT"
+    required_kib=$((AWS_MIN_FREE_GIB * 1024 * 1024))
+    (( available_kib >= required_kib )) || \
+        die "insufficient production storage: available=$((available_kib / 1024 / 1024))GiB required=${AWS_MIN_FREE_GIB}GiB"
+    log "storage free=$((available_kib / 1024 / 1024))GiB required=${AWS_MIN_FREE_GIB}GiB"
+}
+
+check_symlink_slot() {
+    local label="$1"
+    local link_path="$2"
+    local target_path="$3"
+
+    if [[ -L "$link_path" ]]; then
+        [[ -e "$link_path" ]] || \
+            die "$label is a dangling symlink: $link_path -> $(readlink "$link_path")"
+        [[ -d "$target_path" ]] || \
+            die "$label target is not a directory: $target_path"
+        local actual_target expected_target
+        actual_target="$(realpath -e "$link_path")"
+        expected_target="$(realpath -e "$target_path")"
+        [[ "$actual_target" == "$expected_target" ]] || \
+            die "$label points to the wrong target: actual=$actual_target expected=$expected_target"
+    elif [[ -e "$link_path" ]]; then
+        die "$label path already exists and is not a symlink: $link_path. This script will not move, delete, or overwrite it."
+    fi
+}
+
+create_storage_symlink() {
+    local label="$1"
+    local link_path="$2"
+    local target_path="$3"
+    if [[ ! -L "$link_path" ]]; then
+        ln -s "$(realpath -e "$target_path")" "$link_path"
+        log "created $label symlink: $link_path -> $(realpath -e "$target_path")"
+    fi
+    check_symlink_slot "$label" "$link_path" "$target_path"
+}
+
+storage_link() {
+    assert_dedicated_storage_mount
+    check_available_storage
+    assert_outputs_target_disjoint
+
+    # Validate the existing project path before creating anything. Conflicts
+    # fail closed; the script never migrates, removes or overwrites user data.
+    check_symlink_slot "outputs" "$AWS_PREPARED_ROOT" "$AWS_OUTPUTS_TARGET"
+
+    assert_future_path_on_production_storage "outputs target" "$AWS_OUTPUTS_TARGET"
+    mkdir -p "$AWS_OUTPUTS_TARGET"
+    assert_path_on_production_storage "outputs target" "$AWS_OUTPUTS_TARGET"
+    create_storage_symlink "outputs" "$AWS_PREPARED_ROOT" "$AWS_OUTPUTS_TARGET"
+    assert_outputs_link_ready
+
+    log "storage-link PASS"
+    log "upload prepared v2.1 data to $AWS_TUNING_PREPARED_TARGET"
+    log "logical project path is $AWS_PREPARED_ROOT/groot_so101_synthetic_datasets/aws_third_training_20260804"
+}
+
+assert_outputs_link_ready() {
+    assert_dedicated_storage_mount
+    check_available_storage
+    assert_outputs_target_disjoint
+    [[ -L "$AWS_PREPARED_ROOT" ]] || \
+        die "outputs symlink is missing; run: AWS_STORAGE_ROOT=$AWS_STORAGE_ROOT $0 storage-link"
+    check_symlink_slot "outputs" "$AWS_PREPARED_ROOT" "$AWS_OUTPUTS_TARGET"
+    assert_path_on_production_storage "project outputs" "$AWS_PREPARED_ROOT"
+    assert_future_path_on_production_storage "Isaac-GR00T checkout" "$GROOT_ROOT"
+    assert_future_path_on_production_storage "training output" "$TRAIN_OUTPUT_ROOT"
+    assert_future_path_on_production_storage "Hugging Face cache" "$HF_HOME"
+    assert_future_path_on_production_storage "uv cache" "$UV_CACHE_DIR"
+    assert_future_path_on_production_storage "uv Python installs" "$UV_PYTHON_INSTALL_DIR"
+    assert_future_path_on_production_storage "XDG cache" "$XDG_CACHE_HOME"
+    assert_future_path_on_production_storage "torch cache" "$TORCH_HOME"
+    assert_future_path_on_production_storage "torchinductor cache" "$TORCHINDUCTOR_CACHE_DIR"
+    assert_future_path_on_production_storage "triton cache" "$TRITON_CACHE_DIR"
+    assert_future_path_on_production_storage "temporary files" "$TMPDIR"
+    assert_future_path_on_production_storage "uv executable directory" "$UV_INSTALL_DIR"
 }
 
 assert_known_host() {
@@ -159,15 +328,7 @@ bootstrap() {
     assert_known_host
     require_command nvidia-smi
     detect_cuda_home
-
-    [[ -d "$AWS_STORAGE_ROOT" ]] || \
-        die "production storage root does not exist: $AWS_STORAGE_ROOT"
-    [[ -w "$AWS_STORAGE_ROOT" ]] || \
-        die "production storage root is not writable by $(id -un): $AWS_STORAGE_ROOT"
-    [[ -d "$SMART_PROJECT" ]] || \
-        die "sync the project to $SMART_PROJECT before bootstrap"
-    [[ -f "$BATCH_SCRIPT" && -f "$TRAIN_WRAPPER" && -f "$MANIFEST" ]] || \
-        die "AWS training batch/manifest or shared full-finetune wrapper is missing"
+    assert_outputs_link_ready
 
     local sudo_cmd
     sudo_cmd="$(sudo_prefix)"
@@ -225,6 +386,7 @@ bootstrap() {
 }
 
 huggingface_auth() {
+    assert_outputs_link_ready
     [[ -x "$GROOT_ROOT/.venv/bin/hf" ]] || die "run bootstrap first; hf CLI is missing"
     mkdir -p "$HF_HOME"
     assert_path_on_production_storage "Hugging Face token store" "$HF_HOME"
@@ -252,13 +414,21 @@ assert_path_on_production_storage() {
     log "$label=$path_real mount=$path_mount"
 }
 
-check_storage() {
-    require_command realpath
-    require_command findmnt
-    [[ "$AWS_MIN_FREE_GIB" =~ ^[1-9][0-9]*$ ]] || \
-        die "AWS_MIN_FREE_GIB must be a positive integer, got $AWS_MIN_FREE_GIB"
+assert_future_path_on_production_storage() {
+    local label="$1"
+    local path="$2"
+    local storage_real path_real
 
-    assert_path_on_production_storage "project" "$SMART_PROJECT"
+    storage_real="$(realpath -e "$AWS_STORAGE_ROOT")"
+    path_real="$(realpath -m "$path")"
+    case "$path_real" in
+        "$storage_real"|"$storage_real"/*) ;;
+        *) die "$label would resolve outside AWS_STORAGE_ROOT before setup writes it: $path_real (root=$storage_real)" ;;
+    esac
+}
+
+check_storage() {
+    assert_outputs_link_ready
     assert_path_on_production_storage "Isaac-GR00T checkout" "$GROOT_ROOT"
     assert_path_on_production_storage "prepared data" "$AWS_PREPARED_ROOT"
     assert_path_on_production_storage "training output" "$TRAIN_OUTPUT_ROOT"
@@ -270,14 +440,6 @@ check_storage() {
     assert_path_on_production_storage "torchinductor cache" "$TORCHINDUCTOR_CACHE_DIR"
     assert_path_on_production_storage "triton cache" "$TRITON_CACHE_DIR"
     assert_path_on_production_storage "temporary files" "$TMPDIR"
-
-    local available_kib required_kib
-    available_kib="$(df -Pk "$TRAIN_OUTPUT_ROOT" | awk 'NR == 2 {print $4}')"
-    [[ "$available_kib" =~ ^[0-9]+$ ]] || die "could not read free space for $TRAIN_OUTPUT_ROOT"
-    required_kib=$((AWS_MIN_FREE_GIB * 1024 * 1024))
-    (( available_kib >= required_kib )) || \
-        die "insufficient production storage: available=$((available_kib / 1024 / 1024))GiB required=${AWS_MIN_FREE_GIB}GiB"
-    log "storage free=$((available_kib / 1024 / 1024))GiB required=${AWS_MIN_FREE_GIB}GiB"
 }
 
 check_gpu_and_system_runtime() {
@@ -481,9 +643,13 @@ forward_batch() {
         forwarded+=("$argument")
     done
 
-    # A real smoke or training run may not bypass the production preflight.
+    # Every AWS batch action must resolve all mutable paths onto the large
+    # volume. Formal stats/smoke/train additionally run the full GPU/model/data
+    # preflight; the lighter actions still cannot create data on the root disk.
     if [[ "$action" == "stats" || "$action" == "smoke" || "$action" == "train" ]]; then
         preflight
+    else
+        assert_outputs_link_ready
     fi
 
     [[ -x "$GROOT_PYTHON" ]] || die "run bootstrap first; missing $GROOT_PYTHON"
@@ -505,6 +671,22 @@ forward_batch() {
 main() {
     local command="${1:-}"
     case "$command" in
+        -h|--help|help|"")
+            usage
+            return
+            ;;
+    esac
+
+    validate_project_layout
+    case "$command" in
+        paths)
+            [[ "$#" -eq 1 ]] || die "paths takes no positional arguments"
+            show_paths
+            ;;
+        storage-link)
+            [[ "$#" -eq 1 ]] || die "storage-link takes no positional arguments"
+            storage_link
+            ;;
         bootstrap)
             [[ "$#" -eq 1 ]] || die "bootstrap takes no positional arguments"
             bootstrap
@@ -520,9 +702,6 @@ main() {
         audit|prepare|verify|stats|dry-run|smoke|train)
             shift
             forward_batch "$command" "$@"
-            ;;
-        -h|--help|help|"")
-            usage
             ;;
         *)
             usage >&2

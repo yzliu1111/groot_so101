@@ -18,7 +18,7 @@
 |---|---|---|
 | Bridge + Isaac 部署 | `zero_shot_isaac_smart_task/` | 五张公司运行卡、camera/dry-run/one-step、trace/contact/replay |
 | Full fine-tune | `full_finetune_so101/` | 通用训练 wrapper、数据准备、参数参考、modality configs |
-| AWS H100 batch | `aws_training/` | 环境 bootstrap、preflight、八数据 manifest、stats/smoke/train |
+| AWS H100 batch | `aws_training/` | `outputs` 大盘软链接、环境 bootstrap、preflight、八数据独立 stats/smoke/train |
 | Low-memory / LoRA / freeze | `lowmem_lora_freeze_so101/` | `train_so101_synthetic_groot_lowmem.py` |
 | Ubuntu 环境搭建 | `ubuntu_env_setup/` | `README_ZH.md` |
 

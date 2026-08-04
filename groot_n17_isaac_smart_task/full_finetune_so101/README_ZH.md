@@ -70,51 +70,86 @@ AWS 不需要 raw v3、LeRobot、Isaac Sim、IsaacLab、LeIsaac 或 assets。
 
 ## AWS：统一入口
 
-先把项目和 prepared data 放到 `/opt/dlami/nvme/smart_project`。在新实例上：
+AWS 项目路径不需要与本机相同。先确认并挂载独立大盘，然后设置目标机实际路径：
 
 ```bash
-cd /opt/dlami/nvme/smart_project/experiments/groot_n17_isaac_smart_task/aws_training
+export AWS_PROJECT_DIR=/home/ubuntu/smart_project
+export AWS_STORAGE_ROOT=/opt/dlami/nvme
+export AWS_OUTPUTS_TARGET=/opt/dlami/nvme/smart_project_outputs
 
+cd "$AWS_PROJECT_DIR/experiments/groot_n17_isaac_smart_task/aws_training"
+
+./aws_training_pipeline.sh paths
+./aws_training_pipeline.sh storage-link
 ./aws_training_pipeline.sh bootstrap
 ./aws_training_pipeline.sh auth
 ./aws_training_pipeline.sh preflight
-./aws_training_pipeline.sh stats all --run-tag aws-third-20260804
+```
+
+脚本从自身位置识别 `SMART_PROJECT`；`AWS_PROJECT_DIR` 只用于进入目录。`storage-link` 会让
+项目的 `outputs` 指向 `/opt/dlami/nvme/smart_project_outputs`，并拒绝 root filesystem、实体
+目录冲突、错误链接或悬空链接。它不会自动移动、删除、格式化或挂载数据。GR00T 和 cache
+直接写入 `/opt/dlami/nvme`，不再建立第二条项目软链接。详细路径与上传顺序见
+[AWS_UBUNTU_FULL_FINETUNE_ZH.md](AWS_UBUNTU_FULL_FINETUNE_ZH.md)。
+
+八份 prepared v2.1 数据在 AWS 上的固定物理目录是：
+
+```text
+/opt/dlami/nvme/smart_project_outputs/
+└── groot_so101_synthetic_datasets/aws_third_training_20260804/
 ```
 
 `bootstrap` 固定已验证的 GR00T commit 和 uv 0.11.29，并执行
 `uv sync --frozen --python 3.12`；不安装、
 降级或替换 NVIDIA driver，也不安装 Isaac。`preflight` 检查 H100、FFmpeg/AV1、
 torchcodec、`torch.compile`、精确依赖版本、八份 prepared contract、Hugging Face 访问和
-NVMe 真实挂载/空间，并下载 manifest 固定 revision 的 base model。`auth` 与训练共用 NVMe
-上的 `HF_HOME`。`stats all` 随后在同一个固定 commit 下强制重算 stats、执行 span-ratio
-门控并记录 SHA256；不要只依赖另一台机器生成的 stats。
+大盘真实挂载/空间，并下载 manifest 固定 revision 的 base model。`auth` 与训练共用大盘
+上的 `HF_HOME`。每份 `stats <id>`（或顺序批处理 `stats all`）都会在同一个固定 commit 下
+强制重算 stats、执行 span-ratio 门控并记录 SHA256；不要只依赖另一台机器生成的 stats。
 `smoke/train` 会强制查找同一个 run-tag 的 stats lineage；没有它或任何 SHA 不一致都会停止。
 
-先逐份或全部做 1-step smoke：
+任何一份正式命令运行前，八份 prepared leaf 都必须先上传完整，因为 preflight 会统一执行
+`verify all` 和 `dry-run all`。
+
+推荐逐份运行。每份的 `stats/smoke/train` 必须使用同一个独立 tag：
 
 ```bash
-./aws_training_pipeline.sh smoke all --run-tag aws-third-20260804
+./aws_training_pipeline.sh stats real001 --run-tag aws-third-20260804-real001
+./aws_training_pipeline.sh smoke real001 --run-tag aws-third-20260804-real001
+./aws_training_pipeline.sh train real001 --run-tag aws-third-20260804-real001
 ```
 
-全部 smoke PASS 后，今晚的通用训练指令只有一条：
+八份 tag 是：
 
-```bash
-./aws_training_pipeline.sh train all --run-tag aws-third-20260804
-```
+| dataset | run-tag |
+|---|---|
+| real001 | `aws-third-20260804-real001` |
+| sim002 | `aws-third-20260804-sim002` |
+| real003 | `aws-third-20260804-real003` |
+| sim004 | `aws-third-20260804-sim004` |
+| sim005 | `aws-third-20260804-sim005` |
+| real006 | `aws-third-20260804-real006` |
+| real007 | `aws-third-20260804-real007` |
+| sim008 | `aws-third-20260804-sim008` |
 
-`all` 不是并行启动。每个 run 完成后才进入下一个，checkpoint 位于：
+把上面模板中的 dataset 和 run-tag 成对替换即可。八份可直接复制的 24 条完整指令见
+[AWS 手册的“八份数据分别训练”](AWS_UBUNTU_FULL_FINETUNE_ZH.md#八份数据分别训练)。
+
+仍保留 `stats/smoke/train all --run-tag ...` 作为顺序批处理入口；`all` 不是并行启动，也不会
+建立 mixture。
+
+checkpoint 的逻辑路径位于：
 
 ```text
-/opt/dlami/nvme/smart_project/outputs/groot_so101_synthetic_finetune/
-└── aws-third-20260804/{real001,sim002,real003,sim004,sim005,real006,real007,sim008}
+$AWS_PROJECT_DIR/outputs/groot_so101_synthetic_finetune/
+└── <run-tag>/<dataset-id>
 ```
 
-只跑一份时把 `all` 换成 ID，例如：
+对应的物理路径是：
 
-```bash
-./aws_training_pipeline.sh stats real003 --run-tag aws-third-20260804-real003
-./aws_training_pipeline.sh smoke real003 --run-tag aws-third-20260804-real003
-./aws_training_pipeline.sh train real003 --run-tag aws-third-20260804-real003
+```text
+/opt/dlami/nvme/smart_project_outputs/groot_so101_synthetic_finetune/
+└── <run-tag>/<dataset-id>
 ```
 
 ## 不再使用的活动入口

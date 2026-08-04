@@ -28,42 +28,102 @@ H100、`nvcc`、PyTorch CUDA、`torch.compile` 和 torchcodec 解码，失败才
 不要固定修改 Triton PTX 版本。已验证的 Triton 3.5.0 原生输出可用 PTX；只有 preflight 的
 `torch.compile` 真正失败时才单独诊断，不能每次新实例都盲打历史补丁。
 
-## 磁盘布局
+## 今晚固定的 AWS 路径
 
-默认所有大文件必须真实落在同一块 NVMe：
+目标机已经用 `df -h` 确认：`/` 约 193GB，`/opt/dlami/nvme` 约 3.5TB。
+今晚不再猜设备、不再另建挂载点，直接使用已经挂载好的 `/opt/dlami/nvme`。
+项目代码可以位于目标机任意正常路径；脚本从自身位置自动识别 `SMART_PROJECT`。
+
+唯一的项目软链接是：
 
 ```text
-/opt/dlami/nvme/
-├── Isaac-GR00T/
-├── smart_project/
-│   ├── experiments/...
-│   ├── outputs/...prepared datasets...
-│   └── outputs/groot_so101_synthetic_finetune/
-├── cache/{huggingface,uv,uv-python,xdg,torch,torchinductor,triton}/
-└── tmp/
+$AWS_PROJECT_DIR/outputs
+  -> /opt/dlami/nvme/smart_project_outputs
 ```
 
-实际脚本还把 torch、torch.compile、Triton 和临时目录放到同一 NVMe，避免它们回落到 root
-filesystem。
-
-0715 曾因 checkpoint 写入 154GB root filesystem，在保存 optimizer 时出现
-`PytorchStreamWriter failed writing file`。所以 preflight 同时检查 realpath、mount point 和
-free space，而不是只看路径字符串。
-
-manifest 最多保留 34 个 checkpoint。按每份 45–55GiB 加模型/cache/data，默认要求
-2500GiB 可用。若明确采用“每个 run 完成后立刻上传并删旧 checkpoint”的策略，可显式设置
-较小的 `AWS_MIN_FREE_GIB`，但这会改变存储风险，不应静默绕过。
-
-## 新实例操作
-
-项目与 prepared data 同步到 NVMe 后：
+在目标机设置实际项目路径并创建链接：
 
 ```bash
-cd /opt/dlami/nvme/smart_project/experiments/groot_n17_isaac_smart_task/aws_training
+export AWS_PROJECT_DIR=/home/ubuntu/smart_project   # 按目标机实际 checkout 修改
+export AWS_STORAGE_ROOT=/opt/dlami/nvme
+export AWS_OUTPUTS_TARGET=/opt/dlami/nvme/smart_project_outputs
+
+cd "$AWS_PROJECT_DIR/experiments/groot_n17_isaac_smart_task/aws_training"
+./aws_training_pipeline.sh paths
+./aws_training_pipeline.sh storage-link
+```
+
+`storage-link` 只负责这一个 `outputs` 链接。若 `$AWS_PROJECT_DIR/outputs` 已是实体目录、
+错误链接或悬空链接，它会停止且不移动、不删除、不覆盖现有数据。
+
+八份 prepared v2.1 数据必须上传到这个精确的物理目录：
+
+```text
+/opt/dlami/nvme/smart_project_outputs/groot_so101_synthetic_datasets/aws_third_training_20260804/
+```
+
+本机到 AWS 的目录映射是：
+
+```text
+本机源：/home/yzliu/physical_ai/company_project/smart_project/outputs/groot_so101_synthetic_datasets/aws_third_training_20260804/
+AWS 目标：/opt/dlami/nvme/smart_project_outputs/groot_so101_synthetic_datasets/aws_third_training_20260804/
+```
+
+其内部结构是：
+
+```text
+/opt/dlami/nvme/smart_project_outputs/
+└── groot_so101_synthetic_datasets/
+    └── aws_third_training_20260804/
+        ├── real001/...
+        ├── sim002/...
+        ├── real003/...
+        ├── sim004/...
+        ├── sim005/...
+        ├── real006/...
+        ├── real007/...
+        └── sim008/...
+```
+
+公共根目录下必须保留以下八个 trainer 实际读取的 leaf，不能多套或少套一级目录：
+
+| ID | 相对 `aws_third_training_20260804/` 的 prepared leaf |
+|---|---|
+| real001 | `real001/20260624_pickupblock_randomposition_wristonly_ep50_wrist_only` |
+| sim002 | `sim002/pick_camera1_notray_50_0625_1320_wrist_only` |
+| real003 | `real003/real003_drop_ep0_v3_triple` |
+| sim004 | `sim004/so101_test_lego_pick_triple` |
+| sim005 | `sim005/20260611_pickplace_madeInIssac_merged_002_triple` |
+| real006 | `real006/real006_drop_ep0_100_v3_triple` |
+| real007 | `real007/real007_drop_ep0_53_100_121_200_211_v3_triple` |
+| sim008 | `sim008/merged_3tasks_triple` |
+
+训练输出写到同一块大盘：
+
+```text
+/opt/dlami/nvme/smart_project_outputs/groot_so101_synthetic_finetune/
+└── <run-tag>/<dataset-id>/checkpoint-*
+```
+
+项目内看到的等价逻辑路径分别是：
+
+```text
+$AWS_PROJECT_DIR/outputs/groot_so101_synthetic_datasets/aws_third_training_20260804/
+$AWS_PROJECT_DIR/outputs/groot_so101_synthetic_finetune/
+```
+
+GR00T checkout、HF/uv/Torch/Triton cache 和临时文件不需要第二条软链接，脚本直接放到
+`/opt/dlami/nvme/{Isaac-GR00T,cache,tmp}`。`storage-link`、`bootstrap` 和所有 batch 动作
+都会核对 `/opt/dlami/nvme` 与 `/` 不是同一设备，并默认要求至少 2500GiB 可用。
+
+## 新实例环境配置
+
+仍在目标机实际的 `aws_training/` 目录执行：
+
+```bash
 ./aws_training_pipeline.sh bootstrap
 ./aws_training_pipeline.sh auth
 ./aws_training_pipeline.sh preflight
-./aws_training_pipeline.sh stats all --run-tag aws-third-20260804
 ```
 
 `bootstrap` 只安装最小系统依赖、checkout 固定 commit 并执行：
@@ -76,23 +136,61 @@ uv sync --frozen --python 3.12
 assets。raw v3 只在 AWS 现场重新做 `audit/prepare` 时才需要；正常训练不上传 raw。
 `auth` 把 token 写入训练实际使用的 NVMe `HF_HOME`，不能改成裸 `hf auth login`。
 `preflight` 下载并验证 manifest 固定的 base-model revision。
-`stats all` 必须在固定 GR00T commit 下隔离上传的旧 cache、强制重算，并通过
+每份数据的 `stats` 必须在固定 GR00T commit 下隔离上传的旧 cache、强制重算，并通过
 relative-action span-ratio 检查；stats 生成过程失败时脚本会自动恢复旧 stats，若生成成功但
-span-ratio 门禁拒绝，则保留新 stats 供诊断但不会进入 smoke/train。
+span-ratio 门禁拒绝，则保留新 stats 供诊断但不会进入对应的 smoke/train。
 本机 prepared 的不含 stats 全树 SHA256 已固定在 manifest；AWS 不一致会立即停止。
 本次只需同步 `outputs/groot_so101_synthetic_datasets/aws_third_training_20260804/` 这一棵
 prepared root，不要把历史 candidate/ablation 目录一并传上去。
 
-## 开训顺序
+## 八份数据分别训练
+
+开始任何一份 `stats` 之前，八个 prepared leaf 必须已经全部上传。当前 formal preflight 会先
+统一执行 `verify all` 和 `dry-run all`，所以不能只上传 real001 后就直接单跑 real001。
+
+同一份数据的 `stats`、`smoke`、`train` 必须使用完全相同的 run-tag。下面是八份数据可以
+分别复制执行的完整指令：
 
 ```bash
-./aws_training_pipeline.sh smoke all --run-tag aws-third-20260804
-./aws_training_pipeline.sh train all --run-tag aws-third-20260804
+./aws_training_pipeline.sh stats real001 --run-tag aws-third-20260804-real001
+./aws_training_pipeline.sh smoke real001 --run-tag aws-third-20260804-real001
+./aws_training_pipeline.sh train real001 --run-tag aws-third-20260804-real001
+
+./aws_training_pipeline.sh stats sim002 --run-tag aws-third-20260804-sim002
+./aws_training_pipeline.sh smoke sim002 --run-tag aws-third-20260804-sim002
+./aws_training_pipeline.sh train sim002 --run-tag aws-third-20260804-sim002
+
+./aws_training_pipeline.sh stats real003 --run-tag aws-third-20260804-real003
+./aws_training_pipeline.sh smoke real003 --run-tag aws-third-20260804-real003
+./aws_training_pipeline.sh train real003 --run-tag aws-third-20260804-real003
+
+./aws_training_pipeline.sh stats sim004 --run-tag aws-third-20260804-sim004
+./aws_training_pipeline.sh smoke sim004 --run-tag aws-third-20260804-sim004
+./aws_training_pipeline.sh train sim004 --run-tag aws-third-20260804-sim004
+
+./aws_training_pipeline.sh stats sim005 --run-tag aws-third-20260804-sim005
+./aws_training_pipeline.sh smoke sim005 --run-tag aws-third-20260804-sim005
+./aws_training_pipeline.sh train sim005 --run-tag aws-third-20260804-sim005
+
+./aws_training_pipeline.sh stats real006 --run-tag aws-third-20260804-real006
+./aws_training_pipeline.sh smoke real006 --run-tag aws-third-20260804-real006
+./aws_training_pipeline.sh train real006 --run-tag aws-third-20260804-real006
+
+./aws_training_pipeline.sh stats real007 --run-tag aws-third-20260804-real007
+./aws_training_pipeline.sh smoke real007 --run-tag aws-third-20260804-real007
+./aws_training_pipeline.sh train real007 --run-tag aws-third-20260804-real007
+
+./aws_training_pipeline.sh stats sim008 --run-tag aws-third-20260804-sim008
+./aws_training_pipeline.sh smoke sim008 --run-tag aws-third-20260804-sim008
+./aws_training_pipeline.sh train sim008 --run-tag aws-third-20260804-sim008
 ```
 
-`smoke` 和 `train` 都会自动重新执行 preflight，不能绕过。`train all` 顺序启动八个独立
-run，不会混合数据，也不会并行争抢一张 H100。两者还要求同一 run-tag 下已有完全匹配的
-fresh-stats lineage，因此不能跳过上一节的 `stats all`。
+`smoke` 和 `train` 都会自动重新执行 preflight，不能绕过；二者还要求同一 run-tag 下已有
+完全匹配的 fresh-stats lineage。若某份需要重跑，使用新 tag（例如追加 `-r2`），不要复用
+已经非空的 run 目录。
+
+仍然保留 `stats/smoke/train all --run-tag ...` 作为顺序批处理入口，但今晚逐份运行更容易
+观察、停机和上传 checkpoint；`all` 也从不混合数据或并行争抢一张 H100。
 
 每份 stats/smoke/train lineage 都记录 manifest、GR00T、base model、batch/wrapper/modality
 代码以及 prepared 全树和 stats 的 SHA256；同名、同 episode 数但内容不同的副本不能静默
