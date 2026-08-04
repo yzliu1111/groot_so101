@@ -1,263 +1,129 @@
-# SO101 数据准备与 full fine-tune
+# SO101 八份数据 full fine-tune
 
-这份 README 用于把 LeRobot v3 数据非破坏性地准备成 GR00T v2.1 数据，然后调用官方
-`launch_finetune.py`。本机适合数据准备和 smoke；正式训练优先放到大显存机器。
+当前路线是 2026-08-04 的第三次 AWS 训练。唯一配置来源是
+[`aws_tuning_8_manifest.json`](../aws_training/aws_tuning_8_manifest.json)，唯一批量入口是
+[`aws_training_pipeline.sh`](../aws_training/aws_training_pipeline.sh)。AWS 专用文件集中在
+同级 `aws_training/`，不要再从历史日志拼八条命令。
 
-AWS Ubuntu 只跑本路线时，直接看
-[AWS_UBUNTU_FULL_FINETUNE_ZH.md](AWS_UBUNTU_FULL_FINETUNE_ZH.md)；batch、gradient
-accumulation、max steps 与 loss 平台期的选择见
-[TRAINING_PARAMETER_REFERENCE_ZH.md](TRAINING_PARAMETER_REFERENCE_ZH.md)。
+## 已固定的训练契约
 
-## 1. 两个环境，不要混用
+- 八份数据始终启动八个独立 run；`all` 只是依次循环，绝不建立一个 mixture。
+- 两份单相机数据使用 `wrist-only`，六份三相机数据使用 `triple`。没有 dual 数据。
+- 相机数字没有全局语义；manifest 为每份数据显式指定 top、left、wrist。
+- 原始 `dataset/aws_tuning/` 只读。清洗写到
+  `outputs/groot_so101_cleaned_source_datasets/`，prepared v2.1 写到 `outputs/`。
+- 多任务文本逐条保留。只有 sim004 的单任务 raw 标签经视频确认错误，prepared copy 显式改为
+  `pick up block`。
+- 正式 baseline 固定 batch 32、accumulation 1、learning rate `1e-4`、
+  `state_dropout_prob=0`、显式零 ColorJitter。
+- relative-action stats 在 AWS 固定 commit 下强制隔离旧 cache 后重算；full-range / q01-q99
+  span ratio 超过 5 时训练 fail closed，不能靠低 loss 放行。
+- 输出 run 目录必须为空；历史 real007 写进 real003 目录的碰撞不能再次发生。
+- GR00T code、base model revision、pipeline code、prepared 全树和 stats SHA256 都写入 lineage；
+  不含 stats 的本机 golden SHA256 固定在 manifest 中供 AWS 上传后比对。
+
+## 今晚八个 run
+
+| ID | layout | 训练 source | steps / save |
+|---|---|---|---:|
+| real001 | wrist-only，wrist=camera1 | raw 50 ep | 10000 / 2500 |
+| sim002 | wrist-only，wrist=camera1 | raw 50 ep | 10000 / 2500 |
+| real003 | triple，top=c3、left=c1、wrist=c2 | clean49，删 raw ep0 | 10000 / 2500 |
+| sim004 | triple，top=front、left=left、wrist=wrist | raw49；修正单任务文本 | 10000 / 2500 |
+| sim005 | triple，top=c1、left=c2、wrist=c3 | raw100 | 10000 / 2500 |
+| real006 | triple，top=c3、left=c1、wrist=c2 | clean198，删 raw ep0/100 | 15000 / 3000 |
+| real007 | triple，top=c3、left=c1、wrist=c2 | clean294，删 raw ep0/53/100/121/200/211 | 15000 / 3000 |
+| sim008 | triple，top=c3、left=c1、wrist=c2 | raw287 | 10000 / 2500 |
+
+episode、frame、task 文本和 prepared path 的精确期望值也在 manifest 中；目录名相似但内容
+不一致时，`audit` 会直接停止。
+
+## 本机：审计、准备和 dry-run
+
+本机数据准备使用 conda `lerobot`。下面三步都以 manifest 为准：
+
+```bash
+cd /home/yzliu/physical_ai/company_project/smart_project/experiments
+
+/home/yzliu/miniforge3/envs/lerobot/bin/python \
+  groot_n17_isaac_smart_task/aws_training/aws_training_batch.py audit all
+
+/home/yzliu/miniforge3/envs/lerobot/bin/python \
+  groot_n17_isaac_smart_task/aws_training/aws_training_batch.py prepare all \
+  --data-python /home/yzliu/miniforge3/envs/lerobot/bin/python \
+  --groot-root /home/yzliu/Isaac-GR00T-py312
+
+/home/yzliu/Isaac-GR00T-py312/.venv/bin/python \
+  groot_n17_isaac_smart_task/aws_training/aws_training_batch.py dry-run all \
+  --groot-root /home/yzliu/Isaac-GR00T-py312 \
+  --run-tag local-contract-20260804
+```
+
+`prepare` 只写 prepared copy；不能对 `dataset/aws_tuning` 使用 `--force-prepare`。上传 AWS 时
+同步实验代码、manifest 和这一棵 27GB prepared root：
 
 ```text
-LeRobot v3 -> prepared v2.1：conda lerobot
-GR00T stats / fine-tune：     $GROOT_ROOT/.venv (Python 3.12)
+outputs/groot_so101_synthetic_datasets/aws_third_training_20260804/
 ```
 
-原始 `dataset/` 不会被覆盖；prepared copy 写到：
+AWS 不需要 raw v3、LeRobot、Isaac Sim、IsaacLab、LeIsaac 或 assets。
+
+## AWS：统一入口
+
+先把项目和 prepared data 放到 `/opt/dlami/nvme/smart_project`。在新实例上：
+
+```bash
+cd /opt/dlami/nvme/smart_project/experiments/groot_n17_isaac_smart_task/aws_training
+
+./aws_training_pipeline.sh bootstrap
+./aws_training_pipeline.sh auth
+./aws_training_pipeline.sh preflight
+./aws_training_pipeline.sh stats all --run-tag aws-third-20260804
+```
+
+`bootstrap` 固定已验证的 GR00T commit 和 uv 0.11.29，并执行
+`uv sync --frozen --python 3.12`；不安装、
+降级或替换 NVIDIA driver，也不安装 Isaac。`preflight` 检查 H100、FFmpeg/AV1、
+torchcodec、`torch.compile`、精确依赖版本、八份 prepared contract、Hugging Face 访问和
+NVMe 真实挂载/空间，并下载 manifest 固定 revision 的 base model。`auth` 与训练共用 NVMe
+上的 `HF_HOME`。`stats all` 随后在同一个固定 commit 下强制重算 stats、执行 span-ratio
+门控并记录 SHA256；不要只依赖另一台机器生成的 stats。
+`smoke/train` 会强制查找同一个 run-tag 的 stats lineage；没有它或任何 SHA 不一致都会停止。
+
+先逐份或全部做 1-step smoke：
+
+```bash
+./aws_training_pipeline.sh smoke all --run-tag aws-third-20260804
+```
+
+全部 smoke PASS 后，今晚的通用训练指令只有一条：
+
+```bash
+./aws_training_pipeline.sh train all --run-tag aws-third-20260804
+```
+
+`all` 不是并行启动。每个 run 完成后才进入下一个，checkpoint 位于：
 
 ```text
-$SMART_PROJECT/outputs/groot_so101_synthetic_datasets/
+/opt/dlami/nvme/smart_project/outputs/groot_so101_synthetic_finetune/
+└── aws-third-20260804/{real001,sim002,real003,sim004,sim005,real006,real007,sim008}
 ```
 
-训练输出写到：
-
-```text
-$SMART_PROJECT/outputs/groot_so101_synthetic_finetune/
-```
-
-## 2. 新终端恢复路径
-
-目标机：
+只跑一份时把 `all` 换成 ID，例如：
 
 ```bash
-source /home/guest1/smart_project/experiments/groot_n17_isaac_smart_task/terminal_env.sh target
+./aws_training_pipeline.sh stats real003 --run-tag aws-third-20260804-real003
+./aws_training_pipeline.sh smoke real003 --run-tag aws-third-20260804-real003
+./aws_training_pipeline.sh train real003 --run-tag aws-third-20260804-real003
 ```
 
-本机：
+## 不再使用的活动入口
 
-```bash
-source /home/yzliu/physical_ai/company_project/smart_project/experiments/groot_n17_isaac_smart_task/terminal_env.sh local
-```
+- `lowmem_lora_freeze_so101/` 是小显存 fallback，不是 H100 八份 full fine-tune 的并行入口。
+- 旧 dual real003、旧 real007 clean3、两份 0609 prepared 数据保留为历史/消融证据，但
+  manifest 永远不会自动发现或训练它们。
+- `00_docs/` 中 Python 3.10/3.11、旧 CUDA 和旧绝对路径属于历史采集或环境记录，不能覆盖
+  本 README、manifest 与 AWS preflight 的当前契约。
 
-上面二选一。首次使用或换机器后验证：
-
-```bash
-test -d "$SMART_PROJECT"
-test -x "$GROOT_ROOT/.venv/bin/python"
-"$GROOT_ROOT/.venv/bin/python" -c \
-  "import sys, torch; print(sys.version); print(torch.__version__); assert sys.version_info[:2] == (3, 12)"
-```
-
-## 3. 选择相机布局
-
-| layout | prepared 输入 | config |
-|---|---|---|
-| `dual`（默认） | `camera1 -> video.top`，`camera3 -> video.wrist` | `so101_synthetic_groot_config.py` |
-| `wrist-only` | 指定一条 wrist camera | `so101_synthetic_groot_wrist_only_config.py` |
-| `triple` | top + left + wrist | `so101_synthetic_groot_triple_config.py` |
-
-训练、bridge 和 runner 必须使用同一个 layout。
-
-## 4. 阶段 A：在 LeRobot 环境准备数据
-
-如果从这里新开终端，先恢复路径。目标机直接执行；本机使用注释中的替代行：
-
-```bash
-source /home/guest1/smart_project/experiments/groot_n17_isaac_smart_task/terminal_env.sh target
-# source /home/yzliu/physical_ai/company_project/smart_project/experiments/groot_n17_isaac_smart_task/terminal_env.sh local
-```
-
-默认数据源：
-
-```text
-$SMART_PROJECT/dataset/so101_lego_pick_0609_1722
-$SMART_PROJECT/dataset/so101_lego_pick_0609_1722_mimic
-```
-
-默认 dual 准备命令：
-
-```bash
-cd "$SMART_PROJECT"
-conda run -n lerobot python \
-  experiments/groot_n17_isaac_smart_task/full_finetune_so101/train_so101_synthetic_groot.py \
-    --allow-multiple-datasets \
-    --camera-layout dual \
-    --instruction "Pick up the red 2x4 lego brick." \
-    --force-prepare \
-    --skip-stats \
-    --prepare-only
-```
-
-先做 1 episode smoke 时加：
-
-```bash
---max-episodes 1
-```
-
-wrist-only：
-
-```bash
-conda run -n lerobot python \
-  experiments/groot_n17_isaac_smart_task/full_finetune_so101/train_so101_synthetic_groot.py \
-    --allow-multiple-datasets \
-    --camera-layout wrist-only \
-    --dataset-wrist-camera-key observation.images.camera3 \
-    --force-prepare \
-    --skip-stats \
-    --prepare-only
-```
-
-triple：
-
-```bash
-conda run -n lerobot python \
-  experiments/groot_n17_isaac_smart_task/full_finetune_so101/train_so101_synthetic_groot.py \
-    --allow-multiple-datasets \
-    --camera-layout triple \
-    --dataset-front-camera-key observation.images.camera1 \
-    --dataset-left-camera-key observation.images.camera2 \
-    --dataset-wrist-camera-key observation.images.camera3 \
-    --force-prepare \
-    --skip-stats \
-    --prepare-only
-```
-
-自定义任务树使用 `--source-root`；脚本会递归发现含 `meta/info.json` 且
-`codebase_version == v3.0` 的叶子目录：
-
-```bash
---source-root "$SMART_PROJECT/dataset/custom" \
---allow-multiple-datasets \
---prepared-root "$SMART_PROJECT/outputs/groot_so101_synthetic_datasets/custom"
-```
-
-选择多个数据集时，脚本要求显式传入 `--allow-multiple-datasets`。这表示你已经核对过它们使用
-一致的 camera feature key、6D 关节顺序和 action/state 坐标系；脚本能验证 shape 和关节名，
-但无法仅从 LeRobot metadata 分辨 degree 与 motor unit。
-
-### 阶段 A 成功标志
-
-每个 prepared 数据集至少应包含：
-
-```text
-meta/info.json
-meta/modality.json
-meta/stats.json 或后续可生成 stats 的完整数据
-data/chunk-*/episode_*.parquet
-videos/chunk-*/...
-```
-
-不要直接用官方原地转换器处理唯一一份源数据；它会移动原目录并写回 v2.1。本脚本默认使用
-prepared copy，就是为了避免这类误操作。
-
-## 5. 阶段 B：在 GR00T venv 检查训练命令
-
-这个阶段可以在新的训练终端独立开始。先恢复路径并清掉 Isaac 环境变量：
-
-```bash
-source /home/guest1/smart_project/experiments/groot_n17_isaac_smart_task/terminal_env.sh target
-# source /home/yzliu/physical_ai/company_project/smart_project/experiments/groot_n17_isaac_smart_task/terminal_env.sh local
-conda deactivate 2>/dev/null || true
-unset PYTHONPATH PYTHONHOME PYTHONNOUSERSITE PYTHONDONTWRITEBYTECODE ISAAC_PATH ISAACLAB_PATH
-cd "$SMART_PROJECT"
-```
-
-只构造命令，不跑 stats/训练：
-
-```bash
-"$GROOT_ROOT/.venv/bin/python" \
-  experiments/groot_n17_isaac_smart_task/full_finetune_so101/train_so101_synthetic_groot.py \
-    --allow-multiple-datasets \
-    --camera-layout dual \
-    --skip-prepare \
-    --skip-stats \
-    --dry-run \
-    --max-steps 1 \
-    --save-steps 1 \
-    --global-batch-size 1 \
-    --gradient-accumulation-steps 1
-```
-
-检查输出里的 dataset path、modality config、camera layout 和 output directory。
-
-## 6. 1-step full fine-tune smoke
-
-目标机没有 stats 时不要加 `--skip-stats`；已有 stats 时可加它。
-
-从新终端直接执行本节时，先恢复训练终端状态：
-
-```bash
-source /home/guest1/smart_project/experiments/groot_n17_isaac_smart_task/terminal_env.sh target
-# source /home/yzliu/physical_ai/company_project/smart_project/experiments/groot_n17_isaac_smart_task/terminal_env.sh local
-conda deactivate 2>/dev/null || true
-unset PYTHONPATH PYTHONHOME PYTHONNOUSERSITE PYTHONDONTWRITEBYTECODE ISAAC_PATH ISAACLAB_PATH
-cd "$SMART_PROJECT"
-```
-
-```bash
-"$GROOT_ROOT/.venv/bin/python" \
-  experiments/groot_n17_isaac_smart_task/full_finetune_so101/train_so101_synthetic_groot.py \
-    --allow-multiple-datasets \
-    --camera-layout dual \
-    --skip-prepare \
-    --max-steps 1 \
-    --save-steps 1 \
-    --global-batch-size 1 \
-    --gradient-accumulation-steps 1 \
-    --dataloader-num-workers 0 \
-    --experiment-name so101_full_finetune_smoke
-```
-
-如果 1 step OOM，停止 full fine-tune，转到
-[lowmem_lora_freeze_so101/README_ZH.md](../lowmem_lora_freeze_so101/README_ZH.md)，不要先增加 batch size。
-
-## 7. 较长训练起点
-
-只在 1-step 通过后执行：
-
-```bash
-source /home/guest1/smart_project/experiments/groot_n17_isaac_smart_task/terminal_env.sh target
-# source /home/yzliu/physical_ai/company_project/smart_project/experiments/groot_n17_isaac_smart_task/terminal_env.sh local
-conda deactivate 2>/dev/null || true
-unset PYTHONPATH PYTHONHOME PYTHONNOUSERSITE PYTHONDONTWRITEBYTECODE ISAAC_PATH ISAACLAB_PATH
-cd "$SMART_PROJECT"
-```
-
-```bash
-"$GROOT_ROOT/.venv/bin/python" \
-  experiments/groot_n17_isaac_smart_task/full_finetune_so101/train_so101_synthetic_groot.py \
-    --allow-multiple-datasets \
-    --camera-layout dual \
-    --skip-prepare \
-    --max-steps 2000 \
-    --save-steps 500 \
-    --global-batch-size 1 \
-    --gradient-accumulation-steps 16 \
-    --dataloader-num-workers 2 \
-    --experiment-name so101_full_finetune_bs1_acc16
-```
-
-## 8. 动作语义：部署前必须知道
-
-prepared 数据的 `action` 保留源数据的绝对坐标，不做单位换算：已核对的真机数据是 degree，
-sim 数据是 LeRobot motor unit。训练 config 对 arm 使用 relative representation，只是
-processor 内部表示；`Gr00tPolicy.get_action()` 会在返回前 `decode_action()`，所以部署侧收到的
-仍是绝对的原数据集坐标。不要把 “LeRobot 数据格式” 误解为 action 必然采用 motor unit。
-
-部署命令和单位换算见
-[zero_shot_isaac_smart_task/README_ZH.md](../zero_shot_isaac_smart_task/README_ZH.md)。
-跨文件的数据、相机和 action 约定见
-[TECHNICAL_CONTRACTS_ZH.md](../TECHNICAL_CONTRACTS_ZH.md)。
-
-## 9. 常见失败
-
-| 现象 | 先检查 |
-|---|---|
-| LeRobot 转换 import 失败 | 是否在 conda `lerobot`，不是 GR00T/Isaac env |
-| 找不到 v3 数据 | `meta/info.json` 和 `codebase_version` |
-| stats 找不到 modality | layout 与 config 是否一致 |
-| GR00T import 失败 | 是否用 `$GROOT_ROOT/.venv/bin/python` |
-| 1-step OOM | 转 low-memory，不要盲目加 batch size |
-| 部署相机不匹配 | bridge/runner/layout 是否与 checkpoint 一致 |
+参数解释见 [TRAINING_PARAMETER_REFERENCE_ZH.md](TRAINING_PARAMETER_REFERENCE_ZH.md)；AWS
+故障定位见 [AWS_UBUNTU_FULL_FINETUNE_ZH.md](AWS_UBUNTU_FULL_FINETUNE_ZH.md)。

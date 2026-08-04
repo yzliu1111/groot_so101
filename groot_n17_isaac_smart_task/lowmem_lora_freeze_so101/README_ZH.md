@@ -1,5 +1,10 @@
 # SO101 低显存训练：freeze / projector / LoRA
 
+> 历史 / 小显存 fallback：本目录不是 2026-08-04 H100 八份 full fine-tune 的活动入口，
+> 也没有继承当前 manifest 的逐数据集相机、清洗和输出防碰撞合同。今晚只能使用
+> `aws_training/aws_training_pipeline.sh`。需要重新启用本路线时，先把同等级安全门
+> 移植过来再训练。
+
 full fine-tune OOM 时使用本入口。推荐顺序是：
 
 ```text

@@ -3,6 +3,9 @@
 这是一份起跑参数表，不是对所有数据集都成立的最优超参数。先固定数据、相机 layout、
 learning rate 和模型版本，只改变 batch / accumulation / steps，才能解释实验差异。
 
+2026-08-04 的八份正式 run 以 `../aws_training/aws_tuning_8_manifest.json` 为唯一配置；本文件的通用区间不能
+覆盖 manifest 中已按历史可比性固定的 10000/15000 steps。
+
 官方参数语义见
 [FinetuneConfig](https://github.com/NVIDIA/Isaac-GR00T/blob/main/gr00t/configs/finetune_config.py)，
 单卡配置见
@@ -122,8 +125,9 @@ batch；相反，要更早保存 checkpoint、更早做 held-out 检查，并避
 |---|---:|---|
 | `learning_rate` | `1e-4` | 先保持项目/官方路线默认；不要与 batch、steps 同时改 |
 | `dataloader_num_workers` | `4` | GPU 等数据且 CPU/RAM 足够时再试 8 |
-| `save_total_limit` | `5` | 至少保留平台期前后几个 checkpoint |
-| color jitter | 保持当前 wrapper 默认开启 | 做对照时才用 `--no-color-jitter`，不要静默改变 |
+| `save_total_limit` | manifest 的 4 或 5 | 保留平台期前后 checkpoint，并受 NVMe 空间门控 |
+| `state_dropout_prob` | `0` | 上游 processor 与 model 会分别应用；SO101 baseline 不做双重随机遮蔽 |
+| ColorJitter | 显式全零 | 不省略参数；省略可能继承 base processor 的非零配置 |
 
 如果 loss 出现 NaN、突然放大或 grad norm 持续爆炸，优先停止并查数据、混合精度和 learning
 rate，不要靠增加 `max_steps` 解决。
@@ -183,7 +187,9 @@ loss 持续下降能够支持这些结论：
 正式 baseline: global_batch_size = 32, gradient_accumulation_steps = 1
 B_eff = 32
 learning_rate = 1e-4
-save_steps = 500（270k 级别可改 1000）
+state_dropout_prob = 0
+ColorJitter = 0
+save_steps / max_steps = manifest per-dataset values
 ```
 
 然后按 `N_eff` 选择 `max_steps`：7000 帧先 1000，27 万帧先 10000；中间规模按表格插值。
