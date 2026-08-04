@@ -70,6 +70,8 @@ PY
 
 真实训练若需要 DeepSpeed/CUDA extension，`CUDA_HOME/bin/nvcc` 必须存在。优先让 toolkit
 匹配 `torch.version.cuda`；不要只根据 `nvidia-smi` 显示的 CUDA 上限选择 toolkit。
+这是 low-memory / 通用源码扩展建议；AWS 八份 H100 full fine-tune 使用专用 pipeline，保留
+DLAMI CUDA 13.2 + PyTorch cu128，并验证 Triton 3.5 的原生 CUDA 13+ 路径。
 
 ## 3. 先 dry-run
 

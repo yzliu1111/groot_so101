@@ -108,6 +108,10 @@ conda init bash
 
 本节可以从新目标机终端独立开始：
 
+> 本节是通用环境示例，不是今晚八份 AWS H100 full fine-tune 的安装入口。正式 AWS 必须执行
+> `aws_training/aws_training_pipeline.sh bootstrap`，由它固定 GR00T commit、uv、frozen lock
+> 和 CUDA 13+ PTX 门禁；不要用下面的默认分支 clone / 最新 uv 命令替代。
+
 ```bash
 source /home/guest1/smart_project/experiments/groot_n17_isaac_smart_task/terminal_env.sh target
 ```
@@ -157,6 +161,10 @@ export PATH="$CUDA_HOME/bin:$PATH"
 export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
 "$CUDA_HOME/bin/nvcc" --version
 ```
+
+上述“尽量匹配”是通用源码扩展建议，不适用于已经验证的 AWS 专用组合。AWS DLAMI 可保留
+系统 CUDA 13.2，同时使用 PyTorch 2.9.0+cu128；专用 pipeline 会验证 Triton 3.5 原生
+CUDA 13+ 映射和真实 `torch.compile`，不要求另装 toolkit 12.8。
 
 训练入口的 dry-run 和 smoke 见
 [full_finetune_so101/README_ZH.md](../full_finetune_so101/README_ZH.md) 与

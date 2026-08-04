@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import re
+import runpy
 import shutil
 import subprocess
 import tempfile
@@ -13,6 +14,9 @@ AWS_DIR = Path(__file__).resolve().parents[1]
 PIPELINE = AWS_DIR / "aws_training_pipeline.sh"
 PROJECT_ROOT = AWS_DIR.parents[2]
 AWS_GUIDE = AWS_DIR.parent / "full_finetune_so101" / "AWS_UBUNTU_FULL_FINETUNE_ZH.md"
+VERSION_CONTRACT = runpy.run_path(str(AWS_DIR / "version_contract.py"))
+VERSION_NUMBER_MATCHES = VERSION_CONTRACT["version_number_matches"]
+VERSION_MISMATCHES = VERSION_CONTRACT["version_mismatches"]
 RUNTIME_ENV_KEYS = (
     "AWS_MIN_FREE_GIB",
     "AWS_OUTPUTS_TARGET",
@@ -28,6 +32,11 @@ RUNTIME_ENV_KEYS = (
     "TORCHINDUCTOR_CACHE_DIR",
     "TRITON_CACHE_DIR",
     "TMPDIR",
+    "TRITON_PTXAS_PATH",
+    "PYTHONOPTIMIZE",
+    "PYTHONPATH",
+    "PYTHONHOME",
+    "PYTHONNOUSERSITE",
 )
 
 
@@ -99,6 +108,7 @@ def _make_project_copy(root: Path, project: Path | None = None) -> tuple[Path, P
     full_dir.mkdir(parents=True)
     pipeline = aws_dir / PIPELINE.name
     shutil.copy2(PIPELINE, pipeline)
+    shutil.copy2(AWS_DIR / "version_contract.py", aws_dir / "version_contract.py")
     (aws_dir / "aws_training_batch.py").write_text("# test fixture\n")
     (aws_dir / "aws_tuning_8_manifest.json").write_text("{}\n")
     (full_dir / "train_so101_synthetic_groot.py").write_text("# test fixture\n")
@@ -106,6 +116,102 @@ def _make_project_copy(root: Path, project: Path | None = None) -> tuple[Path, P
 
 
 class AwsTrainingPipelinePathTests(unittest.TestCase):
+    def test_python_runtime_versions_ignore_only_local_build_suffixes(self) -> None:
+        self.assertTrue(VERSION_NUMBER_MATCHES("2.9.0+cu128", "2.9.0"))
+        self.assertTrue(VERSION_NUMBER_MATCHES("12.8.0", "12.8"))
+        self.assertFalse(VERSION_NUMBER_MATCHES("2.9.1+cu128", "2.9.0"))
+        self.assertFalse(VERSION_NUMBER_MATCHES("2.9.0rc1", "2.9.0"))
+        self.assertFalse(VERSION_NUMBER_MATCHES("2.9.0.dev1", "2.9.0"))
+        self.assertFalse(VERSION_NUMBER_MATCHES("2.9.0.post1", "2.9.0"))
+
+    def test_python_runtime_version_mismatches_report_exact_packages(self) -> None:
+        expected = {"torch": "2.9.0", "triton": "3.5.0"}
+        actual = {"torch": "2.9.0+cu128", "triton": "3.5.1"}
+        self.assertEqual(
+            VERSION_MISMATCHES(expected, actual),
+            {"triton": {"expected": "3.5.0", "actual": "3.5.1"}},
+        )
+
+    def test_uv_version_accepts_platform_suffix(self) -> None:
+        script = (
+            'source "$1" help >/dev/null; '
+            'uv_version_matches "uv 0.11.29 (x86_64-unknown-linux-gnu)"'
+        )
+        result = subprocess.run(
+            ["bash", "-c", script, "bash", str(PIPELINE)],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_uv_version_rejects_different_semver(self) -> None:
+        script = (
+            'source "$1" help >/dev/null; '
+            'uv_version_matches "uv 0.11.30 (x86_64-unknown-linux-gnu)"'
+        )
+        result = subprocess.run(
+            ["bash", "-c", script, "bash", str(PIPELINE)],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_nvcc_release_parser_accepts_dlami_cuda_13_2(self) -> None:
+        script = (
+            'source "$1" help >/dev/null; '
+            'cuda_toolkit_version_from_output "$2"'
+        )
+        result = subprocess.run(
+            [
+                "bash",
+                "-c",
+                script,
+                "bash",
+                str(PIPELINE),
+                "Cuda compilation tools, release 13.2, V13.2.128",
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "13.2")
+
+    def test_nvcc_release_parser_rejects_unparseable_output(self) -> None:
+        script = (
+            'source "$1" help >/dev/null; '
+            'cuda_toolkit_version_from_output "$2"'
+        )
+        result = subprocess.run(
+            ["bash", "-c", script, "bash", str(PIPELINE), "not an nvcc release"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_python_optimize_is_cleared_for_formal_runtime(self) -> None:
+        script = (
+            'source "$1" help >/dev/null; '
+            'export PYTHONOPTIMIZE=1; '
+            'export PYTHONPATH=/wrong/gr00t; '
+            'export PYTHONHOME=/wrong/python; '
+            'sanitize_python_runtime_env >/dev/null; '
+            '[[ -z "${PYTHONOPTIMIZE:-}" && '
+            '-z "${PYTHONPATH:-}" && '
+            '-z "${PYTHONHOME:-}" && '
+            '"$PYTHONNOUSERSITE" == 1 ]]'
+        )
+        result = subprocess.run(
+            ["bash", "-c", script, "bash", str(PIPELINE)],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_paths_discovers_project_from_script_not_local_cwd(self) -> None:
         result = _run_pipeline(PIPELINE, "paths")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -301,6 +407,37 @@ class AwsTrainingPipelinePathTests(unittest.TestCase):
             "groot_so101_synthetic_datasets/aws_third_training_20260804/",
             guide,
         )
+
+    def test_cuda13_contract_uses_pinned_triton_native_support(self) -> None:
+        pipeline = PIPELINE.read_text()
+        guide = AWS_GUIDE.read_text()
+
+        self.assertIn("check_cuda13_native_triton_support", pipeline)
+        self.assertIn('"if major >= 13:"', pipeline)
+        self.assertIn("legacy CUDA13 source patch detected", pipeline)
+        self.assertNotIn("uv run bash scripts/patch_triton_cuda13.sh", pipeline)
+        self.assertNotIn(
+            "CUDA 13+ Triton mapping check is not required", pipeline
+        )
+        self.assertNotIn(
+            'check_cuda13_native_triton_support "$(cuda_toolkit_version)"',
+            pipeline,
+        )
+        self.assertNotIn(
+            'log "system CUDA toolkit=$(cuda_toolkit_version)', pipeline
+        )
+        self.assertNotRegex(
+            pipeline,
+            r'\[\[\s+-[nz]\s+"\$\(git -C "\$GROOT_ROOT" status',
+        )
+        self.assertIn("env -u PYTHONOPTIMIZE", pipeline)
+        self.assertIn("-u PYTHONPATH -u PYTHONHOME", pipeline)
+        self.assertIn("PYTHONNOUSERSITE=1", pipeline)
+        self.assertIn("sys.flags.optimize != 0", pipeline)
+        self.assertIn("Triton 3.5.0", guide)
+        self.assertIn("PTX 92", guide)
+        self.assertIn("ptxas 12.8", guide)
+        self.assertIn("PyTorch 2.7 / Triton 3.3.1", guide)
 
 
 if __name__ == "__main__":

@@ -55,6 +55,11 @@ class AwsTuningManifestTests(unittest.TestCase):
         self.assertTrue(batch.TRAIN_WRAPPER.is_file())
         self.assertTrue(all(path.is_file() for path in batch.MODALITY_CONFIGS.values()))
 
+    def test_lineage_hashes_the_runtime_version_contract(self) -> None:
+        hashes = batch._pipeline_code_sha256(self.by_id["real001"])
+        self.assertIn("version_contract.py", hashes)
+        self.assertEqual(len(hashes["version_contract.py"]), 64)
+
     def test_camera_layout_counts_and_roles_are_exact(self) -> None:
         wrist_only = [spec for spec in self.specs if spec.camera_layout == "wrist-only"]
         triple = [spec for spec in self.specs if spec.camera_layout == "triple"]

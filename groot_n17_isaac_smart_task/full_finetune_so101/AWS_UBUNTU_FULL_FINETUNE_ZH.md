@@ -21,12 +21,22 @@
 | flash-attn / DeepSpeed | 2.8.3 / 0.17.6 |
 | transformers / pyarrow | 4.57.3 / 23.0.1 |
 
+版本门禁比较的是版本号字段，不比较整行展示文本：例如 uv 的平台后缀和 Python wheel 的
+合法本地构建后缀不会造成假失败；不同 release、rc/dev/post 版本仍会被拒绝。GR00T commit、
+base-model revision、Python 主次版本和 PyTorch CUDA 版本继续分别严格校验。
+
 当时宿主 driver 595.71.05、CUDA toolkit 13.2 与 cu128 PyTorch 已经实跑成功。这不是要求
 把所有实例的 driver 改成同一个版本：脚本不会安装、降级或替换 driver/CUDA。它验证实际
 H100、`nvcc`、PyTorch CUDA、`torch.compile` 和 torchcodec 解码，失败才停止。
 
-不要固定修改 Triton PTX 版本。已验证的 Triton 3.5.0 原生输出可用 PTX；只有 preflight 的
-`torch.compile` 真正失败时才单独诊断，不能每次新实例都盲打历史补丁。
+这里必须区分三层：DLAMI 的 driver/toolkit、PyTorch wheel 自带的 cu128 runtime，以及
+Triton 的 PTX 映射。锁定 commit 的 frozen lock 实际安装 PyTorch 2.9.0 + Triton 3.5.0；
+Triton 3.5.0 已原生实现 CUDA major `>=13`，实际 `nvcc` 为 13.2 时必须映射为 PTX 92。
+本次 x86 cu128 wheel 默认使用 Triton 随包的 ptxas 12.8（映射 PTX 87），而不是把系统
+13.2 ptxas 强塞进 venv；两层会分别打印和校验。
+仓库仍保留的 `scripts/patch_triton_cuda13.sh` 注释针对旧 PyTorch 2.7 / Triton 3.3.1，不能
+应用到本次 frozen venv。`bootstrap` 和 `preflight` 都会拒绝遗留 `.pth`/源码补丁，核对原生
+13+ 分支和实际 PTX 映射；随后 `torch.compile` 再触发一次真实 GPU 编译。
 
 ## 今晚固定的 AWS 路径
 
@@ -132,6 +142,12 @@ GR00T checkout、HF/uv/Torch/Triton cache 和临时文件不需要第二条软�
 uv sync --frozen --python 3.12
 ```
 
+随后脚本读取真实 `nvcc --version`。若 toolkit major 为 13 或更高，它会验证锁定的
+Triton 3.5.0 原生 `major >= 13` 分支和实际 PTX 映射，拒绝旧
+`triton_cuda13_patch.pth` / 直接改写过的 `compiler.py`，并清除外部 `TRITON_PTXAS_PATH`。
+同时它会确认实际编译器是 venv 中随 Triton 提供的 ptxas 12.8。这一步不会把系统 CUDA 13.2
+改成 12.8，也不会把 cu128 wheel 改成 cu132。
+
 上传 prepared v2.1 后，AWS 不需要 conda、LeRobot、Isaac Sim、IsaacLab、LeIsaac 或机器人
 assets。raw v3 只在 AWS 现场重新做 `audit/prepare` 时才需要；正常训练不上传 raw。
 `auth` 把 token 写入训练实际使用的 NVMe `HF_HOME`，不能改成裸 `hf auth login`。
@@ -208,7 +224,7 @@ checkpoint、optimizer 和 trainer state，不要把“允许非空目录”当�
 | 找不到 pyarrow/GR00T 包 | 必须使用 `.venv/bin/python`，不能把符号链接 resolve 成裸 Python |
 | uv 不是 0.11.29 | 重新运行 `bootstrap`；脚本会装到 NVMe 并精确校验 |
 | FFmpeg/torchcodec 不能解 AV1 | 使用 Ubuntu 24.04 的 FFmpeg 4–7 包；先通过实际视频 decode |
-| `torch.compile` PTX 错误 | 记录完整 traceback、driver/nvcc/torch/triton；不要先打历史补丁 |
+| CUDA 13+ / PTX 门禁失败 | 记录完整 traceback 和 `nvcc/torch/triton`；清掉旧 `.pth`/手改 venv 后重跑 `bootstrap`，不要执行 2.7/3.3.1 历史补丁 |
 | Hugging Face 403/404 | 执行 `./aws_training_pipeline.sh auth` 并确认模型访问权限 |
 | NVMe 空间不足 | 扩大 volume，或明确降低保留量并逐 run 上传；不要写 root filesystem |
 | relative stats span ratio > 5 | 返回数据清洗；不能加 `--allow-relative-stats-outliers` 草率开训 |

@@ -46,6 +46,7 @@ FULL_FINETUNE_DIR="$SCRIPT_DIR/../full_finetune_so101"
 BATCH_SCRIPT="$SCRIPT_DIR/aws_training_batch.py"
 TRAIN_WRAPPER="$FULL_FINETUNE_DIR/train_so101_synthetic_groot.py"
 MANIFEST="$SCRIPT_DIR/aws_tuning_8_manifest.json"
+VERSION_CONTRACT="$SCRIPT_DIR/version_contract.py"
 GROOT_PYTHON="$GROOT_ROOT/.venv/bin/python"
 AWS_DATA_PYTHON="$GROOT_PYTHON"
 
@@ -120,6 +121,37 @@ require_command() {
     command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
 }
 
+sanitize_python_runtime_env() {
+    local variable
+    for variable in PYTHONOPTIMIZE PYTHONPATH PYTHONHOME; do
+        if [[ -n "${!variable:-}" ]]; then
+            log "clearing inherited $variable for the pinned GR00T runtime"
+            unset "$variable"
+        fi
+    done
+    export PYTHONNOUSERSITE=1
+}
+
+run_groot_python() {
+    env -u PYTHONOPTIMIZE -u PYTHONPATH -u PYTHONHOME \
+        PYTHONNOUSERSITE=1 "$GROOT_PYTHON" "$@"
+}
+
+uv_version_matches() {
+    local output="$1"
+    local command_name actual_version ignored_suffix
+    read -r command_name actual_version ignored_suffix <<<"$output"
+    [[ "$command_name" == "uv" && "$actual_version" == "$UV_VERSION" ]]
+}
+
+check_uv_version() {
+    local output
+    output="$("$UV_BIN" --version)"
+    uv_version_matches "$output" || \
+        die "expected uv $UV_VERSION, got $output"
+    log "uv=$output"
+}
+
 validate_project_layout() {
     require_command realpath
     [[ -d "$SMART_PROJECT" ]] || die "project root does not exist: $SMART_PROJECT"
@@ -133,8 +165,9 @@ validate_project_layout() {
             die "SMART_PROJECT must resolve to the project containing this script: configured=$configured_project detected=$DETECTED_SMART_PROJECT"
     fi
 
-    [[ -f "$BATCH_SCRIPT" && -f "$TRAIN_WRAPPER" && -f "$MANIFEST" ]] || \
-        die "AWS training batch/manifest or shared full-finetune wrapper is missing"
+    [[ -f "$BATCH_SCRIPT" && -f "$TRAIN_WRAPPER" && -f "$MANIFEST" && \
+        -f "$VERSION_CONTRACT" ]] || \
+        die "AWS training batch/manifest, version contract, or shared full-finetune wrapper is missing"
 }
 
 show_paths() {
@@ -316,6 +349,99 @@ detect_cuda_home() {
     log "CUDA_HOME=$CUDA_HOME"
 }
 
+cuda_toolkit_version_from_output() {
+    local output="$1"
+    local version
+    version="$(sed -nE 's/.*release ([0-9]+\.[0-9]+).*/\1/p' <<<"$output" | sed -n '1p')"
+    [[ "$version" =~ ^[0-9]+\.[0-9]+$ ]] || return 1
+    printf '%s\n' "$version"
+}
+
+cuda_toolkit_version() {
+    local output version
+    output="$("$CUDA_HOME/bin/nvcc" --version 2>&1)"
+    version="$(cuda_toolkit_version_from_output "$output")" || \
+        die "cannot parse CUDA toolkit version from nvcc output: $output"
+    printf '%s\n' "$version"
+}
+
+check_cuda13_native_triton_support() {
+    local cuda_version="$1"
+
+    if [[ -n "${TRITON_PTXAS_PATH:-}" ]]; then
+        log "ignoring inherited TRITON_PTXAS_PATH for the pinned x86 H100 stack: $TRITON_PTXAS_PATH"
+        unset TRITON_PTXAS_PATH
+    fi
+
+    run_groot_python - "$cuda_version" <<'PY'
+import importlib.util
+import inspect
+from pathlib import Path
+import site
+import sys
+
+cuda_version = sys.argv[1]
+import triton
+from triton.backends.nvidia.compiler import get_ptxas, ptx_get_version
+
+if sys.flags.optimize != 0:
+    raise RuntimeError(f"Python optimization must be disabled, got optimize={sys.flags.optimize}")
+
+major, minor = map(int, cuda_version.split("."))
+
+# The pinned environment is Triton 3.5.0. It handles CUDA major >=13 natively.
+# Reject the repository's legacy PyTorch-2.7/Triton-3.3.1 monkey patch so the
+# frozen environment cannot be silently mutated between bootstrap and train.
+legacy_files = []
+for package_root in site.getsitepackages():
+    root = Path(package_root)
+    legacy_files.extend(root.glob("triton_cuda13_patch.pth"))
+    legacy_files.extend(root.glob("triton_cuda13_patch.py"))
+assert importlib.util.find_spec("triton_cuda13_patch") is None, (
+    "legacy triton_cuda13_patch module is installed; remove .venv and rerun bootstrap"
+)
+assert not legacy_files, {
+    "legacy_cuda13_patch_files": [str(path) for path in legacy_files]
+}
+
+source = inspect.getsource(ptx_get_version)
+assert "if major >= 13:" in source, "Triton lacks native CUDA major >=13 support"
+assert "if major == 13:" not in source, "legacy CUDA13 source patch detected"
+
+if major >= 13:
+    ptx_version = ptx_get_version(cuda_version)
+    expected = 90 + (major - 13) * 10 + minor
+    assert ptx_version == expected, {
+        "cuda_toolkit": cuda_version,
+        "expected_ptx": expected,
+        "actual_ptx": ptx_version,
+    }
+    system_mapping = f"toolkit={cuda_version}->PTX{ptx_version}"
+else:
+    system_mapping = f"toolkit={cuda_version} (<13; CUDA13 mapping not exercised)"
+
+# Triton 3.5 from the pinned cu128 environment uses its bundled ptxas unless an
+# override is supplied. Verify that compiler layer independently from system nvcc.
+ptxas = get_ptxas()
+ptxas_path = Path(ptxas.path).resolve()
+triton_root = Path(triton.__file__).resolve().parent
+assert ptxas_path.is_relative_to(triton_root), {
+    "expected_bundled_triton_ptxas_under": str(triton_root),
+    "actual_ptxas": str(ptxas_path),
+}
+assert ptxas.version == "12.8", {
+    "expected_bundled_ptxas": "12.8",
+    "actual_bundled_ptxas": ptxas.version,
+}
+bundled_ptx = ptx_get_version(ptxas.version)
+print(
+    f"native CUDA mapping OK {system_mapping} "
+    f"bundled_ptxas={ptxas.version}->PTX{bundled_ptx} path={ptxas_path}"
+)
+PY
+    log "pinned Triton environment and native CUDA 13+ strategy verified"
+}
+
 sudo_prefix() {
     if [[ "$(id -u)" -eq 0 ]]; then
         return 0
@@ -357,7 +483,11 @@ bootstrap() {
             https://github.com/NVIDIA/Isaac-GR00T.git "$GROOT_ROOT"
     fi
 
-    if [[ -n "$(git -C "$GROOT_ROOT" status --porcelain --untracked-files=no)" ]]; then
+    local groot_status
+    if ! groot_status="$(git -C "$GROOT_ROOT" status --porcelain --untracked-files=no)"; then
+        die "cannot inspect Isaac-GR00T worktree before checkout: $GROOT_ROOT"
+    fi
+    if [[ -n "$groot_status" ]]; then
         die "Isaac-GR00T has tracked local changes; refusing to switch commits: $GROOT_ROOT"
     fi
     git -C "$GROOT_ROOT" fetch origin "$GROOT_COMMIT"
@@ -369,16 +499,17 @@ bootstrap() {
     curl -LsSf "https://astral.sh/uv/$UV_VERSION/install.sh" | \
         env UV_INSTALL_DIR="$UV_INSTALL_DIR" UV_NO_MODIFY_PATH=1 sh
     [[ -x "$UV_BIN" ]] || die "uv installer did not create $UV_BIN"
-    [[ "$("$UV_BIN" --version)" == "uv $UV_VERSION" ]] || \
-        die "expected uv $UV_VERSION, got $("$UV_BIN" --version)"
-    log "uv=$("$UV_BIN" --version)"
+    check_uv_version
 
     (
         cd "$GROOT_ROOT"
         "$UV_BIN" sync --frozen --python 3.12
     )
     [[ -x "$GROOT_PYTHON" ]] || die "GR00T Python was not created: $GROOT_PYTHON"
-    "$GROOT_PYTHON" -c "import gr00t; print('GR00T import OK')"
+    run_groot_python -c "import gr00t; print('GR00T import OK')"
+    local cuda_version
+    cuda_version="$(cuda_toolkit_version)"
+    check_cuda13_native_triton_support "$cuda_version"
 
     log "bootstrap PASS"
     log "next: $0 auth"
@@ -458,7 +589,7 @@ check_gpu_and_system_runtime() {
     [[ "${gpu_rows[0]}" == *H100* ]] || die "expected H100, got: ${gpu_rows[0]}"
     log "gpu=${gpu_rows[0]}"
 
-    local ffmpeg_line ffmpeg_major
+    local ffmpeg_line ffmpeg_major cuda_version
     ffmpeg_line="$(ffmpeg -version 2>&1 | sed -n '1p')"
     ffmpeg_major="$(sed -E 's/^ffmpeg version ([0-9]+).*/\1/' <<<"$ffmpeg_line")"
     [[ "$ffmpeg_major" =~ ^[0-9]+$ ]] || die "cannot parse FFmpeg version: $ffmpeg_line"
@@ -469,21 +600,30 @@ check_gpu_and_system_runtime() {
     grep -qi av1 <<<"$ffmpeg_decoders" || die "FFmpeg has no AV1 decoder"
     log "$ffmpeg_line"
     "$CUDA_HOME/bin/nvcc" --version | sed -n '/release/p'
+    cuda_version="$(cuda_toolkit_version)"
+    log "system CUDA toolkit=$cuda_version; PyTorch CUDA runtime is checked separately"
 }
 
 check_groot_runtime() {
     [[ -d "$GROOT_ROOT/.git" ]] || die "Isaac-GR00T checkout missing: $GROOT_ROOT"
     [[ "$(git -C "$GROOT_ROOT" rev-parse HEAD)" == "$GROOT_COMMIT" ]] || \
         die "Isaac-GR00T must be exactly $GROOT_COMMIT; got $(git -C "$GROOT_ROOT" rev-parse HEAD)"
-    [[ -z "$(git -C "$GROOT_ROOT" status --porcelain --untracked-files=all)" ]] || \
+    local groot_status
+    if ! groot_status="$(git -C "$GROOT_ROOT" status --porcelain --untracked-files=all)"; then
+        die "cannot inspect Isaac-GR00T worktree during preflight: $GROOT_ROOT"
+    fi
+    [[ -z "$groot_status" ]] || \
         die "Isaac-GR00T worktree is dirty; formal stats/train require exact pinned code"
     [[ -x "$GROOT_PYTHON" ]] || die "GR00T Python missing: $GROOT_PYTHON"
     [[ -x "$UV_BIN" ]] || die "pinned uv missing: $UV_BIN"
-    [[ "$("$UV_BIN" --version)" == "uv $UV_VERSION" ]] || \
-        die "expected uv $UV_VERSION, got $("$UV_BIN" --version)"
+    check_uv_version
     log "Isaac-GR00T commit=$GROOT_COMMIT"
+    local cuda_version
+    cuda_version="$(cuda_toolkit_version)"
+    check_cuda13_native_triton_support "$cuda_version"
 
-    "$GROOT_PYTHON" - <<'PY'
+    env -u PYTHONOPTIMIZE -u PYTHONPATH -u PYTHONHOME \
+        PYTHONNOUSERSITE=1 PYTHONPATH="$SCRIPT_DIR" "$GROOT_PYTHON" - <<'PY'
 import sys
 import deepspeed
 import flash_attn
@@ -493,9 +633,13 @@ import torchcodec
 import transformers
 import triton
 import gr00t  # noqa: F401
+from version_contract import version_mismatches
+
+if sys.flags.optimize != 0:
+    raise RuntimeError(f"Python optimization must be disabled, got optimize={sys.flags.optimize}")
 
 expected = {
-    "torch": "2.9.0+cu128",
+    "torch": "2.9.0",
     "torch_cuda": "12.8",
     "torchcodec": "0.8.0",
     "triton": "3.5.0",
@@ -515,7 +659,8 @@ actual = {
     "pyarrow": pyarrow.__version__,
 }
 assert sys.version_info[:2] == (3, 12), sys.version
-assert actual == expected, {"expected": expected, "actual": actual}
+mismatches = version_mismatches(expected, actual)
+assert not mismatches, {"version_mismatches": mismatches}
 assert torch.cuda.is_available(), "torch.cuda.is_available() is false"
 assert "H100" in torch.cuda.get_device_name(0), torch.cuda.get_device_name(0)
 print("python=", sys.version.split()[0])
@@ -536,13 +681,15 @@ PY
     fi
     [[ -n "$sample_video" && -f "$sample_video" ]] || \
         die "no prepared MP4 found for torchcodec decode under $AWS_PREPARED_ROOT"
-    "$GROOT_PYTHON" - "$sample_video" <<'PY'
+    run_groot_python - "$sample_video" <<'PY'
 from pathlib import Path
 import sys
 import torch
 from torchcodec.decoders import VideoDecoder
 
 path = Path(sys.argv[1])
+if sys.flags.optimize != 0:
+    raise RuntimeError(f"Python optimization must be disabled, got optimize={sys.flags.optimize}")
 decoder = VideoDecoder(str(path))
 assert len(decoder) > 0, path
 frame = decoder[0]
@@ -560,7 +707,7 @@ check_pipeline_contract() {
 
     local manifest_commit
     manifest_commit="$(
-        "$GROOT_PYTHON" -c \
+        run_groot_python -c \
             'import json,sys; print(json.load(open(sys.argv[1]))["groot_commit"])' \
             "$MANIFEST"
     )"
@@ -569,7 +716,7 @@ check_pipeline_contract() {
 
     local manifest_model_revision
     manifest_model_revision="$(
-        "$GROOT_PYTHON" -c \
+        run_groot_python -c \
             'import json,sys; print(json.load(open(sys.argv[1]))["base_model_revision"])' \
             "$MANIFEST"
     )"
@@ -578,16 +725,16 @@ check_pipeline_contract() {
 
     local help_output
     help_output="$(
-        "$GROOT_PYTHON" "$GROOT_ROOT/gr00t/experiment/launch_finetune.py" --help 2>&1
+        run_groot_python "$GROOT_ROOT/gr00t/experiment/launch_finetune.py" --help 2>&1
     )"
     grep -q -- '--state-dropout-prob' <<<"$help_output" || \
         die "upstream launch_finetune.py lacks --state-dropout-prob"
     grep -q -- '--color-jitter-params' <<<"$help_output" || \
         die "upstream launch_finetune.py lacks --color-jitter-params"
-    "$GROOT_PYTHON" "$BATCH_SCRIPT" --help >/dev/null
-    "$GROOT_PYTHON" "$BATCH_SCRIPT" verify all \
+    run_groot_python "$BATCH_SCRIPT" --help >/dev/null
+    run_groot_python "$BATCH_SCRIPT" verify all \
         --manifest "$MANIFEST" >/dev/null
-    "$GROOT_PYTHON" "$BATCH_SCRIPT" dry-run all \
+    run_groot_python "$BATCH_SCRIPT" dry-run all \
         --manifest "$MANIFEST" \
         --data-python "$AWS_DATA_PYTHON" \
         --groot-root "$GROOT_ROOT" \
@@ -599,7 +746,7 @@ check_pipeline_contract() {
 }
 
 check_huggingface_access() {
-    BASE_MODEL_PATH="$("$GROOT_PYTHON" - "$BASE_MODEL" "$BASE_MODEL_REVISION" <<'PY'
+    BASE_MODEL_PATH="$(run_groot_python - "$BASE_MODEL" "$BASE_MODEL_REVISION" <<'PY'
 from huggingface_hub import HfApi, snapshot_download
 from pathlib import Path
 import sys
@@ -658,7 +805,8 @@ forward_batch() {
     if [[ "$action" == "smoke" || "$action" == "train" ]]; then
         model_args=(--base-model-path "$BASE_MODEL_PATH")
     fi
-    exec "$GROOT_PYTHON" "$BATCH_SCRIPT" "$action" \
+    exec env -u PYTHONOPTIMIZE -u PYTHONPATH -u PYTHONHOME \
+        PYTHONNOUSERSITE=1 "$GROOT_PYTHON" "$BATCH_SCRIPT" "$action" \
         "${forwarded[@]}" \
         "${model_args[@]}" \
         --manifest "$MANIFEST" \
@@ -677,6 +825,7 @@ main() {
             ;;
     esac
 
+    sanitize_python_runtime_env
     validate_project_layout
     case "$command" in
         paths)

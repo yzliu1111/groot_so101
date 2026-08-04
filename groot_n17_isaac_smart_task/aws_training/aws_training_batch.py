@@ -999,6 +999,7 @@ def _pipeline_code_sha256(spec: DatasetSpec) -> dict[str, str]:
     paths = {
         "aws_training_batch.py": Path(__file__).resolve(),
         "aws_training_pipeline.sh": SCRIPT_DIR / "aws_training_pipeline.sh",
+        "version_contract.py": SCRIPT_DIR / "version_contract.py",
         "train_so101_synthetic_groot.py": TRAIN_WRAPPER,
         "modality_config": MODALITY_CONFIGS[spec.camera_layout],
     }

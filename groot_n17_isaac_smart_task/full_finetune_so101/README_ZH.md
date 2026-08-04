@@ -102,11 +102,16 @@ cd "$AWS_PROJECT_DIR/experiments/groot_n17_isaac_smart_task/aws_training"
 `bootstrap` 固定已验证的 GR00T commit 和 uv 0.11.29，并执行
 `uv sync --frozen --python 3.12`；不安装、
 降级或替换 NVIDIA driver，也不安装 Isaac。`preflight` 检查 H100、FFmpeg/AV1、
-torchcodec、`torch.compile`、精确依赖版本、八份 prepared contract、Hugging Face 访问和
+torchcodec、系统 `nvcc`、Triton 3.5 原生 CUDA 13+ PTX 映射、`torch.compile`、精确依赖版本、
+八份 prepared contract、Hugging Face 访问和
 大盘真实挂载/空间，并下载 manifest 固定 revision 的 base model。`auth` 与训练共用大盘
 上的 `HF_HOME`。每份 `stats <id>`（或顺序批处理 `stats all`）都会在同一个固定 commit 下
 强制重算 stats、执行 span-ratio 门控并记录 SHA256；不要只依赖另一台机器生成的 stats。
 `smoke/train` 会强制查找同一个 run-tag 的 stats lineage；没有它或任何 SHA 不一致都会停止。
+
+DLAMI 的系统 CUDA 13.2 与 venv 的 PyTorch cu128 是不同层，不需要互相改成同一版本。
+锁定环境使用 Triton 3.5.0 的原生 `major >= 13` 支持；不要执行仓库中针对旧
+PyTorch 2.7 / Triton 3.3.1 的 `patch_triton_cuda13.sh`。
 
 任何一份正式命令运行前，八份 prepared leaf 都必须先上传完整，因为 preflight 会统一执行
 `verify all` 和 `dry-run all`。
