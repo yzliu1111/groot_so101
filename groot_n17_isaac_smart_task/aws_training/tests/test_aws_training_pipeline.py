@@ -62,7 +62,7 @@ def _run_pipeline(
     )
 
 
-def _write_fake_storage_tools(root: Path) -> Path:
+def _write_fake_storage_tools(root: Path, *, available_gib: int = 3814) -> Path:
     fake_bin = root / "fake-bin"
     fake_bin.mkdir()
     findmnt = fake_bin / "findmnt"
@@ -90,10 +90,11 @@ fi
     findmnt.chmod(0o755)
 
     df = fake_bin / "df"
+    available_kib = available_gib * 1024 * 1024
     df.write_text(
-        """#!/usr/bin/env bash
+        f"""#!/usr/bin/env bash
 printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\\n'
-printf '/dev/mock 4000000000 1 3999999999 1%% /mock-data\\n'
+printf '/dev/mock {available_kib + 1} 1 {available_kib} 1%% /mock-data\\n'
 """
     )
     df.chmod(0o755)
@@ -313,6 +314,37 @@ class AwsTrainingPipelinePathTests(unittest.TestCase):
                 (storage / "smart_project_outputs").resolve(),
             )
             self.assertFalse((project / ".aws_runtime").exists())
+
+    def test_default_storage_floor_boundaries_and_current_capacity(self) -> None:
+        for available_gib, should_pass in ((199, False), (200, True), (2493, True)):
+            with self.subTest(available_gib=available_gib):
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    project, pipeline = _make_project_copy(root)
+                    storage = root / "large-volume"
+                    storage.mkdir()
+                    fake_bin = _write_fake_storage_tools(
+                        root, available_gib=available_gib
+                    )
+                    env = _clean_env()
+                    env["PATH"] = f"{fake_bin}:{env['PATH']}"
+                    env["AWS_STORAGE_ROOT"] = str(storage)
+
+                    result = _run_pipeline(pipeline, "storage-link", env=env)
+
+                    if should_pass:
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertIn(
+                            f"storage free={available_gib}GiB emergency_floor=200GiB",
+                            result.stdout,
+                        )
+                        self.assertTrue((project / "outputs").is_symlink())
+                    else:
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertIn(
+                            f"available={available_gib}GiB floor=200GiB",
+                            result.stderr,
+                        )
 
     def test_storage_link_supports_checkout_already_on_large_volume(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

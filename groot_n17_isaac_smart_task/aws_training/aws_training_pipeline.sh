@@ -39,7 +39,10 @@ TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-$AWS_STORAGE_ROOT/cache/triton}"
 TMPDIR="$AWS_STORAGE_ROOT/tmp"
 UV_INSTALL_DIR="$AWS_STORAGE_ROOT/bin"
 UV_BIN="$UV_INSTALL_DIR/uv"
-AWS_MIN_FREE_GIB="${AWS_MIN_FREE_GIB:-2500}"
+# Emergency low-water mark only. This is not an estimate of, or reservation
+# for, the whole training batch; retained checkpoints legitimately consume the
+# production volume as runs finish.
+AWS_MIN_FREE_GIB="${AWS_MIN_FREE_GIB:-200}"
 BASE_MODEL_PATH=""
 
 FULL_FINETUNE_DIR="$SCRIPT_DIR/../full_finetune_so101"
@@ -106,7 +109,7 @@ Environment overrides:
   UV_CACHE_DIR       uv cache
   UV_PYTHON_INSTALL_DIR  uv-managed Python storage
   XDG_CACHE_HOME     compiler/runtime cache
-  AWS_MIN_FREE_GIB   Required free space on the production mount (default 2500)
+  AWS_MIN_FREE_GIB   Emergency free-space floor on the production mount (default 200)
 
 The script discovers SMART_PROJECT from its own location, so the AWS checkout path
 does not need to match the local workstation. Run storage-link once before uploading
@@ -241,8 +244,8 @@ check_available_storage() {
         die "could not read free space for $AWS_STORAGE_ROOT"
     required_kib=$((AWS_MIN_FREE_GIB * 1024 * 1024))
     (( available_kib >= required_kib )) || \
-        die "insufficient production storage: available=$((available_kib / 1024 / 1024))GiB required=${AWS_MIN_FREE_GIB}GiB"
-    log "storage free=$((available_kib / 1024 / 1024))GiB required=${AWS_MIN_FREE_GIB}GiB"
+        die "production storage is below the emergency floor: available=$((available_kib / 1024 / 1024))GiB floor=${AWS_MIN_FREE_GIB}GiB"
+    log "storage free=$((available_kib / 1024 / 1024))GiB emergency_floor=${AWS_MIN_FREE_GIB}GiB"
 }
 
 check_symlink_slot() {

@@ -124,7 +124,10 @@ $AWS_PROJECT_DIR/outputs/groot_so101_synthetic_finetune/
 
 GR00T checkout、HF/uv/Torch/Triton cache 和临时文件不需要第二条软链接，脚本直接放到
 `/opt/dlami/nvme/{Isaac-GR00T,cache,tmp}`。`storage-link`、`bootstrap` 和所有 batch 动作
-都会核对 `/opt/dlami/nvme` 与 `/` 不是同一设备，并默认要求至少 2500GiB 可用。
+都会核对 `/opt/dlami/nvme` 与 `/` 不是同一设备。默认的 `AWS_MIN_FREE_GIB=200` 只是在
+action 启动时避免大盘已接近耗尽，不是一次训练或八次训练必须预留的容量，也不负责训练中
+监控；checkpoint 正常占用空间后不会因为跌破 2.5TiB 而停止。目标机有更明确的启动低水位
+策略时可以用环境变量覆盖。
 
 ## 新实例环境配置
 
@@ -212,6 +215,11 @@ prepared root，不要把历史 candidate/ablation 目录一并传上去。
 代码以及 prepared 全树和 stats 的 SHA256；同名、同 episode 数但内容不同的副本不能静默
 冒充本次输入。
 
+`aws_training_pipeline.sh` 本身也属于 lineage。若某份 stats 已成功生成，本批中途不要只为
+调整存储低水位而修改或 `git pull` 这个脚本；应在保持脚本文件不变的前提下使用环境覆盖，
+例如 `AWS_MIN_FREE_GIB=200 ./aws_training_pipeline.sh train ...`。这样不会改变 pipeline SHA。
+若已经更新脚本，必须改用新 run-tag 重新执行该份 stats，再进入 smoke/train。
+
 不要复用已经非空的 `run-tag/dataset-id` 目录。需要重跑时使用新 run tag；中断恢复前先核对
 checkpoint、optimizer 和 trainer state，不要把“允许非空目录”当成 resume。
 
@@ -227,7 +235,7 @@ checkpoint、optimizer 和 trainer state，不要把“允许非空目录”当�
 | 明明有 MP4 但 preflight 报 `no prepared MP4` | 项目 `outputs` 是软链接；更新 pipeline。脚本使用 `find -H` 跟随入口链接，但不会跟随 prepared 内部链接 |
 | CUDA 13+ / PTX 门禁失败 | 记录完整 traceback 和 `nvcc/torch/triton`；清掉旧 `.pth`/手改 venv 后重跑 `bootstrap`，不要执行 2.7/3.3.1 历史补丁 |
 | Hugging Face 403/404 | 执行 `./aws_training_pipeline.sh auth` 并确认模型访问权限 |
-| NVMe 空间不足 | 扩大 volume，或明确降低保留量并逐 run 上传；不要写 root filesystem |
+| NVMe 跌破 200GiB 紧急低水位 | 上传/归档已完成 run 后释放空间，或基于实测 checkpoint 大小显式设置 `AWS_MIN_FREE_GIB`；不要写 root filesystem |
 | relative stats span ratio > 5 | 返回数据清洗；不能加 `--allow-relative-stats-outliers` 草率开训 |
 | run directory not empty | 核对 lineage，换新 run tag；不要覆盖或混入另一个数据的 checkpoint |
 
